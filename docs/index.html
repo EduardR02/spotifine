@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Spotifine: Spotify without the bloat</title>
-<meta name="description" content="Spotify for Windows and macOS that looks good and uses next to nothing: frosted glass lit by the playing song, and 0% CPU at rest. Plus true random shuffle, playback speed, and cutting or looping parts of a song.">
+<meta name="description" content="An unofficial, lightweight Spotify desktop client for Windows and macOS, with song-colored glass, random shuffle, playback speed, and tools to cut or loop parts of a song.">
 <meta name="theme-color" content="#080808">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Spotifine">
-<meta property="og:description" content="Spotify for Windows and macOS that looks good and uses next to nothing.">
+<meta property="og:description" content="An unofficial, lightweight Spotify desktop client for Windows and macOS, with song-colored glass, random shuffle, playback speed, and tools to cut or loop parts of a song.">
 <meta property="og:url" content="https://eduardr02.github.io/spotifine/">
 <meta property="og:image" content="https://eduardr02.github.io/spotifine/now-playing.png">
 <meta name="twitter:card" content="summary_large_image">
@@ -155,11 +155,6 @@ b { font-weight: var(--w-semi); color: var(--fg); }
   background: var(--accent-grad); color: var(--accent-ink);
 }
 .mark svg { width: 17px; height: 17px; }
-.mark.big {
-  width: 44px; height: 44px; border-radius: var(--r3);
-  box-shadow: 0 10px 26px -10px color-mix(in srgb, var(--rose) 55%, transparent);
-}
-.mark.big svg { width: 24px; height: 24px; }
 
 .tag {
   display: inline-flex; align-items: center;
@@ -200,15 +195,16 @@ b { font-weight: var(--w-semi); color: var(--fg); }
 .navlink svg { width: 16px; height: 16px; flex: none; }
 
 /* --------------------------------------------------------------- hero */
-/* The name, the one line, the button: centred over the picture below. */
+/* One band over the picture: the name and line on the left, the download on
+   the right. Stacks, left-aligned, on narrow screens. */
 .hero {
-  display: flex; flex-direction: column; align-items: center; text-align: center;
-  padding-top: 48px; padding-bottom: var(--s7);
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s6); align-items: end;
+  padding-top: 40px; padding-bottom: var(--s6);
 }
-@media (min-width: 1040px) { .hero { padding-top: 80px; padding-bottom: 40px; } }
-.hero .mark { margin-bottom: var(--s4); }
+@media (min-width: 900px) {
+  .hero { grid-template-columns: minmax(0, 1fr) auto; gap: var(--s7); padding-top: 64px; padding-bottom: 36px; }
+}
 h1 {
-  margin-top: var(--s3);
   font-family: var(--font-display);
   font-size: clamp(54px, 13vw, 92px);
   font-weight: var(--w-bold);
@@ -223,23 +219,25 @@ h1 {
   font-weight: var(--w-med);
   line-height: 1.25;
   letter-spacing: -0.012em;
-  max-width: 36ch;
   text-wrap: balance;
 }
+@media (min-width: 900px) {
+  .pitch { font-size: clamp(24px, 2.6vw, 26px); }
+}
 
-.get { margin-top: var(--s7); display: flex; flex-direction: column; align-items: center; gap: var(--s3); max-width: 100%; }
+.get { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s3); max-width: 100%; }
 .dl {
   display: inline-flex; align-items: center; gap: 14px;
   max-width: 100%;
   min-height: 62px; padding: 10px 30px 10px 22px;
   border-radius: var(--rf);
-  background: var(--accent); color: var(--accent-ink);
+  background: var(--rose); color: var(--accent-ink);
   text-decoration: none;
-  box-shadow: 0 16px 36px -16px color-mix(in srgb, var(--foam) 75%, transparent);
+  box-shadow: 0 16px 36px -16px color-mix(in srgb, var(--rose) 75%, transparent);
   transition: background-color var(--d1) var(--ease), transform var(--d2) var(--ease);
 }
-.dl:hover { background: var(--accent-hi); }
-.dl:active { background: var(--accent-lo); transform: translateY(1px); }
+.dl:hover { background: color-mix(in srgb, var(--rose) 78%, #ffffff); }
+.dl:active { background: color-mix(in srgb, var(--rose) 82%, var(--bg-0)); transform: translateY(1px); }
 .dl svg { width: 24px; height: 24px; flex: none; }
 .dl span { display: flex; flex-direction: column; min-width: 0; }
 .dl b {
@@ -257,7 +255,7 @@ h1 {
 .alt a:hover, .foot a:hover { background-size: 100% 1px; }
 .alt .sep { margin: 0 6px; color: var(--fg-3); }
 
-.notes { margin-top: var(--s5); display: flex; flex-direction: column; align-items: center; gap: var(--s2); max-width: 46ch; }
+.notes { margin-top: var(--s4); display: flex; flex-direction: column; align-items: flex-start; gap: var(--s2); max-width: 46ch; }
 .note { display: flex; gap: 10px; align-items: flex-start; color: var(--fg-1); font-size: 13.5px; text-align: left; }
 .note svg { width: 16px; height: 16px; flex: none; margin-top: 2px; color: var(--accent); }
 .note.warn svg { color: var(--love); }
@@ -413,12 +411,15 @@ h2 {
 .cols { height: 34px; border-bottom: 1px solid var(--line); margin-bottom: var(--s2); }
 .cols .idx { text-align: center; }
 .row {
+  width: 100%; border: 0; background: transparent;
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
   min-height: 60px; padding-top: 10px; padding-bottom: 10px;
   border-radius: var(--r2);
   transition: background-color var(--d1) var(--ease);
 }
 .row:hover { background: var(--hover); }
 .row .idx { text-align: center; color: var(--fg-2); font-variant-numeric: tabular-nums; font-size: 13.5px; }
+.row.playing .idx .n { display: none; }
 .art {
   display: grid; place-items: center;
   width: 40px; height: 40px; border-radius: var(--r1);
@@ -503,12 +504,13 @@ h2 {
 
 <main>
   <section class="hero wrap">
-      <span class="mark big rise" style="--i:1"><svg aria-hidden="true"><use href="#i-note"/></svg></span>
-      <span class="tag rise" style="--i:2">Free and open source</span>
-      <h1 class="rise" style="--i:3">Spotifine</h1>
-      <p class="pitch rise" style="--i:4">Spotify for Windows and macOS that looks good and uses next to nothing.</p>
+    <div class="hero-copy">
+      <h1 class="rise" style="--i:1">Spotifine</h1>
+      <p class="pitch rise" style="--i:2">A beautiful, lightweight Spotify desktop client.</p>
+    </div>
 
-      <div class="get rise" style="--i:5">
+    <div class="hero-get">
+      <div class="get rise" style="--i:3">
         <a class="dl" id="dl" href="https://github.com/EduardR02/spotifine/releases/latest/download/Spotifine-windows-x64-setup.exe">
           <svg aria-hidden="true"><use href="#i-download"/></svg>
           <span><b id="dl-label">Download for Windows</b><small id="dl-meta">64-bit installer</small></span>
@@ -518,11 +520,12 @@ h2 {
         </p>
       </div>
 
-      <div class="notes rise" style="--i:6">
-        <p class="note"><svg aria-hidden="true"><use href="#i-check"/></svg><span>Needs Spotify Premium. The first launch opens the Spotify login in your browser.</span></p>
+      <div class="notes rise" style="--i:4">
+        <p class="note"><svg aria-hidden="true"><use href="#i-check"/></svg><span>Unofficial. Requires Spotify Premium.</span></p>
         <p class="note warn" id="intel" hidden><svg aria-hidden="true"><use href="#i-info"/></svg><span>This looks like an Intel Mac. Spotifine runs on Apple Silicon Macs (M1 and later) with macOS 14 or newer.</span></p>
         <p class="note" id="elsewhere" hidden><svg aria-hidden="true"><use href="#i-info"/></svg><span>Spotifine is for Windows PCs and Apple Silicon Macs. Open this page on one of those to download it.</span></p>
       </div>
+    </div>
   </section>
 
   <section class="showcase wrap" aria-label="Screenshot">
@@ -535,15 +538,15 @@ h2 {
   <section class="sell wrap" aria-label="Why Spotifine">
     <article class="point glass pane">
       <div class="point-figure" aria-hidden="true"><span class="swatch"></span></div>
-      <span class="caps">Looks</span>
+      <span class="caps">Beautiful</span>
       <h2>Frosted glass, lit by the song</h2>
-      <p>The whole interface is glass over a haze taken from the playing song's Canvas or cover, so the light changes with every song. It's drawn once per song, so it costs nothing while the music plays.</p>
+      <p>The glass takes on the colors of the playing song's Canvas or album cover. The haze is drawn once per song rather than continuously, keeping the effect light.</p>
     </article>
     <article class="point glass pane">
-      <div class="point-figure"><b class="stat">0%</b><span class="stat-label">CPU at rest</span></div>
-      <span class="caps">Light</span>
-      <h2>Uses next to nothing</h2>
-      <p>I built it because the official app ran my CPU hot just playing music. This one blips to 1–2% for a moment while you use it, and when nothing plays, nothing runs.</p>
+      <div class="point-figure"><b class="stat">0%</b><span class="stat-label">CPU while music plays</span></div>
+      <span class="caps">Efficient</span>
+      <h2>Light on your computer</h2>
+      <p>The official app can keep a CPU busy just playing music. Spotifine plays through a lean native engine, and its interface only redraws what changes. While a song plays it uses effectively no CPU, and when nothing plays, nothing runs.</p>
     </article>
   </section>
 
@@ -551,7 +554,7 @@ h2 {
   <section class="start glass pane" aria-labelledby="first-run">
     <div class="start-head">
       <h2 id="first-run">The first launch</h2>
-      <p>Spotifine isn't signed with a paid developer certificate, so your computer asks once whether you trust it.</p>
+      <p>Windows and macOS may show a security warning the first time you install or open Spotifine.</p>
     </div>
     <div class="firstrun" id="firstrun">
       <article class="os glass card" id="os-windows">
@@ -562,7 +565,7 @@ h2 {
         <ol class="steps">
           <li><span>Run the installer you downloaded.</span></li>
           <li><span>If a blue box says <b>Windows protected your PC</b>, choose <b>More info</b>, then <b>Run anyway</b>.</span></li>
-          <li><span>Spotifine opens the Spotify login in your browser. Sign in, and you're listening.</span></li>
+          <li><span>Spotifine opens the Spotify login in your browser.</span></li>
         </ol>
       </article>
       <article class="os glass card" id="os-mac">
@@ -591,36 +594,36 @@ h2 {
       </div>
       <div class="cols caps" aria-hidden="true"><span class="idx">#</span><span></span><span>Title</span></div>
       <ol>
-        <li class="row playing">
-          <span class="idx"><span class="vu" aria-hidden="true"><i></i><i></i><i></i></span></span>
+        <li><button class="row playing" type="button" aria-pressed="true">
+          <span class="idx" aria-hidden="true"><span class="n">1</span><span class="vu"><i></i><i></i><i></i></span></span>
           <span class="art"><svg aria-hidden="true"><use href="#i-shuffle"/></svg></span>
           <span class="t"><b>Random shuffle</b><small>A truly random order, with no weighting.</small></span>
-        </li>
-        <li class="row">
-          <span class="idx">2</span>
+        </button></li>
+        <li><button class="row" type="button" aria-pressed="false">
+          <span class="idx" aria-hidden="true"><span class="n">2</span></span>
           <span class="art"><svg aria-hidden="true"><use href="#i-skipped"/></svg></span>
           <span class="t"><b>Skip songs without removing them</b><small>Keep a track in a playlist but leave it out of normal playback.</small></span>
-        </li>
-        <li class="row">
-          <span class="idx">3</span>
+        </button></li>
+        <li><button class="row" type="button" aria-pressed="false">
+          <span class="idx" aria-hidden="true"><span class="n">3</span></span>
           <span class="art"><svg aria-hidden="true"><use href="#i-clock"/></svg></span>
           <span class="t"><b>Playback speed</b><small>Anywhere from 0.5× to 4×.</small></span>
-        </li>
-        <li class="row">
-          <span class="idx">4</span>
+        </button></li>
+        <li><button class="row" type="button" aria-pressed="false">
+          <span class="idx" aria-hidden="true"><span class="n">4</span></span>
           <span class="art"><svg aria-hidden="true"><use href="#i-scissors"/></svg></span>
           <span class="t"><b>Cut or loop part of a song</b><small>Cut out a section or loop an exact range, edited on a waveform, set per playlist.</small></span>
-        </li>
-        <li class="row">
-          <span class="idx">5</span>
+        </button></li>
+        <li><button class="row" type="button" aria-pressed="false">
+          <span class="idx" aria-hidden="true"><span class="n">5</span></span>
           <span class="art"><svg aria-hidden="true"><use href="#i-search"/></svg></span>
           <span class="t"><b>Spotify links open here</b><small>Paste a shared link into search and it opens in the app, not the web player.</small></span>
-        </li>
-        <li class="row">
-          <span class="idx">6</span>
+        </button></li>
+        <li><button class="row" type="button" aria-pressed="false">
+          <span class="idx" aria-hidden="true"><span class="n">6</span></span>
           <span class="art"><svg aria-hidden="true"><use href="#i-artist"/></svg></span>
           <span class="t"><b>Whole discographies</b><small>Play everything an artist released, continuously.</small></span>
-        </li>
+        </button></li>
       </ol>
       <p class="also">Also: 320 kbps and gapless, media keys and lock screen controls, listening history kept on your computer, and updates from Settings.</p>
     </div>
@@ -641,6 +644,21 @@ h2 {
 
 <script>
 (() => {
+  // Decorative playlist selection: native buttons also support Enter/Space.
+  const features = document.querySelector(".extras ol");
+  let selected = features.querySelector(".playing");
+  const vu = selected.querySelector(".vu");
+  features.addEventListener("click", (event) => {
+    const row = event.target.closest("button.row");
+    if (!row || row === selected) return;
+    selected.classList.remove("playing");
+    selected.setAttribute("aria-pressed", "false");
+    row.classList.add("playing");
+    row.setAttribute("aria-pressed", "true");
+    row.querySelector(".idx").append(vu);
+    selected = row;
+  });
+
   const latest = "https://github.com/EduardR02/spotifine/releases/latest/download/";
   const builds = {
     windows: { file: "Spotifine-windows-x64-setup.exe", label: "Download for Windows", meta: "64-bit installer", name: "Windows" },
