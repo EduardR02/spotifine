@@ -24,6 +24,74 @@ export function detailArtSize(pane) {
   return 104;
 }
 
+/* =====================================================================
+   THE NOW-PLAYING PANEL'S WIDTH
+
+   The panel runs top to bottom at the window's right edge, and a 9:16
+   Canvas fills it at the window's full height when it is as wide as the
+   Canvas is there: its NATURAL width. Never wider — past that the Canvas
+   would have to be blown up — and never wider than a Canvas can fill
+   sharply: 720px (the common width) at 1.2 device pixels to each of its
+   own. Narrower than natural, the Canvas keeps the full height and is
+   cropped evenly to its centre (placeCanvas, NowPlayingPanel), as Spotify's
+   own apps crop it and as artists are told to compose it for.
+
+   Left alone it is a third of the window, or its natural width if that is
+   less. A width dragged by hand (the handle in the gap, App.svelte)
+   replaces the third and is kept. Either way it never squeezes the reading
+   pane below PANE_MIN; and when even PANEL_MIN would, the panel steps
+   aside on its own until there is room again, without touching whether it
+   was asked to be open.
+
+   PANE_MIN is the narrowest pane the track table keeps all its columns at
+   — title and artist, album, added, duration (TrackList, NEEDS.added).
+   Picked from the owner's library, 966 tracks in 12 playlists: at 640 the
+   title column is 155px and shows 87% of the titles whole (92% of the
+   artist lines), the album column 113px and 76% of the albums.
+
+   PANEL_MIN holds the head, the hero and the cards. It is a little under
+   280 so the panel does not blink out between 1181 and 1183px, where the
+   rail is still at its wide size (app.css, NARROW WINDOW).
+   ===================================================================== */
+export const PANE_MIN = 640;
+export const PANEL_MIN = 272;
+const CANVAS_ASPECT = 9 / 16;
+const CANVAS_SHARP = 720 * 1.2;
+
+/**
+ * The panel's box: its width in CSS px, flush with the window's right edge,
+ * and the range a drag may take it through.
+ *
+ * @param {object} at
+ * @param {number} at.width   the window's width, CSS px
+ * @param {number} at.height  the window's height, CSS px
+ * @param {number} at.start   where the reading pane starts, CSS px from the
+ *                            left: the pane, the gutter and the panel share
+ *                            what is right of it
+ * @param {number} at.gutter  the gap between the pane and the panel
+ * @param {number} [at.dpr]   device pixels per CSS px
+ * @param {number|null} [at.user] the width dragged by hand, or null
+ * @returns {{ fits: boolean, width: number, min: number, max: number }}
+ */
+export function panelLayout({ width, height, start, gutter, dpr = 1, user = null }) {
+  const natural = Math.min(height * CANVAS_ASPECT, CANVAS_SHARP / dpr);
+  const min = Math.min(PANEL_MIN, natural);
+  const room = width - start - gutter - PANE_MIN;
+  const max = Math.max(min, Math.min(natural, room));
+  const want = user ?? Math.min(natural, width / 3);
+  return { fits: room >= min, width: snapPanel(Math.min(max, Math.max(min, want)), dpr), min, max };
+}
+
+/**
+ * A panel width on whole device pixels, never past `width`: the window's
+ * right edge is on the grid, so the panel's left edge — the video's, the
+ * pane's and the bar's right ones — lands on it too, where a rim and a
+ * corner stay crisp.
+ */
+export function snapPanel(width, dpr = 1) {
+  return Math.floor(width * dpr + 1e-6) / dpr;
+}
+
 const reducedMotion =
   typeof window !== "undefined" && window.matchMedia
     ? window.matchMedia("(prefers-reduced-motion: reduce)")

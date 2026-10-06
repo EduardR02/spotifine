@@ -21,6 +21,7 @@
   import { formatTime } from "../lib/time.js";
   import { morphLayout } from "../lib/layout.js";
   import { frost } from "../lib/ambient.svelte.js";
+  import { panel as nowPlayingPanel, nowPlayingShown } from "../lib/panel.svelte.js";
   import { scrollbar } from "../lib/scrollbar.js";
   import { listen } from "@tauri-apps/api/event";
 
@@ -841,10 +842,13 @@
         {#if speedError}<p class="speed-error" role="status">{speedError}</p>{/if}
       </div>
       <DevicePicker />
+      <!-- With no room the panel steps aside on its own, and the button waits
+           for the room rather than changing what was asked for. -->
       <button
         class="btn-round"
-        class:on={ui.nowPlayingOpen}
-        title="Now playing details"
+        class:on={nowPlayingShown()}
+        disabled={!nowPlayingPanel.fits}
+        title={nowPlayingPanel.fits ? "Now playing details" : "Now playing needs a wider window"}
         onclick={() => morphLayout(() => setNowPlayingOpen(!ui.nowPlayingOpen))}
       >
         <Icon name="panel" size={18} />

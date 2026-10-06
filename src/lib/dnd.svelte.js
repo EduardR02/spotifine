@@ -1,9 +1,11 @@
 /**
- * Track drag-and-drop: the one gesture controller behind "grab a song and
- * move it".
+ * Drag-and-drop: the one gesture controller behind "grab a row and move it".
  *
- *   - onto a sidebar playlist row          -> COPY there (add only; the
+ *   - a song onto a sidebar playlist row   -> COPY there (add only; the
  *     source keeps the track — dropping on any other list adds too)
+ *   - a rail playlist or folder            -> MOVE it in the library: onto a
+ *     folder heading puts it in that folder, onto a row puts it beside that
+ *     row (in that row's folder, or out of every folder at the top level)
  *
  * Spatial work is scheduled when the pointer or a scroller moves, and runs
  * continuously only while autoscrolling. `pointermove` only records coordinates;
@@ -37,6 +39,15 @@ export const trackDrag = $state({
    */
   slot: -1,
 });
+
+/**
+ * The rail's own drag: a library row (`item`, `{ kind, id }`) in hand, and
+ * the folder a release would put it in — a folder id, null for the top
+ * level, undefined while no drop would do anything (over the row's own
+ * folder, into itself, or outside the rail). The Sidebar lights the target
+ * from this; a song drag never sets it.
+ */
+export const railDrag = $state({ active: false, item: null, target: undefined });
 
 /* ------------------------------------------------------------------ */
 /* Drop-zone registry                                                  */
@@ -108,7 +119,14 @@ export function pressTrack(ctx) {
   const t = ctx.track;
   if (!t?.uri || t.unavailable) return;
 
+  hold("track", ctx, e);
+}
+
+/** Starts a press: nothing visible until the pointer travels past the
+    threshold. `kind` is "track" or "library". */
+function hold(kind, ctx, e) {
   press = {
+    kind,
     active: false,
     ctx,
     pointerId: e.pointerId,
@@ -118,11 +136,49 @@ export function pressTrack(ctx) {
     grabX: 0,
     grabY: 0,
     dropRow: null,
+    railTarget: undefined,
   };
   window.addEventListener("pointermove", onPressMove);
   window.addEventListener("pointerup", onPressUp);
   window.addEventListener("pointercancel", onPressCancel);
   window.addEventListener("keydown", onPressKey, true);
+}
+
+/**
+ * A rail row was pressed. ctx: { event, rowEl, item, accepts(target),
+ * drop(target) } — `accepts` says whether a release over `target` would
+ * change anything, `drop` carries it out.
+ */
+export function pressLibraryItem(ctx) {
+  if (press) return;
+  const e = ctx.event;
+  if (e.button !== 0 || e.isPrimary === false || !ctx.item) return;
+  hold("library", ctx, e);
+}
+
+/**
+ * The folder a release at a window point would move the row into. A folder
+ * heading means that folder; a row means the folder that row sits in; the
+ * rail's empty space means the top level. Outside the rail, nothing.
+ */
+function railHit(x, y) {
+  const el = document.elementFromPoint(x, y);
+  if (!el?.closest?.(".lib-list")) return undefined;
+  const heading = el.closest("[data-folder]");
+  if (heading) return heading.dataset.folder;
+  const row = el.closest("[data-parent]");
+  return row ? row.dataset.parent || null : null;
+}
+
+/** `railHit`, kept only when the drop would change something; asked once
+    per new target rather than per frame. */
+function railTargetAt(held, x, y) {
+  const target = railHit(x, y);
+  if (target === undefined) return undefined;
+  if (held.railTarget && target === held.railTarget.raw) return held.railTarget.value;
+  const value = held.ctx.accepts(target) ? target : undefined;
+  held.railTarget = { raw: target, value };
+  return value;
 }
 
 function releaseListeners() {
@@ -171,6 +227,23 @@ function activate() {
 
   layer = ensureLayer();
   ghostWrap = buildGhost(press.rowEl); // also fixes press.grabX/grabY
+
+  if (press.kind === "library") {
+    railDrag.active = true;
+    railDrag.item = ctx.item;
+    railDrag.target = undefined;
+    scrollers = [];
+    const rail = press.rowEl.closest(".lib-list");
+    if (rail) {
+      scrollers.push(rail);
+      rail.addEventListener("scroll", scheduleFrame, { passive: true });
+    }
+    document.documentElement.classList.add("dragging-track");
+    positionGhost();
+    lastFrame = performance.now();
+    scheduleFrame();
+    return;
+  }
 
   const d = trackDrag;
   d.active = true;
@@ -230,9 +303,10 @@ function buildGhost(rowEl) {
   wrap.className = "tl-drag-ghost";
   const pill = document.createElement("div");
   pill.className = "tl-drag-pill glass-overlay";
-  const art = rowEl.querySelector(".c-art");
+  /* A song row carries .c-art/.c-title; a rail row its cover and name. */
+  const art = rowEl.querySelector(".c-art, .art");
   if (art) pill.appendChild(art.cloneNode(true));
-  const title = rowEl.querySelector(".c-title");
+  const title = rowEl.querySelector(".c-title, .lib-name, .lib-folder-name");
   if (title) pill.appendChild(title.cloneNode(true));
   wrap.appendChild(pill);
   layer.appendChild(wrap);
@@ -341,10 +415,15 @@ function frame(now) {
     if (el.scrollTop !== before) scrolling = true;
   }
 
-  const { zoneEl, slot, dropRow } = hitTest(pointerX, pointerY);
-  if (d.listEl !== zoneEl) d.listEl = zoneEl;
-  if (d.slot !== slot) d.slot = slot;
-  press.dropRow = dropRow;
+  if (press.kind === "library") {
+    const target = railTargetAt(press, pointerX, pointerY);
+    if (railDrag.target !== target) railDrag.target = target;
+  } else {
+    const { zoneEl, slot, dropRow } = hitTest(pointerX, pointerY);
+    if (d.listEl !== zoneEl) d.listEl = zoneEl;
+    if (d.slot !== slot) d.slot = slot;
+    press.dropRow = dropRow;
+  }
 
   positionGhost();
   if (scrolling) scheduleFrame();
@@ -358,6 +437,28 @@ function endDrag(commit) {
   rafId = 0;
   for (const el of scrollers) el.removeEventListener("scroll", scheduleFrame);
   scrollers = [];
+
+  if (p?.kind === "library") {
+    const wasActive = railDrag.active;
+    let moved = false;
+    if (commit && wasActive) {
+      const target = railTargetAt(p, pointerX, pointerY);
+      if (target !== undefined) {
+        p.ctx.drop(target);
+        moved = true;
+      }
+    }
+    railDrag.active = false;
+    railDrag.item = null;
+    railDrag.target = undefined;
+    if (wasActive) {
+      document.documentElement.classList.remove("dragging-track");
+      retireGhost(moved ? "dissolve" : "return");
+      gestureEndedAt = performance.now();
+      suppressReleaseClick();
+    }
+    return;
+  }
 
   const d = trackDrag;
   const wasActive = d.active;

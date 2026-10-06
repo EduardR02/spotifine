@@ -15,21 +15,30 @@
     playback,
     session,
     ui,
+    createLibraryFolder,
+    renameLibraryFolder,
+    deleteLibraryFolder,
+    moveLibraryItem,
   } from "../lib/state.svelte.js";
-  import { trackDrag } from "../lib/dnd.svelte.js";
+  import { pressLibraryItem, railDrag, trackDrag } from "../lib/dnd.svelte.js";
+  import { findFolder, folderContents, moveItem, playlistIds } from "../lib/library-tree.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import LikedMark from "./LikedMark.svelte";
   import Menu from "./Menu.svelte";
+  import ConfirmDialog from "./ConfirmDialog.svelte";
+  import MoveToFolder from "./MoveToFolder.svelte";
   import PlaylistActions from "./PlaylistActions.svelte";
   import { scrollbar } from "../lib/scrollbar.js";
   import PlaylistRailRow from "./PlaylistRailRow.svelte";
-  import { pins, loadPins, isPinned, isCollapsed, toggleFolder } from "../lib/pins.svelte.js";
+  import { pins, loadPins, isPinned, openFolder, toggleFolder } from "../lib/pins.svelte.js";
   import { avatar, loadAvatar } from "../lib/avatar.svelte.js";
-  import { personalApi, personalConnected, watchPersonal } from "../lib/personal.svelte.js";
   import { frost } from "../lib/ambient.svelte.js";
 
-  let creating = $state(false);
+  /** What the naming field is making: `{ kind: "playlist" | "folder",
+      parent }`, `parent` being the folder a new folder goes in (the field
+      then sits under that folder's heading), or null. */
+  let creating = $state(null);
   let newName = $state("");
   let field = $state(null);
   let libList = $state(null);
@@ -78,58 +87,48 @@
    * artists you rarely open. So each collection is a MODE of the list that
    * already exists rather than anything new in the column — the switch lives
    * in the head beside Filter and New playlist, a row that was already there.
-   * Saved podcasts are the third, and only there when the personal app is
-   * connected: it is the only thing that can read them.
+   * Saved podcasts are the third, read by the engine from Spotify's own
+   * collection service, so they are there for everyone.
    */
   let mode = $state("playlists");
-  const connected = $derived(personalConnected());
-  const modes = $derived([
+  const modes = [
     ["playlists", "Playlists"],
     ["artists", "Artists"],
-    ...(connected ? [["podcasts", "Podcasts"]] : []),
-  ]);
-  $effect(() => {
-    if (mode === "podcasts" && !connected) untrack(() => (mode = "playlists"));
-  });
+    ["podcasts", "Podcasts"],
+  ];
 
   $effect(() => { loadPins(session.username); });
   $effect(() => { loadAvatar(session.username); });
-  $effect(() => watchPersonal());
   const filteredLibrary = $derived(libraryRailEntries(library, libraryState.tree, pins.ids, filterQuery, pins.folders));
   const showLiked = $derived(!filterQuery.trim() || "liked songs".includes(filterQuery.trim().toLocaleLowerCase()));
 
   /* ---------------- Saved podcasts ----------------
-     Read a page at a time, and only once the tab is opened: like Following,
-     the collection costs nothing while you are not looking at it. The next
-     page is asked for when the end of the list scrolls into view. */
-  const SHOWS_PAGE = 50;
-  const podcasts = $state({ shows: [], total: null, loading: false, error: "" });
+     Read once the tab is first opened — like Following, the collection costs
+     nothing while you are not looking at it — and in one answer, newest
+     first, with rail-sized artwork. A sign-in to another account starts
+     over. */
+  const podcasts = $state({ shows: [], loaded: false, loading: false, error: "" });
   let podcastGeneration = 0;
-  let podcastEnd = $state(null);
   $effect(() => {
     session.username;
-    connected;
     untrack(() => {
       podcastGeneration++;
       podcasts.shows = [];
-      podcasts.total = null;
+      podcasts.loaded = false;
       podcasts.loading = false;
       podcasts.error = "";
     });
   });
   async function loadShows() {
-    if (podcasts.loading || !personalConnected()) return;
-    if (podcasts.total !== null && podcasts.shows.length >= podcasts.total) return;
+    if (podcasts.loading || !session.username) return;
     const generation = podcastGeneration;
     podcasts.loading = true;
     podcasts.error = "";
     try {
-      const page = await personalApi.savedShows(podcasts.shows.length, SHOWS_PAGE);
+      const shows = await api.browseSavedShows();
       if (generation !== podcastGeneration) return;
-      const seen = new Set(podcasts.shows.map((show) => show.id));
-      const next = (page?.items ?? []).map((item) => item?.show).filter((show) => show?.id && !seen.has(show.id));
-      podcasts.shows = [...podcasts.shows, ...next];
-      podcasts.total = next.length ? (page?.total ?? podcasts.shows.length) : podcasts.shows.length;
+      podcasts.shows = Array.isArray(shows) ? shows.filter((show) => show?.id) : [];
+      podcasts.loaded = true;
     } catch (reason) {
       if (generation === podcastGeneration) podcasts.error = String(reason || "Could not load your podcasts.");
     } finally {
@@ -137,23 +136,8 @@
     }
   }
   $effect(() => {
-    if (mode === "podcasts" && podcasts.total === null && !podcasts.error) untrack(loadShows);
+    if (mode === "podcasts" && !podcasts.loaded && !podcasts.error) untrack(loadShows);
   });
-  $effect(() => {
-    const sentinel = podcastEnd;
-    const root = libList;
-    if (!sentinel || !root) return;
-    const observer = new IntersectionObserver(([entry]) => {
-      if (entry.isIntersecting && !podcasts.error) untrack(loadShows);
-    }, { root, rootMargin: "0px 0px 240px 0px" });
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  });
-  /** The smallest picture that is still sharp in a 32px tile. */
-  function showArt(show) {
-    const images = [...(show?.images ?? [])].sort((a, b) => (a.width ?? 0) - (b.width ?? 0));
-    return (images.find((image) => (image.width ?? 0) >= 64) ?? images.at(-1))?.url ?? "";
-  }
   const filteredShows = $derived.by(() => {
     const query = filterQuery.trim().toLocaleLowerCase();
     if (!query) return podcasts.shows;
@@ -179,13 +163,137 @@
     };
   }
 
+  /* ---------------- Folders ----------------
+     A folder heading has its own menu (rename, a folder inside it, move it,
+     delete it), renames in place, and is a drop target for the rail's drag.
+     Every edit is the rootlist's (state.svelte.js) and shows at once. */
+  let folderMenu = $state(null);
+  let renaming = $state(null);
+  let renameDraft = $state("");
+  let renameField = $state(null);
+  let deleting = $state(null);
+
+  function openFolderMenu(event, entry) {
+    const keyboard = event.type === "keydown";
+    if (keyboard && event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+    event.preventDefault();
+    if (trackDrag.active || railDrag.active || !session.username) return;
+    const trigger = event.currentTarget;
+    const bounds = trigger.getBoundingClientRect();
+    folderMenu = {
+      entry, trigger,
+      at: { x: keyboard ? bounds.left + 8 : event.clientX, y: keyboard ? bounds.bottom : event.clientY },
+    };
+  }
+
+  function folderAction(close, action) {
+    const entry = folderMenu?.entry;
+    close();
+    if (entry) action(entry);
+  }
+
+  function startRename(entry) {
+    cancelCreate();
+    renaming = entry.id;
+    renameDraft = entry.name;
+  }
+
+  function cancelRename() {
+    renaming = null;
+    renameDraft = "";
+  }
+
+  function commitRename() {
+    if (!renaming) return;
+    const id = renaming;
+    const name = renameDraft;
+    cancelRename();
+    renameLibraryFolder(id, name);
+  }
+
+  $effect(() => {
+    if (!renaming || !renameField) return;
+    renameField.focus();
+    renameField.select();
+  });
+
+  function startFolderInside(entry) {
+    cancelRename();
+    filtering = false;
+    filterQuery = "";
+    openFolder(entry.id);
+    creating = { kind: "folder", parent: entry.id };
+  }
+
+  /** What deleting a folder takes with it, said plainly before it happens. */
+  function deleteMessage(folder) {
+    const { playlists, folders } = folderContents(folder);
+    const name = `“${folder.name}”`;
+    if (!playlists && !folders) return `${name} is removed from your library.`;
+    const parts = [
+      playlists ? `${playlists} ${playlists === 1 ? "playlist" : "playlists"}` : "",
+      folders ? `${folders} ${folders === 1 ? "folder" : "folders"}` : "",
+    ].filter(Boolean).join(" and ");
+    const ids = new Set(playlistIds(folder));
+    const mine = library.filter((row) => ids.has(row.id) && row.owner_id && row.owner_id === session.username).length;
+    const yours = !mine ? ""
+      : mine === playlists ? (playlists === 1 ? " You made the playlist, so it is deleted." : " You made all of them, so they are deleted.")
+      : ` The ${mine} you made ${mine === 1 ? "is" : "are"} deleted.`;
+    return `${name} and everything in it are removed from your library: ${parts}.${yours}`;
+  }
+
+  function requestDelete(entry) {
+    const folder = findFolder(libraryState.tree, entry.id);
+    if (!folder) return;
+    deleting = { id: folder.id, message: deleteMessage(folder), busy: false, error: "" };
+  }
+
+  async function confirmDelete() {
+    const request = deleting;
+    if (!request || request.busy) return;
+    const inside = new Set(playlistIds(findFolder(libraryState.tree, request.id)));
+    request.busy = true;
+    request.error = "";
+    try {
+      await deleteLibraryFolder(request.id);
+      openFolder(request.id);
+      if (deleting === request) deleting = null;
+      if (route.name === "playlist" && inside.has(route.id)) navigate("library");
+    } catch (error) {
+      if (deleting === request) {
+        request.busy = false;
+        request.error = error instanceof Error ? error.message : String(error || "Could not delete this folder.");
+      }
+    }
+  }
+
+  /* The rail's drag: a playlist or folder row, pressed and moved, carried to
+     a folder heading (into it) or a row (beside it, in its folder). Not while
+     filtering — a filtered list shows no folders to aim at. */
+  function pressRow(event, item) {
+    if (filterQuery.trim() || renaming || event.target.closest?.("input")) return;
+    pressLibraryItem({
+      event,
+      rowEl: event.currentTarget,
+      item,
+      accepts: (target) => !!moveItem(libraryState.tree, item, target),
+      drop: (target) => moveLibraryItem(item, target),
+    });
+  }
+
+  const dropRoot = $derived(railDrag.active && railDrag.target === null);
+
   $effect(() => {
     session.username;
     route.name;
     route.id;
     mode;
     filterQuery;
-    untrack(() => (railMenu = null));
+    untrack(() => {
+      railMenu = null;
+      folderMenu = null;
+      createMenu = null;
+    });
   });
 
   const filteredArtists = $derived.by(() => {
@@ -266,7 +374,7 @@
   });
 
   $effect(() => {
-    if (creating) field?.focus();
+    if (creating && field) field.focus();
   });
 
   $effect(() => {
@@ -287,11 +395,25 @@
     return () => document.removeEventListener("pointerdown", onPointerDown);
   });
 
-  function startCreate() {
+  /* The head's "+" opens Create playlist / Create folder, as Spotify's does;
+     either names its new row in place. */
+  let createMenu = $state(null);
+
+  /* A right-click on the list itself, not on a row, is where Spotify offers
+     the same two: it is also the way in when the narrow rail hides "+". */
+  function openListMenu(event) {
+    if (mode !== "playlists" || event.target.closest(".lib-row, .lib-folder, form, button, input")) return;
+    event.preventDefault();
+    if (trackDrag.active || railDrag.active || !session.username) return;
+    createMenu = { anchor: null, at: { x: event.clientX, y: event.clientY } };
+  }
+
+  function startCreate(kind) {
     /* A previous filter activation may have marked the editor cancelled. */
     filtering = false;
     filterQuery = "";
-    creating = true;
+    cancelRename();
+    creating = { kind, parent: null };
   }
 
   /* A half-typed playlist name is not a name for another collection, and the
@@ -306,7 +428,7 @@
   }
 
   function cancelCreate() {
-    creating = false;
+    creating = null;
     newName = "";
   }
 
@@ -323,7 +445,7 @@
   function createFromFilter() {
     newName = filterQuery.trim();
     closeFilter();
-    creating = true;
+    creating = { kind: "playlist", parent: null };
     commitCreate();
   }
 
@@ -331,10 +453,19 @@
     /* Pointer-down on Filter cancels before moving focus. Its ensuing blur
        must not resurrect the discarded partial name as a new playlist. */
     if (!creating) return;
+    const { kind, parent } = creating;
     const name = newName.trim();
-    creating = false;
+    creating = null;
     newName = "";
     if (!name) return;
+    if (kind === "folder") {
+      try {
+        await createLibraryFolder(name, parent);
+      } catch (error) {
+        ui.error = `Could not create the folder "${name}". ${error instanceof Error ? error.message : String(error ?? "")}`.trim();
+      }
+      return;
+    }
     try {
       /* The command answers with the finished row, name included, and that
          row is what goes into the list. Waiting for the rootlist refetch to
@@ -410,7 +541,7 @@
   </nav>
 
   <div class="lib">
-    <div class="lib-head" class:crowded={modes.length > 2}>
+    <div class="lib-head">
       {#if filtering}
         <span class="field sm lib-filter">
           <Icon name="search" size={13} />
@@ -447,9 +578,19 @@
             <Icon name="search" size={13} />
           </button>
           <!-- Creation belongs to playlists; the other collections keep the
-               same header geometry without advertising an unrelated action. -->
+               same header geometry without advertising an unrelated action.
+               One "+" for both things a library makes, as Spotify's is; a
+               right-click on the list opens the same menu. -->
           {#if mode === "playlists"}
-            <button class="btn-round lib-head-btn lib-new" title="New playlist" onclick={startCreate}>
+            <button
+              class="btn-round lib-head-btn lib-new"
+              title="Create"
+              aria-label="Create playlist or folder"
+              aria-haspopup="menu"
+              aria-expanded={!!createMenu}
+              onpointerdown={cancelCreate}
+              onclick={(event) => (createMenu = createMenu ? null : { anchor: event.currentTarget, at: null })}
+            >
               <Icon name="plus" size={14} />
             </button>
           {/if}
@@ -457,29 +598,9 @@
       {/if}
     </div>
 
-    {#if creating}
-      <form
-        class="lib-create"
-        onsubmit={(e) => {
-          e.preventDefault();
-          commitCreate();
-        }}
-      >
-        <span class="field sm">
-          <input
-            bind:this={field}
-            bind:value={newName}
-            aria-label="New playlist name"
-            placeholder="Playlist name"
-            spellcheck="false"
-            onblur={commitCreate}
-            onkeydown={(e) => e.key === "Escape" && cancelCreate()}
-          />
-        </span>
-      </form>
-    {/if}
+    {#if creating && !creating.parent}{@render createField(0)}{/if}
 
-    <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} class:droppable={trackDrag.active} bind:this={libList} use:scrollbar>
+    <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} class:droppable={trackDrag.active} class:drop-root={dropRoot} bind:this={libList} use:scrollbar oncontextmenu={openListMenu}>
       {#if mode === "artists"}
         <!-- Portraits, in circles, because a face is most of how an artist is
              recognised and the rail already draws every artist that way. -->
@@ -521,10 +642,10 @@
             class:active={route.name === "show" && route.id === show.id}
             onclick={() => navigate("show", show.id)}
           >
-            <Cover src={showArt(show)} id={show.id} name={show.name} size={32} />
+            <Cover src={show.cover_url} id={show.id} name={show.name} size={32} />
             <span class="lib-two">
               <span class="lib-name">{show.name}</span>
-              <span class="lib-sub">{show.publisher || (show.total_episodes ? `${show.total_episodes} episodes` : "Podcast")}</span>
+              <span class="lib-sub">{show.publisher || "Podcast"}</span>
             </span>
           </button>
         {/each}
@@ -542,35 +663,64 @@
           </p>
         {:else if filterQuery.trim() && !filteredShows.length}
           <p class="lib-filter-empty">No matching podcasts</p>
-        {:else if podcasts.total === 0}
+        {:else if podcasts.loaded && !podcasts.shows.length}
           <p class="lib-filter-empty">No saved podcasts yet</p>
-        {/if}
-        {#if podcasts.total !== null && podcasts.shows.length < podcasts.total && !filterQuery.trim()}
-          <div class="lib-end" bind:this={podcastEnd} aria-hidden="true"></div>
         {/if}
       {:else}
         {#if showLiked && isPinned("liked")}{@render likedRow()}{/if}
         {#each filteredLibrary as entry (entry.kind === "folder" ? `folder:${entry.id}` : `playlist:${entry.playlist.id}`)}
           {#if entry.kind === "folder"}
-            <!-- A folder heading is its own disclosure: the chevron turns and
-                 the rows under it go, and the rail remembers, per account. -->
-            <button
-              class="lib-folder"
-              class:shut={entry.collapsed}
-              style:padding-left={`${8 + entry.depth * 16}px`}
-              aria-expanded={!entry.collapsed}
-              title={entry.collapsed ? `Show ${entry.name}` : `Hide ${entry.name}`}
-              onclick={() => toggleFolder(entry.id)}
-            >
-              <span class="lib-chevron"><Icon name="chevron-down" size={12} /></span>
-              <span class="lib-folder-name">{entry.name}</span>
-              {#if entry.collapsed && entry.count}<span class="lib-count">{entry.count}</span>{/if}
-            </button>
+            {#if renaming === entry.id}
+              <form
+                class="lib-folder-rename"
+                style:padding-left={`${entry.depth * 16}px`}
+                onsubmit={(event) => {
+                  event.preventDefault();
+                  commitRename();
+                }}
+              >
+                <span class="field sm">
+                  <input
+                    bind:this={renameField}
+                    bind:value={renameDraft}
+                    aria-label="Folder name"
+                    spellcheck="false"
+                    onblur={commitRename}
+                    onkeydown={(event) => event.key === "Escape" && cancelRename()}
+                  />
+                </span>
+              </form>
+            {:else}
+              <!-- A folder heading is its own disclosure: the chevron turns and
+                   the rows under it go, and the rail remembers, per account.
+                   It is also where a dragged row goes in, and it has a menu. -->
+              <button
+                class="lib-folder"
+                class:shut={entry.collapsed}
+                class:drop-into={railDrag.active && railDrag.target === entry.id}
+                class:drag-source={railDrag.item?.kind === "folder" && railDrag.item.id === entry.id}
+                data-folder={entry.id}
+                style:padding-left={`${8 + entry.depth * 16}px`}
+                aria-expanded={!entry.collapsed}
+                aria-haspopup="menu"
+                title={entry.collapsed ? `Show ${entry.name}` : `Hide ${entry.name}`}
+                onclick={() => toggleFolder(entry.id)}
+                onpointerdown={(event) => pressRow(event, { kind: "folder", id: entry.id })}
+                oncontextmenu={(event) => openFolderMenu(event, entry)}
+                onkeydown={(event) => openFolderMenu(event, entry)}
+              >
+                <span class="lib-chevron"><Icon name="chevron-down" size={12} /></span>
+                <span class="lib-folder-name">{entry.name}</span>
+                {#if entry.collapsed && entry.count}<span class="lib-count">{entry.count}</span>{/if}
+              </button>
+            {/if}
+            {#if creating?.parent === entry.id && !entry.collapsed}{@render createField(entry.depth + 1)}{/if}
           {:else}
-            <PlaylistRailRow playlist={entry.playlist} depth={entry.depth} {observeCover}
+            <PlaylistRailRow playlist={entry.playlist} depth={entry.depth} parent={entry.parent} {observeCover}
               pinned={isPinned(entry.playlist.id)}
               active={route.name === "playlist" && route.id === entry.playlist.id} playing={playingId === entry.playlist.id}
-              onmenu={openRailMenu} />
+              onmenu={openRailMenu}
+              onpress={(event, playlist) => pressRow(event, { kind: "playlist", id: playlist.id })} />
           {/if}
         {/each}
         {#if showLiked && !isPinned("liked")}{@render likedRow()}{/if}
@@ -616,23 +766,84 @@
   </div>
 </aside>
 
+{#snippet createField(depth)}
+  <form
+    class="lib-create"
+    style:padding-left={depth ? `${depth * 16}px` : null}
+    onsubmit={(e) => {
+      e.preventDefault();
+      commitCreate();
+    }}
+  >
+    <span class="field sm">
+      <input
+        bind:this={field}
+        bind:value={newName}
+        aria-label={creating?.kind === "folder" ? "New folder name" : "New playlist name"}
+        placeholder={creating?.kind === "folder" ? "Folder name" : "Playlist name"}
+        spellcheck="false"
+        onblur={commitCreate}
+        onkeydown={(e) => e.key === "Escape" && cancelCreate()}
+      />
+    </span>
+  </form>
+{/snippet}
+
 {#if railMenu}
-  <Menu at={railMenu.at} returnTo={railMenu.trigger} label={`${railMenu.playlist.name} actions`} onclose={() => (railMenu = null)}>
+  <Menu at={railMenu.at} returnTo={railMenu.trigger} group label={`${railMenu.playlist.name} actions`} onclose={() => (railMenu = null)}>
     {#snippet children(close)}
       <PlaylistActions playlist={railMenu.playlist} {close} />
     {/snippet}
   </Menu>
 {/if}
 
+{#if createMenu}
+  <Menu anchor={createMenu.anchor} at={createMenu.at} label="Create" onclose={() => (createMenu = null)}>
+    {#snippet children(close)}
+      <button class="menu-item" role="menuitem" onclick={() => { close(); startCreate("playlist"); }}><Icon name="playlist-add" size={16} />Create playlist</button>
+      <button class="menu-item" role="menuitem" onclick={() => { close(); startCreate("folder"); }}><Icon name="folder-plus" size={16} />Create folder</button>
+    {/snippet}
+  </Menu>
+{/if}
+
+{#if folderMenu}
+  <Menu at={folderMenu.at} returnTo={folderMenu.trigger} group label={`${folderMenu.entry.name} actions`} onclose={() => (folderMenu = null)}>
+    {#snippet children(close)}
+      <!-- Each item reads its folder before closing: closing drops the menu
+           state the items are rendered from. -->
+      <button class="menu-item" role="menuitem" onclick={() => folderAction(close, startRename)}><Icon name="pencil" size={16} />Rename</button>
+      <button class="menu-item" role="menuitem" onclick={() => folderAction(close, startFolderInside)}><Icon name="folder-plus" size={16} />Create folder</button>
+      <MoveToFolder item={{ kind: "folder", id: folderMenu.entry.id }} {close} />
+      <div class="menu-sep" role="separator"></div>
+      <button class="menu-item danger" role="menuitem" onclick={() => folderAction(close, requestDelete)}><Icon name="trash" size={16} />Delete folder…</button>
+    {/snippet}
+  </Menu>
+{/if}
+
+{#if deleting}
+  <ConfirmDialog
+    open
+    title="Delete this folder?"
+    message={deleting.message}
+    confirmLabel="Delete folder"
+    busyLabel="Deleting…"
+    busy={deleting.busy}
+    error={deleting.error}
+    onConfirm={confirmDelete}
+    onCancel={() => (deleting = null)}
+  />
+{/if}
+
 <style>
   .lib-row.liked-row { grid-template-columns: 32px minmax(0, 1fr) auto; }
   .lib-head-btn { width: 24px; height: 24px; }
-  /* Three collections do not fit the narrow rail beside two buttons. New
-     playlist gives way (the filter's "Create" still makes one); the words
-     close up a step. */
+  /* Three collections do not fit the narrow rail beside two buttons. The
+     "+" gives way there; the same Create playlist / Create folder menu opens
+     from a right-click on the list, and the filter's "Create" still makes a
+     playlist. */
   @media (max-width: 1180px) {
-    .lib-head.crowded .lib-new { display: none; }
-    .lib-head.crowded .lib-mode { font-size: 11px; }
+    .lib-new { display: none; }
+    .lib-head :global(.lib-mode) { font-size: 11px; }
   }
   .lib-filter { width: 100%; }
 
@@ -651,6 +862,19 @@
   .lib-folder.shut .lib-chevron { transform: rotate(-90deg); }
   .lib-folder-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lib-folder .lib-count { flex: none; }
+  /* Where a dragged row would go: the heading it would go into lifts under a
+     foam hairline — arranging is position, not membership — and the row in
+     hand dims. A drop to the top level rings the list itself. */
+  .lib-folder.drop-into {
+    color: var(--fg);
+    background: var(--raise-2);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 50%, transparent);
+  }
+  .lib-folder.drop-into .lib-chevron { color: var(--accent); }
+  .lib-folder.drag-source { opacity: 0.4; }
+  .lib-list.drop-root { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent); border-radius: var(--r2); }
+  .lib-folder-rename { display: flex; align-items: center; height: 30px; }
+  .lib-folder-rename .field { width: 100%; }
 
   .lib-pin { display: grid; place-items: center; color: var(--fg-3); }
 
@@ -661,7 +885,6 @@
     font-family: var(--font-small); font-size: var(--t-11); color: var(--fg-3);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .lib-end { height: 1px; }
 
   /* The account row takes the Settings row's place and its 34px. */
   .account { display: flex; align-items: center; gap: var(--s1); }

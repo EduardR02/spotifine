@@ -7,9 +7,10 @@ import { session, sessionEpoch, playback, lookupSavedIn, artistFollowChanged, ap
  * The personal Spotify app: the owner's own developer app for the same
  * account, which can WRITE to the library — likes, follows — and route
  * Spotifine playback to a Spotify Connect device. It is never asked what is saved: Liked Songs is
- * answered by the shell's membership index (`get_track_playlists`) and the
- * followed artists by the engine's own list, both local. The one exception is
- * whether you follow a USER, which nothing local knows (`followsUser`).
+ * answered by the shell's membership index (`get_track_playlists`), and the
+ * followed artists and saved podcasts by the engine's own reads. The one
+ * exception is whether you follow a USER, which nothing else knows
+ * (`followsUser`).
  */
 export const personal = $state({ status: null, loading: false, error: "" });
 let request = null;
@@ -127,5 +128,4 @@ export async function setFollowingUser(username, following) {
 
 export const personalApi = {
   devices: () => invoke("personal_api_devices"),
-  savedShows: (offset = 0, limit = 50) => invoke("personal_api_saved_shows", { offset, limit }),
 };

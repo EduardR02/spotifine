@@ -1684,6 +1684,13 @@ impl EngineClient {
         parse_data(reply, "browse_followed_artists")
     }
 
+    pub async fn browse_saved_shows(
+        &self,
+    ) -> Result<Vec<renderer_engine::protocol::ShowRef>, String> {
+        let reply = self.request("browse_saved_shows", json!({})).await?;
+        parse_data(reply, "browse_saved_shows")
+    }
+
     pub async fn create_playlist(
         &self,
         name: &str,
@@ -1704,6 +1711,46 @@ impl EngineClient {
     pub async fn delete_playlist(&self, id: &str) -> Result<(), String> {
         let _ = self
             .request("edit_delete_playlist", json!({"id": id}))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn follow_playlist(&self, id: &str) -> Result<(), String> {
+        let _ = self
+            .request("edit_follow_playlist", json!({"id": id}))
+            .await?;
+        Ok(())
+    }
+
+    /// Answers with the new folder's id.
+    pub async fn create_folder(&self, name: &str, parent: Option<&str>) -> Result<String, String> {
+        let reply = self
+            .request("edit_create_folder", json!({"name": name, "parent": parent}))
+            .await?;
+        parse_data(reply, "edit_create_folder")
+    }
+
+    pub async fn rename_folder(&self, id: &str, name: &str) -> Result<(), String> {
+        let _ = self
+            .request("edit_rename_folder", json!({"id": id, "name": name}))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_folder(&self, id: &str) -> Result<(), String> {
+        let _ = self
+            .request("edit_delete_folder", json!({"id": id}))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn move_library_item(
+        &self,
+        item: &renderer_engine::protocol::LibraryItem,
+        folder: Option<&str>,
+    ) -> Result<(), String> {
+        let _ = self
+            .request("edit_move_library_item", json!({"item": item, "folder": folder}))
             .await?;
         Ok(())
     }

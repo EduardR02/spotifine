@@ -89,10 +89,10 @@ Spotify's side. Spotifine shows it whenever it's on for your account.
 
 ### Likes, follows and devices
 
-Without any setup, Spotifine can read your Liked Songs and the artists you
-follow, but can't change them. To like songs, follow artists and people, see
-your saved podcasts, and play on your other devices, connect a Spotify
-developer app of your own. It's free, takes two minutes, and is a second
+Without any setup, Spotifine can read your Liked Songs, the artists you follow
+and your saved podcasts, but can't change them. To like songs, follow artists
+and people, and play on your other devices, connect a Spotify developer app of
+your own. It's free, takes two minutes, and is a second
 authorization for the same account, not another account.
 
 1. Open the [Spotify developer dashboard](https://developer.spotify.com/dashboard),

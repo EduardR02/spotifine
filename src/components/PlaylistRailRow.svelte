@@ -1,17 +1,23 @@
 <script>
   import { navigate } from "../lib/state.svelte.js";
-  import { trackDrag } from "../lib/dnd.svelte.js";
+  import { railDrag, trackDrag } from "../lib/dnd.svelte.js";
   import Cover from "./Cover.svelte";
   import Icon from "./Icon.svelte";
-  let { playlist, active = false, playing = false, pinned = false, depth = 0, onmenu, observeCover } = $props();
+  /* `parent` is the folder the row sits in (null at the top level): a row
+     dropped onto this one joins it there. `onpress` starts the rail's own
+     drag; a row that cannot move (a filtered list) passes none. */
+  let { playlist, active = false, playing = false, pinned = false, depth = 0, parent = null, onmenu, onpress = null, observeCover } = $props();
 </script>
 
 <button class="lib-row" class:active class:playing
-  class:no-drop={trackDrag.active && trackDrag.sourcePlaylistId === playlist.id} data-pid={playlist.id}
+  class:no-drop={trackDrag.active && trackDrag.sourcePlaylistId === playlist.id}
+  class:drag-source={railDrag.item?.kind === "playlist" && railDrag.item.id === playlist.id}
+  data-pid={playlist.id} data-parent={parent ?? ""}
   use:observeCover={playlist.id}
   style:padding-left={`${8 + depth * 16}px`}
   aria-haspopup="menu"
   onclick={() => navigate("playlist", playlist.id)}
+  onpointerdown={(event) => onpress?.(event, playlist)}
   oncontextmenu={(event) => onmenu?.(event, playlist)}
   onkeydown={(event) => onmenu?.(event, playlist)}>
   <Cover src={playlist.cover_url} srcs={playlist.cover_urls ?? []} id={playlist.id} name={playlist.name} size={32} />
@@ -31,4 +37,5 @@
 <style>
   .lib-tail { display: flex; align-items: center; gap: var(--s2); }
   .lib-pin { display: grid; place-items: center; color: var(--fg-3); }
+  .lib-row.drag-source { opacity: 0.4; }
 </style>

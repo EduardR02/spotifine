@@ -20,17 +20,18 @@ use crate::log;
 use crate::media_keys;
 use crate::personal_api::{
     Authorization as PersonalAuthorization, Device as PersonalDevice, PersonalApi,
-    SavedShowsPage, Status as PersonalStatus,
+    Status as PersonalStatus,
 };
 use crate::playback_router::{Action as PlaybackAction, PlaybackRouter};
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail,
     CacheStats, EpisodeDetail, HistoryPageDetail, LibraryNodeDetail, LikedSongsDetail,
     PlaybackEvent, Playlist, PlaylistDetail, PlaylistRecommendationsDetail, ProfileDetail, RadioDetail,
-    SearchResult, ShowDetail, SongwriterPlaylist, Track, TrackCreditsDetail, TrackPlaylistRef,
+    SearchResult, Show, ShowDetail, SongwriterPlaylist, Track, TrackCreditsDetail, TrackPlaylistRef,
     TrackWaveform,
 };
 use parking_lot::Mutex;
+use renderer_engine::protocol::LibraryItem;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
@@ -616,6 +617,22 @@ pub async fn browse_followed_artists(
         .collect())
 }
 
+/// Every podcast the account follows, newest first. Read through the engine
+/// from Spotify's collection service, so it needs no developer app; like the
+/// followed artists it is uncached and asked for only when the rail opens its
+/// Podcasts tab.
+#[tauri::command]
+pub async fn browse_saved_shows(
+    client: State<'_, Arc<EngineClient>>,
+) -> Result<Vec<Show>, String> {
+    Ok(client
+        .browse_saved_shows()
+        .await?
+        .into_iter()
+        .map(Show::from)
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Playlist edit commands
 // ---------------------------------------------------------------------------
@@ -682,6 +699,9 @@ pub async fn rename_playlist(
     Ok(())
 }
 
+/// Deletes a playlist you made, or removes someone else's from your library:
+/// on the wire both are the same rootlist REM, which is all the official
+/// client sends for either.
 #[tauri::command]
 pub async fn delete_playlist(
     app: AppHandle,
@@ -689,42 +709,182 @@ pub async fn delete_playlist(
     id: String,
 ) -> Result<(), String> {
     client.delete_playlist(&id).await?;
-    {
-        let state = app.state::<Mutex<AppState>>();
-        let persistence = state.lock().playlist_persistence.clone();
-        let _serialize = persistence.lock();
-        let (dir, list_cache, tracks_cache, membership) = {
-            let mut guard = state.lock();
-            guard.library_generation = guard.library_generation.wrapping_add(1);
-            guard.playlists.retain(|playlist| playlist.id != id);
-            remove_tree_playlist(&mut guard.playlist_tree, &id);
-            guard.tracks_cache.retain(|entry| entry.id != id);
-            // The index must forget the container in the same critical
-            // section, or the next lookup could still light the mark for a
-            // playlist that no longer exists.
-            let removed = remove_membership(&mut guard.memberships, &id);
-            let membership = removed.then(|| guard.memberships.clone());
-            (
-                guard.data_dir.clone(),
-                PlaylistListCache {
-                    version: 1,
-                    fetched_at: guard.playlists_fetched_at,
-                    me_id: guard.me_id.clone(),
-                    playlists: guard.playlists.clone(),
-                    playlist_tree: guard.playlist_tree.clone(),
-                },
-                guard.tracks_cache.clone(),
-                membership,
-            )
-        };
-        // A successful unfollow must reach disk before a concurrent older
-        // refresh can persist, or the removed row reappears on next startup.
-        save_playlist_list(&dir, &list_cache);
-        save_tracks_cache(&dir, &tracks_cache);
-        if let Some(entries) = membership {
-            save_membership(&dir, &entries);
+    forget_library_playlists(&app, |tree| {
+        remove_tree_playlist(tree, &id);
+        vec![id.clone()]
+    });
+    spawn_refresh_library(app);
+    Ok(())
+}
+
+/// Drops playlists that just left the library from every local store in one
+/// critical section, together with the tree edit that removed them (which
+/// answers with their ids), and puts all of it on disk before a concurrent
+/// older refresh can persist — or the removed rows reappear on the next
+/// start.
+fn forget_library_playlists(
+    app: &AppHandle,
+    edit_tree: impl FnOnce(&mut Vec<LibraryNodeDetail>) -> Vec<String>,
+) {
+    let state = app.state::<Mutex<AppState>>();
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    let (dir, list_cache, tracks_cache, membership) = {
+        let mut guard = state.lock();
+        guard.library_generation = guard.library_generation.wrapping_add(1);
+        let ids = edit_tree(&mut guard.playlist_tree);
+        let gone: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        guard.playlists.retain(|playlist| !gone.contains(playlist.id.as_str()));
+        let before = guard.tracks_cache.len();
+        guard.tracks_cache.retain(|entry| !gone.contains(entry.id.as_str()));
+        let tracks_changed = before != guard.tracks_cache.len();
+        // The index must forget the container in the same critical section,
+        // or the next lookup could still light the mark for a playlist that
+        // no longer exists.
+        let mut removed = false;
+        for id in &ids {
+            removed |= remove_membership(&mut guard.memberships, id);
         }
+        let membership = removed.then(|| guard.memberships.clone());
+        (
+            guard.data_dir.clone(),
+            library_list_cache(&guard),
+            tracks_changed.then(|| guard.tracks_cache.clone()),
+            membership,
+        )
+    };
+    save_playlist_list(&dir, &list_cache);
+    if let Some(tracks_cache) = tracks_cache {
+        save_tracks_cache(&dir, &tracks_cache);
     }
+    if let Some(entries) = membership {
+        save_membership(&dir, &entries);
+    }
+}
+
+fn library_list_cache(state: &AppState) -> PlaylistListCache {
+    PlaylistListCache {
+        version: 1,
+        fetched_at: state.playlists_fetched_at,
+        me_id: state.me_id.clone(),
+        playlists: state.playlists.clone(),
+        playlist_tree: state.playlist_tree.clone(),
+    }
+}
+
+/// Writes a landed library edit into the shell's copy and to disk at once,
+/// fenced like a delete: a rootlist read that was already in flight predates
+/// the edit and must not install over it. The refresh that follows brings
+/// the account's own answer.
+fn commit_library_edit<R>(app: &AppHandle, edit: impl FnOnce(&mut AppState) -> R) -> R {
+    let state = app.state::<Mutex<AppState>>();
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    let (dir, cache, result) = {
+        let mut guard = state.lock();
+        guard.library_generation = guard.library_generation.wrapping_add(1);
+        let result = edit(&mut guard);
+        (guard.data_dir.clone(), library_list_cache(&guard), result)
+    };
+    save_playlist_list(&dir, &cache);
+    result
+}
+
+/// Puts someone else's playlist back in your library, at the top, and
+/// answers with the library row. The row is the one the playlist's page
+/// already holds; following it is library activity, so it is stamped the way
+/// a created playlist is and the next refresh keeps it first.
+#[tauri::command]
+pub async fn follow_playlist(
+    app: AppHandle,
+    client: State<'_, Arc<EngineClient>>,
+    playlist: Playlist,
+) -> Result<Playlist, String> {
+    client.follow_playlist(&playlist.id).await?;
+    let row = commit_library_edit(&app, |guard| {
+        insert_created_playlist(&mut guard.playlists, playlist, now_secs())
+    });
+    spawn_refresh_library(app);
+    Ok(row)
+}
+
+/// Creates an empty folder first in the library, or first in `parent`, and
+/// answers with the folder as the tree holds it.
+#[tauri::command]
+pub async fn create_folder(
+    app: AppHandle,
+    client: State<'_, Arc<EngineClient>>,
+    name: String,
+    parent: Option<String>,
+) -> Result<LibraryNodeDetail, String> {
+    let name = name.trim().to_owned();
+    let id = client.create_folder(&name, parent.as_deref()).await?;
+    let folder = LibraryNodeDetail::Folder {
+        id,
+        name,
+        children: Vec::new(),
+        last_activity: Some(now_secs()),
+    };
+    commit_library_edit(&app, |guard| {
+        LibraryNodeDetail::insert_first(&mut guard.playlist_tree, parent.as_deref(), folder.clone());
+    });
+    spawn_refresh_library(app);
+    Ok(folder)
+}
+
+#[tauri::command]
+pub async fn rename_folder(
+    app: AppHandle,
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    let name = name.trim().to_owned();
+    client.rename_folder(&id, &name).await?;
+    commit_library_edit(&app, |guard| {
+        if let Some(LibraryNodeDetail::Folder { name: current, .. }) =
+            LibraryNodeDetail::folder_mut(&mut guard.playlist_tree, &id)
+        {
+            *current = name;
+        }
+    });
+    spawn_refresh_library(app);
+    Ok(())
+}
+
+/// Deletes a folder and everything in it, as the official client does: the
+/// playlists inside leave the library with it.
+#[tauri::command]
+pub async fn delete_folder(
+    app: AppHandle,
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+) -> Result<(), String> {
+    client.delete_folder(&id).await?;
+    forget_library_playlists(&app, |tree| {
+        let mut inside = Vec::new();
+        if let Some(folder) = LibraryNodeDetail::take(tree, &LibraryItem::Folder { id }) {
+            folder.playlist_ids(&mut inside);
+        }
+        inside
+    });
+    spawn_refresh_library(app);
+    Ok(())
+}
+
+/// Moves a playlist or a folder to the top of `folder`, or out of every
+/// folder when there is none.
+#[tauri::command]
+pub async fn move_library_item(
+    app: AppHandle,
+    client: State<'_, Arc<EngineClient>>,
+    item: LibraryItem,
+    folder: Option<String>,
+) -> Result<(), String> {
+    client.move_library_item(&item, folder.as_deref()).await?;
+    commit_library_edit(&app, |guard| {
+        LibraryNodeDetail::move_to(&mut guard.playlist_tree, &item, folder.as_deref());
+    });
     spawn_refresh_library(app);
     Ok(())
 }
@@ -865,16 +1025,6 @@ pub async fn personal_api_set_saved(
         let _ = app.emit("memberships_changed", json!({"saved_tracks": true, "uris": uris, "saved": saved}));
     }
     Ok(())
-}
-
-#[tauri::command]
-pub async fn personal_api_saved_shows(
-    app: AppHandle,
-    personal: State<'_, Arc<PersonalApi>>,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> Result<SavedShowsPage, String> {
-    personal.saved_shows(&app, offset.unwrap_or(0), limit.unwrap_or(20)).await
 }
 
 #[tauri::command]
@@ -1942,7 +2092,7 @@ async fn fetch_library(
 ) -> Result<LibraryFetchResult, String> {
     let mut generation = state.lock().library_generation;
     let mut playlists = Vec::new();
-    let playlist_tree = LibraryNodeDetail::split(client.browse_playlist_tree(LIBRARY_LENGTH).await?, &mut playlists);
+    let mut playlist_tree = LibraryNodeDetail::split(client.browse_playlist_tree(LIBRARY_LENGTH).await?, &mut playlists);
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
@@ -1960,6 +2110,7 @@ async fn fetch_library(
         // rootlist request was in flight. Carry and install in the same
         // serialized completion so sparse metadata cannot overwrite it.
         carry_local_fields(&guard.playlists, &mut playlists);
+        LibraryNodeDetail::carry_folder_activity(&guard.playlist_tree, &mut playlist_tree);
         order_by_last_activity(&mut playlists);
         let fresh_ids: HashSet<_> = playlists.iter().map(|playlist| playlist.id.as_str()).collect();
         if guard.playlists.iter().any(|old| !fresh_ids.contains(old.id.as_str())) {
@@ -2116,7 +2267,7 @@ mod tests {
     #[test]
     fn a_deleted_playlist_leaves_every_folder_of_the_tree() {
         let node = |id: &str| LibraryNodeDetail::Playlist { id: id.into() };
-        let folder = |id: &str, children| LibraryNodeDetail::Folder { id: id.into(), name: id.into(), children };
+        let folder = |id: &str, children| LibraryNodeDetail::Folder { id: id.into(), name: id.into(), children, last_activity: None };
         let mut tree = vec![folder("f", vec![node("a"), folder("nested", vec![node("b"), node("a")])]), node("a")];
         remove_tree_playlist(&mut tree, "a");
         assert_eq!(tree, [folder("f", vec![folder("nested", vec![node("b")])])]);

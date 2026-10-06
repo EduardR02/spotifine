@@ -72,3 +72,17 @@ test("a collapsed folder keeps its heading and count and hides its rows, except 
   expect(inner[1]).toMatchObject({ collapsed: true, count: 1, depth: 1 });
   expect(ids(libraryRailEntries(library, tree, [], "road", ["outer"]))).toEqual(["recent", "quiet"]);
 });
+
+test("a folder this app made stands on its own stamp, and every entry names its folder", () => {
+  const older = playlist("older", 100);
+  const newer = playlist("newer", 500);
+  setLibrary([older, newer]);
+  const made = { kind: "folder", id: "made", name: "Made", children: [], last_activity: 900 };
+  const tree = [leaf(older), made, folder("box", [leaf(newer)]), folder("empty", [])];
+  const entries = libraryRailEntries(library, tree);
+  expect(ids(entries)).toEqual(["folder:made", "folder:box", "newer", "older", "folder:empty"]);
+  expect(entries.map((entry) => entry.parent)).toEqual([null, null, "box", null, null]);
+  // A stamp older than what a folder holds does not hold it back.
+  const stale = { ...made, last_activity: 50, children: [leaf(newer)] };
+  expect(ids(libraryRailEntries(library, [stale, leaf(older)]))).toEqual(["folder:made", "newer", "older"]);
+});

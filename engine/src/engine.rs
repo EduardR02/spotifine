@@ -2057,6 +2057,7 @@ impl Engine {
             | Command::BrowseCanvas { .. }
             | Command::EnableAccountCanvas
             | Command::BrowseFollowedArtists
+            | Command::BrowseSavedShows
             | Command::GetTrackWaveform { .. }
             | Command::CancelTrackWaveform { .. }
             | Command::GetTrackEdit { .. }
@@ -2067,6 +2068,11 @@ impl Engine {
             | Command::EditCreatePlaylist { .. }
             | Command::EditRenamePlaylist { .. }
             | Command::EditDeletePlaylist { .. }
+            | Command::EditFollowPlaylist { .. }
+            | Command::EditCreateFolder { .. }
+            | Command::EditRenameFolder { .. }
+            | Command::EditDeleteFolder { .. }
+            | Command::EditMoveLibraryItem { .. }
             | Command::EditAddPlaylistTracks { .. }
             | Command::EditRemovePlaylistTracks { .. }
             | Command::EditReorderPlaylistTracks { .. } => unreachable!(),

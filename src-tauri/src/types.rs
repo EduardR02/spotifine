@@ -13,7 +13,7 @@ use renderer_engine::protocol::{
     normalize_canonical_playlist_description, AlbumBrowse, AlbumRef, ArtistBrowse,
     ArtistCataloguePage, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
     ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist, CreditRole, EpisodeRef,
-    HistoryItem as EngineHistoryItem, HistoryPage as EngineHistoryPage, LibraryNode,
+    HistoryItem as EngineHistoryItem, HistoryPage as EngineHistoryPage, LibraryItem, LibraryNode,
     LikedSongsPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse,
     SearchBrowse, SearchTopRef, ShowBrowse, ShowRef, SongwriterPlaylist as EngineSongwriterPlaylist,
     TrackCredits, TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform, UserProfile,
@@ -952,7 +952,8 @@ impl ProfileDetail {
 }
 
 /// The rootlist's folder order and hierarchy. A playlist is named by id: its
-/// record lives once, in the library list.
+/// record lives once, in the library list. A playlist the tree does not name
+/// sits at the top level.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LibraryNodeDetail {
@@ -960,6 +961,12 @@ pub enum LibraryNodeDetail {
         id: String,
         name: String,
         children: Vec<LibraryNodeDetail>,
+        /// Unix seconds this app made the folder, the way a playlist's
+        /// `last_activity` is stamped: what floats a new, still-empty folder
+        /// to the top of an activity-ordered rail. Local to this app, carried
+        /// across refreshes by id; Spotify has no such field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_activity: Option<i64>,
     },
     Playlist { id: String },
 }
@@ -973,6 +980,7 @@ impl LibraryNodeDetail {
                 id,
                 name,
                 children: Self::split(children, playlists),
+                last_activity: None,
             },
             LibraryNode::Playlist { playlist } => {
                 let playlist = Playlist::from(&playlist);
@@ -981,6 +989,118 @@ impl LibraryNodeDetail {
                 Self::Playlist { id }
             }
         }).collect()
+    }
+
+    fn is(&self, item: &LibraryItem) -> bool {
+        match (self, item) {
+            (Self::Folder { id, .. }, LibraryItem::Folder { id: wanted })
+            | (Self::Playlist { id }, LibraryItem::Playlist { id: wanted }) => id == wanted,
+            _ => false,
+        }
+    }
+
+    /// Takes the row out of the tree, wherever it is nested.
+    pub fn take(tree: &mut Vec<Self>, item: &LibraryItem) -> Option<Self> {
+        if let Some(index) = tree.iter().position(|node| node.is(item)) {
+            return Some(tree.remove(index));
+        }
+        tree.iter_mut().find_map(|node| match node {
+            Self::Folder { children, .. } => Self::take(children, item),
+            Self::Playlist { .. } => None,
+        })
+    }
+
+    pub fn folder_mut<'a>(tree: &'a mut [Self], wanted: &str) -> Option<&'a mut Self> {
+        for node in tree {
+            if matches!(node, Self::Folder { id, .. } if id == wanted) {
+                return Some(node);
+            }
+            if let Self::Folder { children, .. } = node {
+                if let Some(found) = Self::folder_mut(children, wanted) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Puts a row first in `folder`, or first at the top level.
+    pub fn insert_first(tree: &mut Vec<Self>, folder: Option<&str>, node: Self) {
+        match folder.and_then(|folder| Self::folder_mut(tree, folder)) {
+            Some(Self::Folder { children, .. }) => children.insert(0, node),
+            _ => tree.insert(0, node),
+        }
+    }
+
+    fn holds(&self, item: &LibraryItem) -> bool {
+        match self {
+            Self::Folder { children, .. } => children.iter().any(|child| child.is(item) || child.holds(item)),
+            Self::Playlist { .. } => false,
+        }
+    }
+
+    /// Moves a row where the rootlist MOV that was just written puts it: to
+    /// the top of `folder`, or — none — out of every folder to just after the
+    /// top-level folder it was in. A playlist the tree did not name was at
+    /// the top level already; a folder it does not name is left alone.
+    pub fn move_to(tree: &mut Vec<Self>, item: &LibraryItem, folder: Option<&str>) {
+        let outermost = match folder {
+            Some(_) => None,
+            None => tree.iter().position(|node| node.holds(item)),
+        };
+        let node = match Self::take(tree, item) {
+            Some(node) => node,
+            None => match item {
+                LibraryItem::Playlist { id } => Self::Playlist { id: id.clone() },
+                LibraryItem::Folder { .. } => return,
+            },
+        };
+        match outermost {
+            Some(index) => tree.insert(index + 1, node),
+            None => Self::insert_first(tree, folder, node),
+        }
+    }
+
+    /// Every playlist id at or under this row.
+    pub fn playlist_ids(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Playlist { id } => out.push(id.clone()),
+            Self::Folder { children, .. } => {
+                for child in children {
+                    child.playlist_ids(out);
+                }
+            }
+        }
+    }
+
+    /// Copies the local folder stamps of `previous` onto the same folders in
+    /// a freshly read tree; the rootlist knows nothing about them.
+    pub fn carry_folder_activity(previous: &[Self], fresh: &mut [Self]) {
+        fn stamps(nodes: &[LibraryNodeDetail], out: &mut std::collections::HashMap<String, i64>) {
+            for node in nodes {
+                if let LibraryNodeDetail::Folder { id, children, last_activity, .. } = node {
+                    if let Some(at) = last_activity {
+                        out.insert(id.clone(), *at);
+                    }
+                    stamps(children, out);
+                }
+            }
+        }
+        fn apply(nodes: &mut [LibraryNodeDetail], stamps: &std::collections::HashMap<String, i64>) {
+            for node in nodes {
+                if let LibraryNodeDetail::Folder { id, children, last_activity, .. } = node {
+                    if last_activity.is_none() {
+                        *last_activity = stamps.get(id.as_str()).copied();
+                    }
+                    apply(children, stamps);
+                }
+            }
+        }
+        let mut known = std::collections::HashMap::new();
+        stamps(previous, &mut known);
+        if !known.is_empty() {
+            apply(fresh, &known);
+        }
     }
 }
 
@@ -1494,6 +1614,54 @@ mod tests {
         assert_eq!(playlists.len(), 1);
         assert_eq!(playlists[0].owner, "DJ Name");
         assert_eq!(playlists[0].tracks_total, 12);
+    }
+
+    #[test]
+    fn library_tree_edits_move_take_and_carry_folder_stamps() {
+        let playlist = |id: &str| LibraryNodeDetail::Playlist { id: id.into() };
+        let folder = |id: &str, children, last_activity| LibraryNodeDetail::Folder {
+            id: id.into(), name: id.to_uppercase(), children, last_activity,
+        };
+        let mut tree = vec![
+            playlist("a"),
+            folder("outer", vec![playlist("b"), folder("inner", vec![playlist("c")], None)], Some(5)),
+        ];
+        // Into a nested folder, first.
+        LibraryNodeDetail::move_to(&mut tree, &LibraryItem::Playlist { id: "a".into() }, Some("inner"));
+        assert_eq!(tree, vec![folder("outer", vec![playlist("b"), folder("inner", vec![playlist("a"), playlist("c")], None)], Some(5))]);
+        // A folder out of its parent, contents and all: just after the
+        // top-level folder it was in, where the rootlist MOV puts it.
+        LibraryNodeDetail::move_to(&mut tree, &LibraryItem::Folder { id: "inner".into() }, None);
+        assert_eq!(tree[0], folder("outer", vec![playlist("b")], Some(5)));
+        assert_eq!(tree[1], folder("inner", vec![playlist("a"), playlist("c")], None));
+        // A playlist the tree never named was at the top level already.
+        LibraryNodeDetail::move_to(&mut tree, &LibraryItem::Playlist { id: "z".into() }, Some("outer"));
+        assert_eq!(tree[0], folder("outer", vec![playlist("z"), playlist("b")], Some(5)));
+        // An unknown folder is not invented.
+        LibraryNodeDetail::move_to(&mut tree, &LibraryItem::Folder { id: "ghost".into() }, None);
+        assert_eq!(tree.len(), 2);
+        tree.swap(0, 1);
+
+        let taken = LibraryNodeDetail::take(&mut tree, &LibraryItem::Folder { id: "outer".into() }).unwrap();
+        let mut ids = Vec::new();
+        taken.playlist_ids(&mut ids);
+        assert_eq!(ids, vec!["z", "b"]);
+        assert_eq!(tree.len(), 1);
+        assert!(LibraryNodeDetail::take(&mut tree, &LibraryItem::Folder { id: "outer".into() }).is_none());
+
+        LibraryNodeDetail::insert_first(&mut tree, Some("inner"), folder("new", Vec::new(), Some(9)));
+        assert!(matches!(&tree[0], LibraryNodeDetail::Folder { children, .. } if children[0] == folder("new", Vec::new(), Some(9))));
+
+        // A refresh answers without stamps; the folders this app made keep theirs.
+        let mut fresh = vec![folder("inner", vec![folder("new", Vec::new(), None)], None)];
+        LibraryNodeDetail::carry_folder_activity(&tree, &mut fresh);
+        assert_eq!(fresh, vec![folder("inner", vec![folder("new", Vec::new(), Some(9))], None)]);
+        // The stamp is local and travels only when there is one.
+        let json = serde_json::to_value(&fresh[0]).unwrap();
+        assert!(json.get("last_activity").is_none());
+        assert_eq!(json["children"][0]["last_activity"], 9);
+        let old: LibraryNodeDetail = serde_json::from_value(serde_json::json!({"kind": "folder", "id": "x", "name": "X", "children": []})).unwrap();
+        assert_eq!(old, folder("x", Vec::new(), None));
     }
 
     #[test]

@@ -83,42 +83,6 @@ pub struct PlayerState {
     pub repeat_state: String,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct SavedShowsPage {
-    pub href: String,
-    pub items: Vec<SavedShow>,
-    pub limit: usize,
-    pub next: Option<String>,
-    pub offset: usize,
-    pub previous: Option<String>,
-    pub total: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SavedShow {
-    pub added_at: String,
-    pub show: SavedShowInfo,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SavedShowInfo {
-    pub id: String,
-    pub uri: String,
-    pub name: String,
-    pub description: String,
-    pub images: Vec<ShowImage>,
-    pub total_episodes: u32,
-    #[serde(default)]
-    pub publisher: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ShowImage {
-    pub url: String,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-}
-
 #[derive(Clone, Serialize)]
 pub struct Status {
     pub client_id: String,
@@ -604,20 +568,6 @@ impl PersonalApi {
         let method = if saved { Method::PUT } else { Method::DELETE };
         self.request(app, false, method, "me/library", Some(&uris), None).await?;
         Ok(())
-    }
-
-    /// User-owned grant only; no request is made until the subscribed-podcasts
-    /// surface explicitly asks for a page.
-    pub async fn saved_shows(&self, app: &AppHandle, offset: usize, limit: usize) -> Result<SavedShowsPage, String> {
-        if !(1..=50).contains(&limit) {
-            return Err("saved shows page size must be between 1 and 50".to_owned());
-        }
-        let _operation = self.operation.lock().await;
-        let path = format!("me/shows?offset={offset}&limit={limit}");
-        let page = self.request(app, false, Method::GET, &path, None, None).await?
-            .json().await.map_err(|_| "Spotify returned an invalid saved shows page".to_owned())?;
-        self.check_active_grant(app)?;
-        Ok(page)
     }
 
     pub async fn devices(&self, app: &AppHandle) -> Result<Vec<Device>, String> {

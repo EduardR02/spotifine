@@ -1226,7 +1226,7 @@ mod tests {
     fn folder_tree_survives_cache_replacement_and_deleted_playlists_stay_deleted() {
         let dir = std::env::temp_dir().join(format!("renderer-tree-{}-{}", std::process::id(), now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
-        let folder = |children| LibraryNodeDetail::Folder { id: "folder".into(), name: "Music".into(), children };
+        let folder = |children| LibraryNodeDetail::Folder { id: "folder".into(), name: "Music".into(), children, last_activity: None };
         let node = |id: &str| LibraryNodeDetail::Playlist { id: id.into() };
         let first = PlaylistListCache { version: 1, fetched_at: Some(1), me_id: "me".into(),
             playlists: vec![playlist("a"), playlist("b")], playlist_tree: vec![folder(vec![node("a"), node("b")])] };

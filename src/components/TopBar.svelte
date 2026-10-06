@@ -20,9 +20,10 @@
   import Icon from "./Icon.svelte";
   import WindowControls from "./WindowControls.svelte";
   import { drawsWindowControls } from "../lib/window-frame.svelte.js";
+  import { nowPlayingShown } from "../lib/panel.svelte.js";
 
   let field = $state(null);
-  const framed = $derived(drawsWindowControls && !ui.nowPlayingOpen);
+  const framed = $derived(drawsWindowControls && !nowPlayingShown());
 
   // The sidebar's Search entry and Ctrl+F both focus this one field.
   $effect(() => {

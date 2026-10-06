@@ -17,6 +17,7 @@
   import { drawsWindowControls } from "../lib/window-frame.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { haze } from "../lib/ambient.svelte.js";
+  import { panel as panelState } from "../lib/panel.svelte.js";
   import { formatTime } from "../lib/time.js";
   import { scrollbar } from "../lib/scrollbar.js";
 
@@ -212,15 +213,11 @@
   let stageEl = $state(null);
   let pixelRatio = $state(window.devicePixelRatio || 1);
 
-  /* The panel's width is bounded in device pixels too (--panel-w), so the
-     stylesheet needs the ratio as well as placeCanvas. Dragging the window
-     to another screen changes it. */
+  /* Dragging the window to another screen changes the ratio. */
   $effect(() => {
-    const root = document.documentElement;
     let query = null;
     const update = () => {
       pixelRatio = window.devicePixelRatio || 1;
-      root.style.setProperty("--dpr", String(pixelRatio));
       query?.removeEventListener("change", update);
       query = window.matchMedia(`(resolution: ${pixelRatio}dppx)`);
       query.addEventListener("change", update);
@@ -275,8 +272,11 @@
         h: round(Math.min(h, box.height)),
       };
     }
-    /* Only a video on screen has colour to carry on. */
+    /* Only a video on screen has colour to carry on. And while the edge is
+       being dragged the haze is slid, not redrawn: the anchor is published
+       once, when it is let go (ambient.svelte.js, THE FROST, 5). */
     if (!videoShown) visible = null;
+    if (panelState.resizing) return;
     const last = haze.anchor;
     const moved =
       !last ||
@@ -306,6 +306,7 @@
     pixelRatio;
     videoEl;
     videoShown;
+    panelState.resizing;
     untrack(placeCanvas);
   });
 

@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import { playback, ui, coverUrl as imageUrl } from "../lib/state.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
-  import { haze, publishLight, frost, watchFrost } from "../lib/ambient.svelte.js";
+  import { haze, publishLight, frost, watchFrost, watchShift } from "../lib/ambient.svelte.js";
   import { rgbOf, parseFrost, RESTRAINED } from "../lib/haze.js";
 
   /* =====================================================================
@@ -134,23 +134,26 @@
      another is still fading in (a track skipped during a crossfade, or a
      new record during the loop's slow settle) and simply fade in over the
      mix. A fourth arrival waits for a layer; only the latest is kept. */
-  /** Visible layers, bottom to top: { el, anim }. */
+  /** Visible layers, bottom to top: { el, anim, left, covered } — from the
+      geometry the picture was drawn for: the panel's edge, and whether a
+      Canvas covered the panel out to the window's right edge. */
   let stack = [];
   let queued = null;
   let z = 1;
 
-  function show(bitmap, frosted, fade) {
+  function show(bitmap, frosted, fade, geo) {
     const el = layerEls.find((c) => c && !stack.some((s) => s.el === c));
     if (!el) {
       queued?.bitmap.close();
       queued?.frosted?.close();
-      queued = { bitmap, frosted, fade };
+      queued = { bitmap, frosted, fade, geo };
       return;
     }
-    const [hazeCanvas, frostCanvas] = el.children;
+    const [hazeCanvas, frostClip] = el.children;
+    const frostCanvas = frostClip.firstElementChild;
     hazeCanvas.getContext("bitmaprenderer").transferFromImageBitmap(bitmap);
     if (stats) stats.uploads++;
-    frostCanvas.hidden = !frosted;
+    frostClip.hidden = !frosted;
     if (frosted) {
       frostCanvas.getContext("bitmaprenderer").transferFromImageBitmap(frosted);
       if (stats) stats.uploads++;
@@ -158,7 +161,13 @@
     el.style.zIndex = String(++z);
     el.style.visibility = "visible";
     const { ms, easing } = FADES[fade];
-    const entry = { el, anim: el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: ms, easing, fill: "forwards" }) };
+    const entry = {
+      el,
+      anim: el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: ms, easing, fill: "forwards" }),
+      left: geo?.left ?? null,
+      covered: coversPanel(geo),
+    };
+    slide(entry, dragEdge);
     stack.push(entry);
     if (stats) stats.fades.push({ fade, ms, at: Math.round(performance.now()), key: asked?.key });
     entry.anim.finished.then(
@@ -170,7 +179,7 @@
         if (queued) {
           const next = queued;
           queued = null;
-          show(next.bitmap, next.frosted, next.fade);
+          show(next.bitmap, next.frosted, next.fade, next.geo);
         }
       },
       () => {},
@@ -181,6 +190,53 @@
     entry.anim?.cancel();
     entry.el.style.visibility = "hidden";
     entry.el.style.opacity = "0";
+    slide(entry, null);
+  }
+
+  /* ---- The drag ------------------------------------------------------------
+     While the panel's edge is dragged nothing is rendered: each picture on
+     screen is slid so the seam it was drawn at stays on the edge
+     (ambient.svelte.js, THE FROST, 5). A slide uncovers a strip at one side
+     of the window; the picture is stretched about the seam just enough to
+     cover it — the left side always, the right only where the panel shows
+     the haze (a cover, or a Canvas that stops short of an edge). The
+     frost's clip is the planes' own and stays put: only the pictures inside
+     it move. When the drag ends the slides stay as they are, and go with
+     their layers when the picture drawn for the new edge has faded in over
+     them. */
+  let dragEdge = null;
+
+  /** A Canvas hid the haze under the whole panel, out to the window's edge. */
+  function coversPanel(geo) {
+    const v = geo?.immersive ? geo.video : null;
+    return Boolean(v && v.y <= 0.5 && v.y + v.h >= geo.h - 0.5 && v.x + v.w >= geo.w - 0.5);
+  }
+
+  $effect(() => watchShift((edge) => {
+    dragEdge = edge;
+    if (edge != null) for (const entry of stack) slide(entry, edge);
+  }));
+
+  /** Slide a layer's pictures so their seam is at `edge`; null puts them
+      back where they were drawn. */
+  function slide(entry, edge) {
+    const [hazeCanvas, frostClip] = entry.el.children;
+    const canvases = [hazeCanvas, frostClip.firstElementChild];
+    const vw = window.innerWidth || 1;
+    const from = entry.left == null ? null : entry.left * vw;
+    if (edge == null || from == null || Math.abs(edge - from) < 0.25) {
+      for (const c of canvases) c.style.transform = "";
+      return;
+    }
+    const stretch = edge > from
+      ? edge / Math.max(1, from)
+      : entry.covered ? 1 : (vw - edge) / Math.max(1, vw - from);
+    const transform = `translateX(${(edge - from).toFixed(2)}px) scaleX(${stretch.toFixed(4)})`;
+    const origin = `${from.toFixed(2)}px 0`;
+    for (const c of canvases) {
+      c.style.transformOrigin = origin;
+      c.style.transform = transform;
+    }
   }
 
   /* ---- The worker -------------------------------------------------------- */
@@ -246,7 +302,7 @@
           m.frost?.close();
           return;
         }
-        show(m.bitmap, m.frost, lit ? m.fade : "first");
+        show(m.bitmap, m.frost, lit ? m.fade : "first", asked?.geo);
         lit = true;
         grey = m.grey;
         blankTries = 0;
@@ -557,7 +613,7 @@
     {#each [0, 1, 2] as i (i)}
       <div class="layer" bind:this={layerEls[i]}>
         <canvas width="1" height="1"></canvas>
-        <canvas class="frost" width="1" height="1" hidden></canvas>
+        <div class="frost" hidden><canvas width="1" height="1"></canvas></div>
       </div>
     {/each}
   </div>
@@ -569,7 +625,8 @@
      both are already blurred, so the bilinear upscale is all the smoothing
      they need. The layers only ever
      change opacity, on the compositor, and are hidden once covered. Each
-     layer's frosted twin lies over its haze, cut to the planes. */
+     layer's frosted twin lies over its haze, cut to the planes by its own
+     box, so a picture slid during a drag (slide) moves under the cut. */
   .ambient {
     position: fixed;
     inset: 0;
@@ -584,7 +641,8 @@
     visibility: hidden;
     will-change: opacity;
   }
-  canvas {
+  canvas,
+  .frost {
     position: absolute;
     inset: 0;
     width: 100%;

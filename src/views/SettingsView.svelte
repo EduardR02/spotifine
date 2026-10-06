@@ -295,7 +295,7 @@
       <h2>Likes, follows &amp; devices</h2>
       <p class="set-intro">
         Your own free Spotify developer app, for this same account, lets Spotifine like songs,
-        follow artists and people, list your saved podcasts and play on your other devices.
+        follow artists and people, and play on your other devices.
         <button class="link-more inline-link" onclick={() => openUrl(GUIDE).catch(() => {})}>Setup guide</button>
       </p>
       {#if !personalConnected()}

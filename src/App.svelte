@@ -26,7 +26,9 @@
   import NowPlayingPanel from "./components/NowPlayingPanel.svelte";
   import Ambient from "./components/Ambient.svelte";
   import { scrollbar } from "./lib/scrollbar.js";
-  import { frost } from "./lib/ambient.svelte.js";
+  import { frost, shiftHaze } from "./lib/ambient.svelte.js";
+  import { panelLayout, snapPanel } from "./lib/layout.js";
+  import { panel, setPanelWidth, nowPlayingShown } from "./lib/panel.svelte.js";
   import { devicesEnabled } from "./lib/personal.svelte.js";
   import { vuMeterStyle } from "./lib/vu-meter.js";
   import { os } from "./lib/window-frame.svelte.js";
@@ -74,11 +76,113 @@
     const observer = new ResizeObserver(([entry]) => {
       const width = Math.round(entry.contentRect.width);
       if (width !== ui.paneWidth) ui.paneWidth = width;
+      relayoutPanel();
     });
     observer.observe(node);
     ui.paneWidth = Math.round(node.getBoundingClientRect().width);
     return () => observer.disconnect();
   });
+
+  /* ---- The now-playing panel's width (layout.js) -----------------------
+     Worked out from the window and from where the pane starts — the rail's
+     width is the rail's business, so it is measured, not assumed — on a
+     resize and when the pane moves; never per frame at rest. Until the pane
+     has been measured the rail is taken at its token, so the first paint
+     already has the right shape. */
+  const GUTTER = 8; // app.css --gutter
+  let paneStart =
+    2 * GUTTER + (parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--sidebar-w")) || 240);
+  const measurePanel = () =>
+    panelLayout({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      start: paneStart,
+      gutter: GUTTER,
+      dpr: window.devicePixelRatio || 1,
+      user: panel.width,
+    });
+  const first = measurePanel();
+  let box = $state(first);
+  panel.fits = first.fits;
+
+  /* The pane's start is read fresh each time: a resize can carry the rail
+     across its breakpoint, and a stale start would hide the panel for a
+     frame and bring it straight back. */
+  function relayoutPanel() {
+    if (paneEl) paneStart = paneEl.getBoundingClientRect().left;
+    const next = measurePanel();
+    if (next.fits !== panel.fits) panel.fits = next.fits;
+    if (next.width !== box.width || next.min !== box.min || next.max !== box.max) box = next;
+  }
+
+  $effect(() => {
+    panel.width;
+    untrack(relayoutPanel);
+  });
+  $effect(() => {
+    window.addEventListener("resize", relayoutPanel);
+    return () => window.removeEventListener("resize", relayoutPanel);
+  });
+
+  /* ---- The handle -------------------------------------------------------
+     In the gap left of the panel, like the official client's. A drag sets
+     the width on the grid each frame (dragWidth) and nothing else: the
+     haze slides with the edge instead of being redrawn (shiftHaze), and the
+     panel holds its anchor back until it is let go (panel.resizing). The
+     width it ends on is kept; a double-click goes back to automatic. */
+  let dragWidth = $state(null);
+  const shownWidth = $derived(dragWidth ?? box.width);
+
+  /** Keep `width` (null: automatic), in one step: the grid never sees the
+      old width again on the way, and the haze is slid to the new edge until
+      the picture drawn for it fades in. */
+  function keepPanelWidth(width) {
+    setPanelWidth(width);
+    relayoutPanel();
+    dragWidth = null;
+    shiftHaze(window.innerWidth - box.width);
+    shiftHaze(null);
+  }
+
+  function resizePanel(event) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+    const from = box.width;
+    const x0 = event.clientX;
+    const { min, max } = box;
+    const dpr = window.devicePixelRatio || 1;
+    panel.resizing = true;
+    const move = (e) => {
+      const width = snapPanel(Math.min(max, Math.max(min, from + x0 - e.clientX)), dpr);
+      if (width === shownWidth) return;
+      dragWidth = width;
+      shiftHaze(window.innerWidth - width);
+    };
+    const end = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("lostpointercapture", end);
+      if (dragWidth != null && dragWidth !== from) keepPanelWidth(dragWidth);
+      dragWidth = null;
+      shiftHaze(null);
+      panel.resizing = false;
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("lostpointercapture", end);
+  }
+
+  /** The keyboard's way: a step per arrow, Home for automatic. */
+  function nudgePanel(event) {
+    const step = { ArrowLeft: 16, ArrowRight: -16 }[event.key];
+    if (event.key === "Home") {
+      event.preventDefault();
+      keepPanelWidth(null);
+    } else if (step) {
+      event.preventDefault();
+      keepPanelWidth(snapPanel(Math.min(box.max, Math.max(box.min, box.width + step)), window.devicePixelRatio || 1));
+    }
+  }
 
   /* Every route reuses this one scroll container, so the pane keeps a small
      ledger of where each route identity (name + id + param) was last left,
@@ -409,7 +513,8 @@
 <div
   class="app"
   class:anim-paused={!playback.playing || !ui.windowFocused}
-  class:has-panel={ui.nowPlayingOpen}
+  class:has-panel={nowPlayingShown()}
+  style:--np-w="{shownWidth}px"
   data-tauri-drag-region
 >
   <Sidebar />
@@ -476,8 +581,23 @@
     </div>
   </main>
 
-  {#if ui.nowPlayingOpen}
+  {#if nowPlayingShown()}
     <NowPlayingPanel />
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions (a focusable separator is the window-splitter pattern) -->
+    <div
+      class="np-resize"
+      class:dragging={dragWidth !== null}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Now playing width"
+      aria-valuemin={Math.round(box.min)}
+      aria-valuemax={Math.round(box.max)}
+      aria-valuenow={Math.round(shownWidth)}
+      tabindex="0"
+      onpointerdown={resizePanel}
+      ondblclick={() => keepPanelWidth(null)}
+      onkeydown={nudgePanel}
+    ></div>
   {/if}
 
   <PlayerBar />

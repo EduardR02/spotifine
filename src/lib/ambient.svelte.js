@@ -109,6 +109,14 @@
       MORPH, app.css) and the frost is traced in the ResizeObserver pass,
       after layout and before paint, so it takes a plane's new edge in the
       same frame the plane does.
+   5. Dragging the panel's edge (App.svelte) renders nothing. The panel
+      holds its anchor back for the length of the drag (panel.resizing),
+      and the drag moves the pictures already on screen instead
+      (shiftHaze): each is slid so the seam it was drawn for stays on the
+      panel's edge — a transform, on the compositor — and stretched only
+      as much as keeps the window's edges covered. When the drag ends the
+      panel publishes its anchor once and the haze is drawn once for the
+      new edge, fading in over the slid picture as any layout change does.
    ===================================================================== */
 
 /** What the panels and the layer share. Written only on a real change. */
@@ -119,6 +127,22 @@ export const haze = $state({
   lightTop: 1,
   lightBottom: 1,
 });
+
+let onShift = null;
+
+/** For the drag: the panel's left edge in window CSS px while it is being
+    dragged, then null once it is let go (THE FROST, 5). */
+export function shiftHaze(edge) {
+  onShift?.(edge);
+}
+
+/** For the layer: receive shiftHaze's edges. Returns the unsubscribe. */
+export function watchShift(fn) {
+  onShift = fn;
+  return () => {
+    if (onShift === fn) onShift = null;
+  };
+}
 
 /** Publish the type's light; a change of 0.01 or less is not published. */
 export function publishLight(light) {

@@ -61,3 +61,9 @@ export function toggleFolder(id) {
   pins.folders = isCollapsed(id) ? pins.folders.filter((item) => item !== id) : [...pins.folders, id];
   write(`sr.library-folders:${pins.account}`, pins.folders);
 }
+
+/** Opens a folder if it is shut — it is where a new folder is being named —
+    which also forgets a deleted folder's state, since open is the default. */
+export function openFolder(id) {
+  if (isCollapsed(id)) toggleFolder(id);
+}

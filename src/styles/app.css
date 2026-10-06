@@ -343,19 +343,6 @@
   --lift-plane:    0 1px 1px rgba(0, 0, 0, 0.16), 0 16px 40px -22px rgba(0, 0, 0, 0.7);
   --lift-raised:   0 1px 1px rgba(0, 0, 0, 0.14), 0 12px 28px -18px rgba(0, 0, 0, 0.7);
   --lift-overlay:  0 2px 6px rgba(0, 0, 0, 0.22), 0 20px 44px -18px rgba(0, 0, 0, 0.66);
-
-  /* The now-playing panel is as wide as a 9:16 Canvas is at the window's
-     full height — it runs top to bottom — so the video is barely cropped;
-     never more than 40% of the window; and never wider than a Canvas can
-     fill sharply: 720px (the common width, and the smaller of the two
-     usual ones) at 1.2 device pixels to each of its own. Whole device
-     pixels, so the pane's and the bar's right edges, and the video's left
-     one, fall on the pixel grid rather than a quarter of the way across a
-     pixel, where a rim and a corner go soft. The panel keeps --dpr current
-     while it is open. */
-  --panel-w: round(nearest,
-    clamp(296px, min(100vh * 9 / 16, 864px / var(--dpr, 1) - var(--gutter)), 40vw),
-    1px / var(--dpr, 1));
 }
 
 
@@ -553,7 +540,17 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    the width under it. The panel steps out over the window's padding on
    the three sides where the window ends (see .np-panel), and keeps the
    gutter on the fourth, so the grid itself stays one shape and the pane
-   and the bar stay whole panes of glass beside it. */
+   and the bar stay whole panes of glass beside it.
+
+   The panel's width is its box, --np-w, set on .app by App.svelte from
+   the window (layout.js, THE NOW-PLAYING PANEL'S WIDTH): a third of the
+   window or the Canvas's natural width, or what the handle was dragged
+   to, and never so wide that the pane loses a column of the track table.
+   Its track is that less the gutter it steps out over. It changes on
+   every frame of a drag, so it is registered as not inherited: a change
+   restyles .app alone instead of every element in the window (measured:
+   about 1ms a frame against 12). */
+@property --np-w { syntax: "<length>"; inherits: false; initial-value: 0px; }
 .app {
   position: relative; z-index: 1;
   display: grid;
@@ -565,20 +562,18 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   height: 100vh;
 }
 .app.has-panel {
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--panel-w);
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) calc(var(--np-w) - var(--gutter));
   grid-template-areas: "side pane panel" "bar bar panel";
 }
 
 /* =====================================================================
    NARROW WINDOW — the chrome gives ground before the content does.
 
-   The window's floor is 940px. With the panel open the reading pane is what
-   absorbs the difference, and a playlist table cannot be built in 332px.
-
-   So below 1180 the rail steps down to a size that still holds "Driving
-   North at…" and a count, and the pane gets the 28px back. The panel
-   narrows on its own: it is as wide as the Canvas is at the window's
-   height (--panel-w), so a short window is also a narrower panel.
+   The window's floor is 940px. Below 1180 the rail steps down to a size
+   that still holds "Driving North at…" and a count, and the pane gets the
+   28px back. The panel gives ground before the pane does: it narrows to
+   leave the track table its columns, and when even its narrowest would
+   not, it steps aside until the window is wide enough again.
    ===================================================================== */
 @media (max-width: 1180px) {
   :root { --sidebar-w: 212px; --pane-pad: 18px; }
@@ -871,6 +866,28 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
      than cutting the two that reach the corners. */
   --np-corners: var(--np-radius) 0 0 var(--np-radius);
 }
+
+/* The handle (App.svelte): the gap left of the panel and a sliver of its
+   edge, top to bottom. A press there resizes the panel; the rest of the gap
+   still moves the window. At rest it is only a cursor. Under the pointer,
+   held or focused, a hairline down the middle of the gap, between the
+   planes' corners — in the gap, never over the picture. */
+.np-resize {
+  grid-area: panel; justify-self: start; z-index: 4;
+  position: relative;
+  width: calc(var(--gutter) + 4px);
+  margin: calc(var(--gutter) * -1) 0 calc(var(--gutter) * -1) calc(var(--gutter) * -1);
+  cursor: col-resize; touch-action: none; outline: none;
+}
+.np-resize::after {
+  content: ""; position: absolute;
+  top: calc(var(--gutter) + var(--r-panel)); bottom: calc(var(--gutter) + var(--r-panel));
+  left: calc(var(--gutter) / 2 - 1px); width: 2px; border-radius: var(--rf);
+  background: rgb(255 255 255 / 0.3);
+  opacity: 0; transition: opacity var(--d1) var(--ease);
+}
+.np-resize:hover::after, .np-resize.dragging::after { opacity: 1; }
+.np-resize:focus-visible::after { opacity: 1; background: var(--accent); }
 
 /* The picture layer, cut to the panel's corners. Nothing is
    painted under the video in it — no fill, no shadow — so the rounded cut

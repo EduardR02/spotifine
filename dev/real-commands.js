@@ -45,6 +45,8 @@ export const READ_COMMANDS = new Set([
   "browse_track_credits",
   "browse_canvas",
   "browse_followed_artists",
+  // Engine: the collection service's saved podcasts, read-only.
+  "browse_saved_shows",
   "browse_show",
   "browse_episode",
   "browse_profile",
@@ -53,7 +55,6 @@ export const READ_COMMANDS = new Set([
   // UI asks for devices only when the device menu is opened.
   "personal_api_status",
   "personal_api_contains",
-  "personal_api_saved_shows",
   "personal_api_devices",
   // Walks the cache directories, memoised for a minute.
   "get_cache_stats",

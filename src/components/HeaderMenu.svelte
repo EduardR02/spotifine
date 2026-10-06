@@ -38,5 +38,6 @@
   <Icon name="more" size={20} />
 </button>
 {#if open}
-  <Menu anchor={button} {label} onclose={() => (open = false)} {children} />
+  <!-- A group menu: an item may hang a submenu off it (Move to folder). -->
+  <Menu anchor={button} {label} group onclose={() => (open = false)} {children} />
 {/if}

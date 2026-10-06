@@ -93,6 +93,8 @@ const fixtures = {
     { id: "p1", name: "Road Trip", owner_id: "eduard", tracks_total: 12 },
     { id: "p2", name: "Deep Focus", owner_id: "eduard", tracks_total: 3 },
     { id: "p3", name: "Night Drive", owner_id: "eduard", tracks_total: 0 },
+    { id: "p4", name: "Lo-fi Beats", owner_id: "spotify", owner: "Spotify", tracks_total: 40 },
+    { id: "p5", name: "Gym Classics", owner_id: "eduard", tracks_total: 22 },
   ],
 };
 fixtures.episode = {
@@ -125,7 +127,46 @@ fixtures.playlistTree = [
     ] },
   ] },
   { kind: "playlist", id: fixtures.playlists[1].id },
+  { kind: "playlist", id: fixtures.playlists[3].id },
+  { kind: "folder", id: "f3", name: "Workouts", children: [
+    { kind: "playlist", id: fixtures.playlists[4].id },
+  ] },
 ];
+fixtures.savedShows = [
+  { id: fixtures.show.id, uri: fixtures.show.uri, name: fixtures.show.name, publisher: fixtures.show.publisher, description: "", cover_url: "" },
+  { id: "show2", uri: "spotify:show:show2", name: "Slow Science", publisher: "Field Recordings", description: "", cover_url: "" },
+];
+let folderSerial = 0;
+/** The fixture library's own copy of the tree, edited the way the shell
+    edits its copy when a rootlist write lands. */
+function treeTake(nodes, item) {
+  const index = nodes.findIndex((node) => node.kind === item.kind && node.id === item.id);
+  if (index >= 0) return nodes.splice(index, 1)[0];
+  for (const node of nodes) {
+    if (node.kind !== "folder") continue;
+    const taken = treeTake(node.children, item);
+    if (taken) return taken;
+  }
+  return null;
+}
+function treeFolder(nodes, id) {
+  for (const node of nodes) {
+    if (node.kind !== "folder") continue;
+    if (node.id === id) return node;
+    const found = treeFolder(node.children, id);
+    if (found) return found;
+  }
+  return null;
+}
+function treeInsertFirst(parent, node) {
+  const folder = parent ? treeFolder(fixtures.playlistTree, parent) : null;
+  (folder ? folder.children : fixtures.playlistTree).unshift(node);
+}
+function treeIds(node, out = []) {
+  if (node.kind === "playlist") out.push(node.id);
+  else for (const child of node.children) treeIds(child, out);
+  return out;
+}
 fixtures.playlistDetail = {
   id: "p1",
   name: "Road Trip",
@@ -943,14 +984,43 @@ const mock = {
         emitState();
         return null;
       }
-      case "personal_api_saved_shows": {
-        const offset = Number(args.offset ?? 0);
-        const items = offset === 0 ? [{ added_at: "2026-09-20", show: {
-          id: fixtures.show.id, uri: fixtures.show.uri, name: fixtures.show.name,
-          description: fixtures.show.description, publisher: fixtures.show.publisher,
-          images: [], total_episodes: fixtures.show.episodes.length,
-        } }] : [];
-        return { items, offset, limit: 50, total: 1, next: null, previous: null, href: "" };
+      case "browse_saved_shows":
+        return clone(fixtures.savedShows);
+      case "create_folder": {
+        const name = String(args.name ?? "").trim();
+        if (!name) throw new Error("folder name must not be empty");
+        folderSerial += 1;
+        const folder = { kind: "folder", id: `fx${String(folderSerial).padStart(14, "0")}`, name, children: [], last_activity: Math.floor(Date.now() / 1000) };
+        treeInsertFirst(args.parent ?? null, clone(folder));
+        return folder;
+      }
+      case "rename_folder": {
+        const folder = treeFolder(fixtures.playlistTree, args.id);
+        if (!folder) throw new Error("That folder is no longer in your library.");
+        folder.name = String(args.name ?? "").trim();
+        return null;
+      }
+      case "delete_folder": {
+        const folder = treeTake(fixtures.playlistTree, { kind: "folder", id: args.id });
+        if (!folder) throw new Error("That folder is no longer in your library.");
+        const gone = new Set(treeIds(folder));
+        fixtures.playlists = fixtures.playlists.filter((playlist) => !gone.has(playlist.id));
+        return null;
+      }
+      case "move_library_item": {
+        const node = treeTake(fixtures.playlistTree, args.item) ?? (args.item?.kind === "playlist" ? { kind: "playlist", id: args.item.id } : null);
+        if (!node) throw new Error("That folder is no longer in your library.");
+        treeInsertFirst(args.folder ?? null, node);
+        return null;
+      }
+      case "delete_playlist":
+        treeTake(fixtures.playlistTree, { kind: "playlist", id: args.id });
+        fixtures.playlists = fixtures.playlists.filter((playlist) => playlist.id !== args.id);
+        return null;
+      case "follow_playlist": {
+        const row = { ...clone(args.playlist), last_activity: Math.floor(Date.now() / 1000) };
+        fixtures.playlists = [row, ...fixtures.playlists.filter((playlist) => playlist.id !== row.id)];
+        return row;
       }
       case "browse_artist":
         return clone(fixtures.artist);

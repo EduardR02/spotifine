@@ -8,6 +8,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { normalizeCanonicalPlaylistDescription } from "./artist.js";
 import { parseSpotifyLink } from "./spotify-link.js";
 import { applyCacheMarks } from "./cache-marks.js";
+import { findFolder, insertFirst, moveItem, removeFolder, removePlaylist, renameFolder } from "./library-tree.js";
 
 /* ---------------- Navigation ---------------- */
 
@@ -1792,12 +1793,15 @@ export function setLibrary(playlists, { fresh = false, tree } = {}) {
 
 /**
  * Keep rootlist folders, but let the activity-ordered library decide where
- * their contents sit. A folder moves with its most recent remaining child;
- * explicitly pinned playlists are lifted out once, never duplicated inside.
- * Filtering is a flat, activity-ordered result set rather than orphaned folder
- * headings or indentation with no parent. A collapsed folder keeps its heading
- * (with the number of playlists it holds) and hides what is under it; a
- * filter looks inside collapsed folders too.
+ * their contents sit. A folder moves with its most recent remaining child,
+ * or with its own stamp when this app made it (a new folder comes first the
+ * way a new playlist does, empty or not); explicitly pinned playlists are
+ * lifted out once, never duplicated inside. Filtering is a flat,
+ * activity-ordered result set rather than orphaned folder headings or
+ * indentation with no parent. A collapsed folder keeps its heading (with the
+ * number of playlists it holds) and hides what is under it; a filter looks
+ * inside collapsed folders too. Each entry says which folder it sits in
+ * (`parent`), which is what a drop onto it means.
  */
 export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "", collapsedIds = []) {
   const byId = new Map(playlists.map((playlist) => [playlist.id, playlist]));
@@ -1808,13 +1812,21 @@ export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "",
   const pinnedRows = [];
   const query = filter.trim().toLocaleLowerCase();
   const matches = (playlist) => !query || playlist.name?.toLocaleLowerCase().includes(query);
+  /* A row's place: its activity, then its library position — the library is
+     already activity order with the rootlist's behind it, so for playlists
+     the position alone decides; the activity is what lets a folder's own
+     stamp stand among them. */
+  const before = (left, right) => {
+    if (left.at !== right.at) return right.at > left.at ? 1 : -1;
+    return left.rank === right.rank ? 0 : left.rank < right.rank ? -1 : 1;
+  };
 
   function playlistRow(playlist) {
     const id = playlist?.id;
     if (!id || seen.has(id)) return null;
     seen.add(id);
     if (!matches(playlist)) return null;
-    const row = { kind: "playlist", playlist, rank: rank.get(id) ?? Infinity };
+    const row = { kind: "playlist", playlist, at: activityValue(playlist), rank: rank.get(id) ?? Infinity };
     if (pinned.has(id)) {
       pinnedRows.push(row);
       return null;
@@ -1830,8 +1842,10 @@ export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "",
         // Do not leave empty headings behind a lifted pin. Truly empty folders
         // still belong to the rootlist and remain visible outside a filter.
         if (!children.length && (query || node.children?.length)) continue;
-        const folder = { kind: "folder", id: node.id, name: node.name, children, rank: Infinity };
-        for (const child of children) folder.rank = Math.min(folder.rank, child.rank);
+        const stamp = Number(node.last_activity);
+        let folder = { kind: "folder", id: node.id, name: node.name, children, at: Number.isFinite(stamp) ? stamp : Number.NEGATIVE_INFINITY, rank: Infinity };
+        const lead = children[0];
+        if (lead && before(lead, folder) < 0) folder = { ...folder, at: lead.at, rank: lead.rank };
         rows.push(folder);
       } else if (node.kind === "playlist") {
         // The tree names a playlist; its row lives once, in the library.
@@ -1839,7 +1853,7 @@ export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "",
         if (row) rows.push(row);
       }
     }
-    rows.sort((left, right) => left.rank === right.rank ? 0 : left.rank - right.rank);
+    rows.sort(before);
     return rows;
   }
 
@@ -1848,26 +1862,26 @@ export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "",
     const row = playlistRow(playlist);
     if (row) roots.push(row);
   }
-  roots.sort((left, right) => left.rank === right.rank ? 0 : left.rank - right.rank);
-  pinnedRows.sort((left, right) => left.rank === right.rank ? 0 : left.rank - right.rank);
-  const entries = pinnedRows.map(({ playlist }) => ({ kind: "playlist", playlist, depth: 0 }));
+  roots.sort(before);
+  pinnedRows.sort(before);
+  const entries = pinnedRows.map(({ playlist }) => ({ kind: "playlist", playlist, depth: 0, parent: null }));
   const countOf = (rows) => rows.reduce((sum, row) => sum + (row.kind === "folder" ? countOf(row.children) : 1), 0);
-  function flatten(rows, depth) {
+  function flatten(rows, depth, parent) {
     for (const row of rows) {
       if (row.kind === "folder") {
         if (query) {
-          flatten(row.children, 0);
+          flatten(row.children, 0, row.id);
           continue;
         }
         const shut = collapsed.has(row.id);
-        entries.push({ kind: "folder", id: row.id, name: row.name, depth, collapsed: shut, count: countOf(row.children) });
-        if (!shut) flatten(row.children, depth + 1);
+        entries.push({ kind: "folder", id: row.id, name: row.name, depth, parent, collapsed: shut, count: countOf(row.children) });
+        if (!shut) flatten(row.children, depth + 1, row.id);
       } else {
-        entries.push({ kind: "playlist", playlist: row.playlist, depth });
+        entries.push({ kind: "playlist", playlist: row.playlist, depth, parent });
       }
     }
   }
-  flatten(roots, 0);
+  flatten(roots, 0, null);
   if (query) {
     entries.sort((left, right) => {
       const pinOrder = Number(pinned.has(right.playlist.id)) - Number(pinned.has(left.playlist.id));
@@ -1957,6 +1971,118 @@ export function applyPlaylistSummary(summary) {
     if (row[key] !== value) row[key] = value;
   }
   return true;
+}
+
+/* ---------------- Library edits: folders, following ----------------
+   Every edit goes through the rootlist (see the engine's `edits`) and edits
+   `libraryState.tree` — the one tree — with the same edit the shell applies
+   to its copy when the write lands (library-tree.js). A move or a rename
+   shows the moment it is asked for and is put back if the write fails,
+   unless a library answer has replaced the tree meanwhile: then the
+   account's answer stands. A create or a delete waits for the write, as a
+   playlist's does — the one needs the id the account mints, the other is
+   confirmed in a dialog that shows it working. */
+
+function editFailed(what, error) {
+  ui.error = `${what} ${error instanceof Error ? error.message : String(error ?? "")}`.trim();
+}
+
+async function editTree(next, write, failure) {
+  const previous = libraryState.tree;
+  libraryState.tree = next;
+  const shown = libraryState.tree;
+  try {
+    await write();
+    return true;
+  } catch (error) {
+    if (libraryState.tree === shown) libraryState.tree = previous;
+    editFailed(failure, error);
+    return false;
+  }
+}
+
+function libraryItemName(item) {
+  return item.kind === "folder"
+    ? findFolder(libraryState.tree, item.id)?.name ?? "this folder"
+    : library.find((row) => row.id === item.id)?.name ?? "this playlist";
+}
+
+/** A new folder, first in the library or first in `parent`. Throws. */
+export async function createLibraryFolder(name, parent = null) {
+  const folder = await api.createFolder(name.trim(), parent);
+  if (!findFolder(libraryState.tree, folder.id)) {
+    libraryState.tree = insertFirst(libraryState.tree, parent, folder);
+  }
+  return folder;
+}
+
+export function renameLibraryFolder(id, name) {
+  const folder = findFolder(libraryState.tree, id);
+  const trimmed = name.trim();
+  if (!folder || !trimmed || trimmed === folder.name) return Promise.resolve(false);
+  return editTree(
+    renameFolder(libraryState.tree, id, trimmed),
+    () => api.renameFolder(id, trimmed),
+    `Could not rename "${folder.name}".`,
+  );
+}
+
+/** The folder and everything in it, gone from the library. Throws. */
+export async function deleteLibraryFolder(id) {
+  await api.deleteFolder(id);
+  const { tree, playlistIds } = removeFolder(libraryState.tree, id);
+  libraryState.tree = tree;
+  const gone = new Set(playlistIds);
+  for (let index = library.length - 1; index >= 0; index--) {
+    if (gone.has(library[index]?.id)) library.splice(index, 1);
+  }
+}
+
+/**
+ * A playlist or a folder, `{ kind, id }`, to the top of `folder` — or out of
+ * every folder when it is null. False, with nothing written, when it is
+ * already there or cannot go there.
+ */
+export function moveLibraryItem(item, folder = null) {
+  const next = moveItem(libraryState.tree, item, folder);
+  if (!next) return Promise.resolve(false);
+  return editTree(next, () => api.moveLibraryItem(item, folder), `Could not move "${libraryItemName(item)}".`);
+}
+
+/**
+ * Someone else's playlist out of your library, at once and without asking —
+ * Spotify does not ask either, and the playlist's page offers it back.
+ */
+export async function removeFromLibrary(id) {
+  const index = library.findIndex((row) => row?.id === id);
+  if (index < 0) return false;
+  const row = library[index];
+  const previous = libraryState.tree;
+  library.splice(index, 1);
+  libraryState.tree = removePlaylist(previous, id);
+  const shown = libraryState.tree;
+  try {
+    await api.deletePlaylist(id);
+    return true;
+  } catch (error) {
+    if (!library.some((entry) => entry?.id === id)) library.splice(Math.min(index, library.length), 0, row);
+    if (libraryState.tree === shown) libraryState.tree = previous;
+    editFailed(`Could not remove "${row.name}" from your library.`, error);
+    return false;
+  }
+}
+
+/** Puts a playlist back in your library, first, from the row its page holds
+    (the page's detail without its tracks: only the library row crosses). */
+export async function addToLibrary(playlist) {
+  const { tracks: _tracks, excluded_track_ids: _excluded, ...row } = playlist ?? {};
+  try {
+    insertPlaylist(await api.followPlaylist(row));
+    return true;
+  } catch (error) {
+    editFailed(`Could not add "${playlist?.name ?? "this playlist"}" to your library.`, error);
+    return false;
+  }
 }
 
 /* ---------------- Spotify saved tracks ---------------- */
@@ -2391,9 +2517,17 @@ export const api = {
   browseArtistSongwriter: (id, name) =>
     invoke("browse_artist_songwriter", { id, name }),
   browseFollowedArtists: () => invoke("browse_followed_artists"),
+  browseSavedShows: () => invoke("browse_saved_shows"),
   createPlaylist: (name) => invoke("create_playlist", { name }),
   renamePlaylist: (id, name) => invoke("rename_playlist", { id, name }),
+  /* One rootlist REM: deleting a playlist you made and removing someone
+     else's from your library are the same edit. */
   deletePlaylist: (id) => invoke("delete_playlist", { id }),
+  followPlaylist: (playlist) => invoke("follow_playlist", { playlist }),
+  createFolder: (name, parent = null) => invoke("create_folder", { name, parent }),
+  renameFolder: (id, name) => invoke("rename_folder", { id, name }),
+  deleteFolder: (id) => invoke("delete_folder", { id }),
+  moveLibraryItem: (item, folder = null) => invoke("move_library_item", { item, folder }),
   addPlaylistTracks: (id, uris) => invoke("add_playlist_tracks", { id, uris }),
   removePlaylistTracks: (id, uris, expectedSnapshotId = null) =>
     invoke("remove_playlist_tracks", { id, uris, expectedSnapshotId }),

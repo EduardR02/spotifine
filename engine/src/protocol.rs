@@ -428,6 +428,11 @@ pub enum Command {
     /// There is no cursor: the engine's `follow` module records why this read
     /// does not page.
     BrowseFollowedArtists,
+    /// Every podcast this account follows, newest first, from the collection
+    /// service. Responded to with a `browse_saved_shows` message carrying an
+    /// array of [`ShowRef`]; the engine's `collection` module records the
+    /// transport.
+    BrowseSavedShows,
     /// Creates a playlist via the spclient playlist4 create endpoint and adds
     /// it to the user's rootlist. Responded to with an `edit_create_playlist`
     /// message carrying the new playlist's [`PlaylistRef`].
@@ -444,6 +449,40 @@ pub enum Command {
     /// REM change. Responded to with an `edit_delete_playlist` message.
     EditDeletePlaylist {
         id: String,
+    },
+    /// Puts someone else's playlist back in the library: a rootlist ADD at
+    /// the top, which is all following a playlist is. Responded to with an
+    /// `edit_follow_playlist` message.
+    EditFollowPlaylist {
+        id: String,
+    },
+    /// Creates an empty folder at the top of the library, or at the top of
+    /// `parent`: the start and end markers as one rootlist ADD. Responded to
+    /// with an `edit_create_folder` message carrying the new folder id.
+    EditCreateFolder {
+        name: String,
+        #[serde(default)]
+        parent: Option<String>,
+    },
+    /// Renames a folder: its start marker, which carries the name, is
+    /// replaced in place (REM + ADD in one delta). Responded to with an
+    /// `edit_rename_folder` message.
+    EditRenameFolder {
+        id: String,
+        name: String,
+    },
+    /// Deletes a folder and everything in it from the library, as Spotify's
+    /// own client does. Responded to with an `edit_delete_folder` message.
+    EditDeleteFolder {
+        id: String,
+    },
+    /// Moves a playlist or a folder (with its contents) to the top of
+    /// `folder`, or out of every folder when `folder` is absent. Responded
+    /// to with an `edit_move_library_item` message.
+    EditMoveLibraryItem {
+        item: LibraryItem,
+        #[serde(default)]
+        folder: Option<String>,
     },
     /// Appends tracks to a playlist via a playlist4 ADD change. Responded to
     /// with an `edit_add_playlist_tracks` message.
@@ -1240,6 +1279,15 @@ pub struct UserProfile {
     pub playlists: Vec<PlaylistRef>,
 }
 
+/// One movable row of the library tree: a playlist by id, or a folder by
+/// the 16-hex id its rootlist markers carry.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LibraryItem {
+    Playlist { id: String },
+    Folder { id: String },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LibraryNode {
@@ -1433,7 +1481,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ArtistRef, AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations,
+        ArtistRef, AuthState, BrowseResponse, Command, LibraryItem, LoopRange, PlaylistRecommendations,
         PlaylistRef, PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse,
         SongwriterPlaylist, StateEvent, TrackRef, VolumeEvent,
         normalize_canonical_playlist_description, sanitize_playlist_description,
@@ -1447,6 +1495,47 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(request.command, Command::BrowseFollowedArtists));
+    }
+
+    #[test]
+    fn library_folder_commands_deserialize_from_the_line_protocol() {
+        let saved: Request = serde_json::from_value(json!({"request_id": "r1", "type": "browse_saved_shows"})).unwrap();
+        assert!(matches!(saved.command, Command::BrowseSavedShows));
+        let create: Request = serde_json::from_value(json!({
+            "request_id": "r2", "type": "edit_create_folder", "name": "Gym",
+        }))
+        .unwrap();
+        assert!(matches!(create.command, Command::EditCreateFolder { ref name, parent: None } if name == "Gym"));
+        let nested: Request = serde_json::from_value(json!({
+            "request_id": "r3", "type": "edit_create_folder", "name": "Gym", "parent": "0123456789abcdef",
+        }))
+        .unwrap();
+        assert!(matches!(nested.command, Command::EditCreateFolder { parent: Some(ref parent), .. } if parent == "0123456789abcdef"));
+        let moved: Request = serde_json::from_value(json!({
+            "request_id": "r4", "type": "edit_move_library_item",
+            "item": {"kind": "folder", "id": "0123456789abcdef"}, "folder": null,
+        }))
+        .unwrap();
+        assert!(matches!(
+            moved.command,
+            Command::EditMoveLibraryItem { item: LibraryItem::Folder { ref id }, folder: None } if id == "0123456789abcdef"
+        ));
+        let into: Request = serde_json::from_value(json!({
+            "request_id": "r5", "type": "edit_move_library_item",
+            "item": {"kind": "playlist", "id": "37i9dQZF1DXcBWIGoYBM5M"}, "folder": "0123456789abcdef",
+        }))
+        .unwrap();
+        assert!(matches!(into.command, Command::EditMoveLibraryItem { item: LibraryItem::Playlist { .. }, folder: Some(_) }));
+        for (kind, extra) in [
+            ("edit_rename_folder", json!({"id": "0123456789abcdef", "name": "Run"})),
+            ("edit_delete_folder", json!({"id": "0123456789abcdef"})),
+            ("edit_follow_playlist", json!({"id": "37i9dQZF1DXcBWIGoYBM5M"})),
+        ] {
+            let mut value = extra;
+            value["request_id"] = json!("r6");
+            value["type"] = json!(kind);
+            assert!(serde_json::from_value::<Request>(value).is_ok(), "{kind}");
+        }
     }
 
     #[test]

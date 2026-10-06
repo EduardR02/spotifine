@@ -1174,6 +1174,34 @@ pub async fn episode_browse(session: &Session, id: &str) -> Result<EpisodeRef, S
     .ok_or_else(|| "This podcast episode is not available on Spotify.".to_owned())
 }
 
+/// Library rows for saved podcasts: name, publisher and a rail-sized cover,
+/// resolved in extended-metadata batches in the given order. Descriptions are
+/// left out — the rail never shows one and the show page fetches its own —
+/// and audiobooks are not podcasts.
+pub(crate) async fn library_shows(session: &Session, uris: &[String]) -> Result<Vec<ShowRef>, String> {
+    let parsed: Vec<SpotifyUri> = uris.iter().filter_map(|uri| SpotifyUri::from_uri(uri).ok()).collect();
+    fetch_extended(session, parsed.iter(), ExtensionKind::SHOW_V4, |uri, payload| {
+        let message = librespot_protocol::metadata::Show::parse_from_bytes(payload).ok()?;
+        let show = Show::parse(&message, &SpotifyUri::from_uri(uri).ok()?).ok()?;
+        if show.is_audiobook {
+            return None;
+        }
+        let small = show.covers.iter()
+            .find(|image| image.size == librespot_metadata::image::ImageSize::SMALL)
+            .and_then(|image| image.id.to_base16().ok())
+            .map(|hex| format!("{COVER_BASE}{hex}"));
+        Some(ShowRef {
+            id: id_of(&show.id),
+            uri: uri_of(&show.id),
+            name: show.name,
+            publisher: show.publisher,
+            description: String::new(),
+            cover_url: small.or_else(|| cover_url(&show.covers)),
+        })
+    })
+    .await
+}
+
 pub async fn show_browse(session: &Session, id: &str) -> Result<ShowBrowse, String> {
     let uri = podcast_uri("show", id)?;
     let show: Show = metadata_get(session, &uri, "show").await?;

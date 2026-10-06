@@ -1,6 +1,7 @@
 mod audio;
 mod auth;
 mod browse;
+mod collection;
 mod customization;
 mod edits;
 mod engine;
@@ -502,6 +503,11 @@ async fn run(
                                     follow::followed_artists(&session).await
                                 });
                             }
+                            Command::BrowseSavedShows => {
+                                spawn_browse(&engine, request_id, "browse_saved_shows", move |session| async move {
+                                    collection::saved_shows(&session).await
+                                });
+                            }
                             Command::EditCreatePlaylist { name } => {
                                 spawn_browse(&engine, request_id, "edit_create_playlist", move |session| async move {
                                     edits::create_playlist(&session, &name).await
@@ -515,6 +521,31 @@ async fn run(
                             Command::EditDeletePlaylist { id } => {
                                 spawn_edit(&engine, request_id, "edit_delete_playlist", move |session| async move {
                                     edits::delete_playlist(&session, &id).await
+                                });
+                            }
+                            Command::EditFollowPlaylist { id } => {
+                                spawn_edit(&engine, request_id, "edit_follow_playlist", move |session| async move {
+                                    edits::follow_playlist(&session, &id).await
+                                });
+                            }
+                            Command::EditCreateFolder { name, parent } => {
+                                spawn_browse(&engine, request_id, "edit_create_folder", move |session| async move {
+                                    edits::create_folder(&session, &name, parent.as_deref()).await
+                                });
+                            }
+                            Command::EditRenameFolder { id, name } => {
+                                spawn_edit(&engine, request_id, "edit_rename_folder", move |session| async move {
+                                    edits::rename_folder(&session, &id, &name).await
+                                });
+                            }
+                            Command::EditDeleteFolder { id } => {
+                                spawn_edit(&engine, request_id, "edit_delete_folder", move |session| async move {
+                                    edits::delete_folder(&session, &id).await
+                                });
+                            }
+                            Command::EditMoveLibraryItem { item, folder } => {
+                                spawn_edit(&engine, request_id, "edit_move_library_item", move |session| async move {
+                                    edits::move_library_item(&session, &item, folder.as_deref()).await
                                 });
                             }
                             Command::EditAddPlaylistTracks { id, uris } => {

@@ -23,6 +23,7 @@
   import { observeStuck } from "../lib/sticky.js";
   import { rowWindow } from "../lib/virtual.js";
   import { scrollbar } from "../lib/scrollbar.js";
+  import { PANE_MIN } from "../lib/layout.js";
   import { pressTrack, justDragged, registerReorderZone, trackDrag } from "../lib/dnd.svelte.js";
 
   let {
@@ -209,8 +210,7 @@
        1. Added      — when you saved it matters least
        2. Album      — where it came from
        3. Plays      — how popular it is
-       4. Artwork    — last, and only in the extreme (a 940px window with the
-                       inspector open leaves the pane 332px wide)
+       4. Artwork    — last, and only in the extreme
 
      Nothing ever wraps and nothing is ever squeezed to zero: every elastic
      column is a minmax(0, …) and every cell truncates.
@@ -224,8 +224,12 @@
   };
 
   /* Pane width, in CSS px, below which each column stops earning its keep.
-     Measured against the pane rather than the window — see `ui.paneWidth`. */
-  const NEEDS = { added: 780, album: 640, plays: 540, art: 430 };
+     Measured against the pane rather than the window — see `ui.paneWidth`.
+     Added and album go where the title would fall under 155px, with and
+     without the date beside it: 640 is also the narrowest the now-playing
+     panel ever leaves the pane (layout.js, PANE_MIN), so the four columns
+     stay whenever it is open. */
+  const NEEDS = { added: PANE_MIN, album: 544, plays: 540, art: 430 };
   /* Below this the 16px column gap becomes 12px: at a narrow pane the gaps are
      a bigger share of the row than any single column. */
   const DENSE_BELOW = 780;

@@ -95,7 +95,15 @@
 <symbol id="i-scissors" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6.4" cy="6.6" r="2.6"/><circle cx="6.4" cy="17.4" r="2.6"/><path d="M8.6 8.1 20 17.4M8.6 15.9 20 6.6"/></symbol>
 <symbol id="i-waveform" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 10v4M8 7v10M12 4.5v15M16 8v8M20 10.5v3"/></symbol>
 <symbol id="i-restore" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.4 12.4a7.6 7.6 0 1 0 2.3-5.8"/><path d="M4.2 3.6v4.8H9"/></symbol>
-<symbol id="i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.4 4.8a2.2 2.2 0 0 1 3.1 0l.7.7a2.2 2.2 0 0 1 0 3.1L9 18.8l-4.4 1 1-4.4L15.4 4.8Z"/><path d="m13.6 6.6 3.8 3.8"/></symbol>
+<!-- Folders, as the rail's menus offer them: the folder itself, a new one,
+     and one an item goes into. Library membership as a ringed plus and
+     minus, the way Spotify draws Add to / Remove from Your Library. -->
+<symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3.4 7a2 2 0 0 1 2-2h3.8l2.1 2.3h7.3a2 2 0 0 1 2 2v8.6a2 2 0 0 1-2 2H5.4a2 2 0 0 1-2-2V7Z"/></symbol>
+<symbol id="i-folder-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.4 7a2 2 0 0 1 2-2h3.8l2.1 2.3h7.3a2 2 0 0 1 2 2v8.6a2 2 0 0 1-2 2H5.4a2 2 0 0 1-2-2V7Z"/><path d="M12 11v5.4M9.3 13.7h5.4"/></symbol>
+<symbol id="i-folder-move" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.4 7a2 2 0 0 1 2-2h3.8l2.1 2.3h7.3a2 2 0 0 1 2 2v8.6a2 2 0 0 1-2 2H5.4a2 2 0 0 1-2-2V7Z"/><path d="M8.8 13.7h6M12.6 11.3l2.4 2.4-2.4 2.4"/></symbol>
+<symbol id="i-library-add" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.6"/><path d="M12 8.2v7.6M8.2 12h7.6"/></symbol>
+<symbol id="i-library-remove" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.6"/><path d="M8.2 12h7.6"/></symbol>
+<symbol id="i-pencil"viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.4 4.8a2.2 2.2 0 0 1 3.1 0l.7.7a2.2 2.2 0 0 1 0 3.1L9 18.8l-4.4 1 1-4.4L15.4 4.8Z"/><path d="m13.6 6.6 3.8 3.8"/></symbol>
 <symbol id="i-filter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.8 5.2h16.4l-6.3 7.6v5.4l-3.8 2v-7.4L3.8 5.2Z"/></symbol>
 <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.4 6.8h15.2M9.6 6.8V4.9c0-.6.5-1.1 1.1-1.1h2.6c.6 0 1.1.5 1.1 1.1v1.9"/><path d="m6.4 6.8.9 12.4c.1 1 .9 1.8 1.9 1.8h5.6c1 0 1.8-.8 1.9-1.8l.9-12.4"/></symbol>
 <!-- The pin again, as an outline: in a menu it stands in a column of
