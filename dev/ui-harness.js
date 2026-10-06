@@ -1282,6 +1282,8 @@ window.__TAURI_INTERNALS__ = {
   runCallback,
   unregisterCallback,
   convertFileSrc: (source) => new URL(source, location.origin).href,
+  // What getCurrentWindow() reads; the window commands themselves answer null.
+  metadata: { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } },
   invoke: async (cmd, args = {}) => {
     calls.push({ cmd, args });
     return realMode ? realMode.invoke(cmd, args) : mock.invoke(cmd, args);

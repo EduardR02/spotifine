@@ -18,8 +18,11 @@
     pageTitle,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
+  import WindowControls from "./WindowControls.svelte";
+  import { drawsWindowControls } from "../lib/window-frame.svelte.js";
 
   let field = $state(null);
+  const framed = $derived(drawsWindowControls && !ui.nowPlayingOpen);
 
   // The sidebar's Search entry and Ctrl+F both focus this one field.
   $effect(() => {
@@ -147,7 +150,9 @@
 <div class="topbar-sentinel" aria-hidden="true" bind:this={sentinel}></div>
 <div class="topbar-sentinel topbar-edge" aria-hidden="true" bind:this={edge}></div>
 
-<div class="topbar" class:scrolled class:glass-strip={covering}>
+<!-- The bar's empty parts move the window. With the now-playing panel
+     closed, the window's controls end the bar; open, the panel has them. -->
+<div class="topbar" class:scrolled class:glass-strip={covering} class:framed data-tauri-drag-region="deep">
   <div class="hist">
     <button class="round" title="Back (Alt ←)" disabled={!canGoBack()} onclick={goBack}>
       <Icon name="back" size={16} />
@@ -170,7 +175,7 @@
     {/if}
   </div>
 
-  <form class="field" onsubmit={onSubmit}>
+  <form class="field" onsubmit={onSubmit} data-tauri-drag-region="false">
     <Icon name="search" size={14} />
     <input
       bind:this={field}
@@ -188,4 +193,6 @@
       </button>
     {/if}
   </form>
+
+  {#if framed}<WindowControls />{/if}
 </div>

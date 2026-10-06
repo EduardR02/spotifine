@@ -58,6 +58,31 @@ fn reconcile_autostart_preference(app: &tauri::AppHandle, settings: &mut app::Ap
     }
 }
 
+/// The Windows window has no native frame (tauri.windows.conf.json), so the
+/// frontend draws maximize and restore and has to know which one to show.
+/// Every way in or out of maximized resizes the window — the button, a
+/// double-click on a drag area, Aero snap, Win+Up — so Resized is the one
+/// place to look, and only a change is sent on.
+#[cfg(windows)]
+fn report_maximized(window: tauri::WebviewWindow) {
+    use std::cell::Cell;
+    use tauri::Emitter;
+
+    let last = Cell::new(None);
+    let handle = window.clone();
+    window.on_window_event(move |event| {
+        if !matches!(event, tauri::WindowEvent::Resized(_)) {
+            return;
+        }
+        let Ok(maximized) = handle.is_maximized() else {
+            return;
+        };
+        if last.replace(Some(maximized)) != Some(maximized) {
+            let _ = handle.emit("window-maximized", maximized);
+        }
+    });
+}
+
 /// Shared by normal RunEvent::Exit and the Windows updater's direct exit.
 pub(crate) fn shutdown_for_exit(app: &tauri::AppHandle) {
     if let Some(client) = app.try_state::<Arc<EngineClient>>() {
@@ -173,6 +198,8 @@ pub fn run() {
                         "could not show the main window at startup: {error}"
                     ));
                 }
+                #[cfg(windows)]
+                report_maximized(window);
             } else {
                 log::warn("could not find the main window at startup");
             }

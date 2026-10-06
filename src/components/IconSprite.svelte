@@ -102,4 +102,10 @@
      outlines at 16px, where the filled 11px mark would be the one heavy
      shape. -->
 <symbol id="i-pin-line" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8.6 3.4h6.8l-1 5.2 3.4 3.4v1.8H6.2V12l3.4-3.4-1-5.2Z"/><path d="M12 13.8v7"/></symbol>
+<!-- The window's own controls (WindowControls), drawn on a 12-unit grid for
+     the 10px they are shown at: hairline glyphs, as the system's are. -->
+<symbol id="i-win-min" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"><path d="M2 6h8"/></symbol>
+<symbol id="i-win-max" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1"><rect x="2" y="2" width="8" height="8" rx="1.4"/></symbol>
+<symbol id="i-win-restore" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"><rect x="1.8" y="3.8" width="6.4" height="6.4" rx="1.2"/><path d="M4 3.8v-.4c0-.7.5-1.2 1.2-1.2h3.6c.7 0 1.2.5 1.2 1.2V7c0 .7-.5 1.2-1.2 1.2h-.6"/></symbol>
+<symbol id="i-win-close" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"><path d="m2.6 2.6 6.8 6.8m0-6.8-6.8 6.8"/></symbol>
 </defs></svg>

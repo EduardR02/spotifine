@@ -644,9 +644,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: var(--s3) var(--s3) var(--s2);
+  padding: 0 var(--s3) var(--s2);
   border-radius: var(--r-panel);
 }
+/* The rail's top inset, as a strip the window is moved by (Sidebar). On
+   macOS the traffic lights are drawn over the window's top-left corner, so
+   the strip is as tall as the title bar they sit in and the first row
+   starts below them. */
+.sidebar-top { flex: none; height: var(--s3); margin: 0 calc(var(--s3) * -1); }
+:root[data-os="mac"] .sidebar-top { height: 30px; }
 .nav { display: flex; flex-direction: column; gap: 1px; }
 /* The app's mark, carried by the Home row. It is a filled tile among outline
    glyphs, so it is drawn one pixel narrower than the 17px icons around it —
@@ -913,13 +919,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
 }
 
-/* The head holds the one control over the picture — cover or Canvas — in
-   the corner, and is there only while there is a choice. Once the details
-   scroll up under it, it is the pane's top-bar strip (.glass-strip, set by
-   the panel), frosting the video live. Its corner is the panel's. */
+/* The head holds the controls over the picture in the corner: cover or
+   Canvas, while there is a choice, and on Windows the window's own
+   controls beside it. Once the details scroll up under it, it is the
+   pane's top-bar strip (.glass-strip, set by the panel), frosting the video
+   live. Its corner is the panel's. */
 .np-head {
   position: absolute; top: 0; left: 0; right: 0; z-index: 3;
-  display: flex; align-items: center; justify-content: flex-end;
+  display: flex; align-items: center; justify-content: flex-end; gap: var(--s3);
   height: var(--head-h); padding: 0 var(--s5);
   border-top-left-radius: var(--np-radius);
   transition: background-color var(--d2) var(--ease);
@@ -935,12 +942,27 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .np-swap svg { opacity: 0.8; }
 /* Pressing a plate lights it from inside rather than greying it. */
-:is(.np-swap, .np-more)::after {
+:is(.np-swap, .np-more, .win-btn)::after {
   content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
   background: rgba(255, 255, 255, 0); transition: background-color var(--d1) var(--ease);
 }
-:is(.np-swap, .np-more):hover { color: var(--fg); }
-:is(.np-swap, .np-more):hover::after { background: rgba(255, 255, 255, 0.1); }
+:is(.np-swap, .np-more, .win-btn):hover { color: var(--fg); }
+:is(.np-swap, .np-more, .win-btn):hover::after { background: rgba(255, 255, 255, 0.1); }
+
+/* The window's own controls (WindowControls), on Windows only: the swap
+   toggle's plate as three small circles, quieter than it at rest. Close
+   turns the system's red under the pointer. */
+.win-controls { display: flex; align-items: center; gap: 6px; flex: none; }
+.win-btn {
+  position: relative;
+  display: grid; place-items: center; width: 26px; height: 26px; flex: none;
+  border-radius: var(--rf); color: var(--fg-1);
+  transition: color var(--d1) var(--ease);
+}
+/* Under the glyph: the close fill is opaque. */
+.win-btn::after { z-index: -1; }
+.win-close:hover { color: #fff; }
+.win-close:hover::after { background: #c42b1c; }
 
 /* ---- Hero ------------------------------------------------------------- */
 .np-hero {
@@ -1212,6 +1234,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: opacity var(--d2) var(--ease);
 }
 .topbar.scrolled::after { opacity: 1; }
+/* With the window's controls at its end (Windows, panel closed), the bar
+   tucks them into the pane's corner, as far from its right edge as from its
+   top and bottom. */
+.topbar.framed {
+  grid-template-columns: auto minmax(0, 1fr) minmax(152px, min(340px, 40%)) auto;
+  padding-right: calc((var(--topbar-h) - 26px) / 2);
+}
 
 /* The sentinel itself: no size, no paint, no hit area. It only has to have a
    position in the scrolled content for the observer to watch. */

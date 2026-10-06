@@ -29,6 +29,7 @@
   import { frost } from "./lib/ambient.svelte.js";
   import { devicesEnabled } from "./lib/personal.svelte.js";
   import { vuMeterStyle } from "./lib/vu-meter.js";
+  import { os } from "./lib/window-frame.svelte.js";
   import LibraryView from "./views/LibraryView.svelte";
   import MadeForYouView from "./views/MadeForYouView.svelte";
   import LikedSongsView from "./views/LikedSongsView.svelte";
@@ -52,6 +53,9 @@
   $effect(() => {
     initEvents();
   });
+
+  // The stylesheet's hook for the window frame (see window-frame.svelte.js).
+  document.documentElement.dataset.os = os;
 
   let trackEditor = null;
   const loadTrackEditor = () => (trackEditor ??= import("./views/TrackEditorView.svelte"));
@@ -400,10 +404,13 @@
 <IconSprite />
 <Ambient />
 
+<!-- The gutters between the panes are the window's to move it by: only a
+     press on the grid itself, never on a pane, counts. -->
 <div
   class="app"
   class:anim-paused={!playback.playing || !ui.windowFocused}
   class:has-panel={ui.nowPlayingOpen}
+  data-tauri-drag-region
 >
   <Sidebar />
 

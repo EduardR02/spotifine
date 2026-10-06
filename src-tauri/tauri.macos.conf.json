@@ -1,4 +1,19 @@
 {
+  "app": {
+    "windows": [
+      {
+        "title": "Spotifine",
+        "visible": false,
+        "width": 1200,
+        "height": 800,
+        "minWidth": 940,
+        "minHeight": 560,
+        "backgroundColor": "#121212",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ]
+  },
   "build": {
     "beforeBuildCommand": "bun run build && bun run build:engine && codesign --force --sign - target/release/PlaybackEngine"
   },

@@ -170,9 +170,9 @@ Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
 
 The audio path has its own resampler. Spotify decodes at 44.1 kHz and most
-Windows devices run at 48 kHz, and the stock path came out about half a percent
-slow and slightly flat. The replacement converts exactly, and tests pin both
-the timing and the quality.
+Windows devices run at 48 kHz, and librespot's stock conversion comes out about
+half a percent slow and slightly flat. This one converts exactly, and tests pin
+both the timing and the quality.
 
 Tauri and a web frontend are an odd pick for this. I used them because the UI
 needed the most iteration and HTML and CSS were much faster to work in.

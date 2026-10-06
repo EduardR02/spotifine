@@ -388,6 +388,9 @@
 {/snippet}
 
 <aside class="sidebar glass-chrome" use:frost>
+  <!-- The rail's top edge moves the window; on macOS the traffic lights sit
+       in it. -->
+  <div class="sidebar-top" data-tauri-drag-region></div>
   <nav class="nav">
     <button class="nav-item" class:active={route.name === "library"} onclick={() => navigate("library")}>
       <!-- Spotifine's mark, where the outline house used to be. It came off

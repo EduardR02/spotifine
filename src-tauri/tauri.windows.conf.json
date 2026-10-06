@@ -9,6 +9,7 @@
         "minWidth": 940,
         "minHeight": 560,
         "backgroundColor": "#121212",
+        "decorations": false,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"
       }
     ]

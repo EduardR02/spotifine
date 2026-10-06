@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Spotifine: Spotify without the bloat</title>
-<meta name="description" content="Spotify for Windows and macOS, without the bloat. A light desktop client with true random shuffle, playback speed, and cutting or looping parts of a song.">
+<meta name="description" content="Spotify for Windows and macOS that looks good and uses next to nothing: frosted glass lit by the playing song, and 0% CPU at rest. Plus true random shuffle, playback speed, and cutting or looping parts of a song.">
 <meta name="theme-color" content="#080808">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Spotifine">
-<meta property="og:description" content="Spotify for Windows and macOS, without the bloat.">
+<meta property="og:description" content="Spotify for Windows and macOS that looks good and uses next to nothing.">
 <meta property="og:url" content="https://eduardr02.github.io/spotifine/">
 <meta property="og:image" content="https://eduardr02.github.io/spotifine/now-playing.png">
 <meta name="twitter:card" content="summary_large_image">
@@ -200,16 +200,13 @@ b { font-weight: var(--w-semi); color: var(--fg); }
 .navlink svg { width: 16px; height: 16px; flex: none; }
 
 /* --------------------------------------------------------------- hero */
+/* The name, the one line, the button: centred over the picture below. */
 .hero {
-  display: grid; gap: var(--s7);
-  padding-top: 40px; padding-bottom: var(--s8);
-  align-items: center;
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  padding-top: 48px; padding-bottom: var(--s7);
 }
-@media (min-width: 1040px) {
-  .hero { grid-template-columns: minmax(0, 400px) minmax(0, 1fr); gap: 56px; padding-top: 72px; padding-bottom: var(--s9); }
-}
-.intro { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
-.intro .mark { margin-bottom: var(--s4); }
+@media (min-width: 1040px) { .hero { padding-top: 80px; padding-bottom: 40px; } }
+.hero .mark { margin-bottom: var(--s4); }
 h1 {
   margin-top: var(--s3);
   font-family: var(--font-display);
@@ -222,19 +219,15 @@ h1 {
 .pitch {
   margin-top: var(--s4);
   font-family: var(--font-display);
-  font-size: clamp(20px, 4.6vw, 24px);
+  font-size: clamp(20px, 4.6vw, 26px);
   font-weight: var(--w-med);
   line-height: 1.25;
   letter-spacing: -0.012em;
-  max-width: 22ch;
-}
-.lede {
-  margin-top: var(--s3);
-  color: var(--fg-1);
-  max-width: 38ch;
+  max-width: 36ch;
+  text-wrap: balance;
 }
 
-.get { margin-top: var(--s7); display: flex; flex-direction: column; align-items: flex-start; gap: var(--s3); max-width: 100%; }
+.get { margin-top: var(--s7); display: flex; flex-direction: column; align-items: center; gap: var(--s3); max-width: 100%; }
 .dl {
   display: inline-flex; align-items: center; gap: 14px;
   max-width: 100%;
@@ -255,17 +248,17 @@ h1 {
 }
 .dl small { font-size: 12.5px; font-weight: var(--w-med); line-height: 1.3; opacity: 0.74; }
 
-.alt { color: var(--fg-2); font-size: 13.5px; padding-left: var(--s2); }
-.alt a, .foot a, .lede a {
+.alt { color: var(--fg-2); font-size: 13.5px; }
+.alt a, .foot a {
   color: var(--accent); text-decoration: none;
   background: linear-gradient(currentColor 0 0) 0 100% / 0 1px no-repeat;
   transition: background-size var(--d2) var(--ease);
 }
-.alt a:hover, .foot a:hover, .lede a:hover { background-size: 100% 1px; }
+.alt a:hover, .foot a:hover { background-size: 100% 1px; }
 .alt .sep { margin: 0 6px; color: var(--fg-3); }
 
-.notes { margin-top: var(--s5); display: flex; flex-direction: column; gap: var(--s2); }
-.note { display: flex; gap: 10px; align-items: flex-start; color: var(--fg-1); font-size: 13.5px; }
+.notes { margin-top: var(--s5); display: flex; flex-direction: column; align-items: center; gap: var(--s2); max-width: 46ch; }
+.note { display: flex; gap: 10px; align-items: flex-start; color: var(--fg-1); font-size: 13.5px; text-align: left; }
 .note svg { width: 16px; height: 16px; flex: none; margin-top: 2px; color: var(--accent); }
 .note.warn svg { color: var(--love); }
 .note[hidden] { display: none; }
@@ -278,9 +271,51 @@ h1 {
   min-width: 0;
 }
 .shot img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; }
-@media (max-width: 1039px) {
-  .shot { margin: 0 calc(-1 * var(--s1)); }
+/* The picture at the page's full width: it is most of the argument. */
+.showcase { padding-bottom: var(--s6); }
+.showcase .shot { margin: 0; }
+
+/* ---------------------------------------------------- the two reasons */
+/* Looks and light, side by side once there is room: a figure, a label, a
+   line, and a few sentences each. */
+.sell { display: grid; gap: var(--s6); padding-bottom: var(--s8); }
+@media (min-width: 720px) { .sell { grid-template-columns: 1fr 1fr; } }
+.point {
+  border-radius: var(--r4);
+  padding: var(--s6);
+  min-width: 0;
 }
+@media (min-width: 1040px) { .point { padding: var(--s7) 36px 36px; } }
+.point-figure { display: flex; align-items: baseline; gap: var(--s3); height: 64px; margin-bottom: var(--s5); }
+.point h2 { margin-top: var(--s2); font-size: clamp(24px, 5vw, 28px); }
+.point p { margin-top: var(--s3); color: var(--fg-1); max-width: 52ch; }
+/* The idea at the size of a tile: the screenshot's own Canvas, and a pane
+   of the app's glass laid over part of it, frosting what it covers. */
+.swatch {
+  position: relative; isolation: isolate; overflow: hidden;
+  width: 128px; height: 64px; border-radius: var(--r3);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14), 0 16px 36px -16px rgba(80, 140, 220, 0.85);
+}
+.swatch::before {
+  content: ""; position: absolute; inset: -20px; z-index: -1;
+  background: url("now-playing.webp") 100% 42% / 310% auto no-repeat;
+  filter: blur(2px) saturate(1.3);
+}
+.swatch::after {
+  content: ""; position: absolute; inset: 9px 9px 9px 44px;
+  border-radius: 7px;
+  background: var(--glass-sheen), var(--tint-pane);
+  -webkit-backdrop-filter: blur(8px) saturate(1.45) brightness(0.7);
+          backdrop-filter: blur(8px) saturate(1.45) brightness(0.7);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), 0 6px 14px -6px rgba(0, 0, 0, 0.5);
+}
+.stat {
+  font-family: var(--font-display);
+  font-size: 64px; font-weight: var(--w-bold); line-height: 1;
+  letter-spacing: -0.04em; font-variant-numeric: tabular-nums;
+  background: var(--accent-grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.stat-label { color: var(--fg-2); font-size: 13.5px; }
 
 /* ------------------------------------------------------ below the hero */
 /* Laid out the way the app is: a reading pane, and a panel beside it. On a
@@ -468,14 +503,12 @@ h2 {
 
 <main>
   <section class="hero wrap">
-    <div class="intro">
       <span class="mark big rise" style="--i:1"><svg aria-hidden="true"><use href="#i-note"/></svg></span>
       <span class="tag rise" style="--i:2">Free and open source</span>
       <h1 class="rise" style="--i:3">Spotifine</h1>
-      <p class="pitch rise" style="--i:4">Spotify for Windows and macOS, without the bloat.</p>
-      <p class="lede rise" style="--i:5">Light enough to leave open all day, and it does what the official app won't: true random shuffle, playback speed, and cutting or looping parts of a song.</p>
+      <p class="pitch rise" style="--i:4">Spotify for Windows and macOS that looks good and uses next to nothing.</p>
 
-      <div class="get rise" style="--i:6">
+      <div class="get rise" style="--i:5">
         <a class="dl" id="dl" href="https://github.com/EduardR02/spotifine/releases/latest/download/Spotifine-windows-x64-setup.exe">
           <svg aria-hidden="true"><use href="#i-download"/></svg>
           <span><b id="dl-label">Download for Windows</b><small id="dl-meta">64-bit installer</small></span>
@@ -485,17 +518,33 @@ h2 {
         </p>
       </div>
 
-      <div class="notes rise" style="--i:7">
+      <div class="notes rise" style="--i:6">
         <p class="note"><svg aria-hidden="true"><use href="#i-check"/></svg><span>Needs Spotify Premium. The first launch opens the Spotify login in your browser.</span></p>
         <p class="note warn" id="intel" hidden><svg aria-hidden="true"><use href="#i-info"/></svg><span>This looks like an Intel Mac. Spotifine runs on Apple Silicon Macs (M1 and later) with macOS 14 or newer.</span></p>
         <p class="note" id="elsewhere" hidden><svg aria-hidden="true"><use href="#i-info"/></svg><span>Spotifine is for Windows PCs and Apple Silicon Macs. Open this page on one of those to download it.</span></p>
       </div>
-    </div>
+  </section>
 
-    <figure class="shot glass" style="margin:0">
+  <section class="showcase wrap" aria-label="Screenshot">
+    <figure class="shot glass">
       <img src="now-playing.webp" width="1600" height="900" fetchpriority="high"
            alt="Spotifine playing a playlist, with the song's video Canvas in the Now Playing panel">
     </figure>
+  </section>
+
+  <section class="sell wrap" aria-label="Why Spotifine">
+    <article class="point glass pane">
+      <div class="point-figure" aria-hidden="true"><span class="swatch"></span></div>
+      <span class="caps">Looks</span>
+      <h2>Frosted glass, lit by the song</h2>
+      <p>The whole interface is glass over a haze taken from the playing song's Canvas or cover, so the light changes with every song. It's drawn once per song, so it costs nothing while the music plays.</p>
+    </article>
+    <article class="point glass pane">
+      <div class="point-figure"><b class="stat">0%</b><span class="stat-label">CPU at rest</span></div>
+      <span class="caps">Light</span>
+      <h2>Uses next to nothing</h2>
+      <p>I built it because the official app ran my CPU hot just playing music. This one blips to 1–2% for a moment while you use it, and when nothing plays, nothing runs.</p>
+    </article>
   </section>
 
   <div class="lower wrap">
@@ -545,7 +594,7 @@ h2 {
         <li class="row playing">
           <span class="idx"><span class="vu" aria-hidden="true"><i></i><i></i><i></i></span></span>
           <span class="art"><svg aria-hidden="true"><use href="#i-shuffle"/></svg></span>
-          <span class="t"><b>Random shuffle</b><small>Every song gets the same chance, the first one too.</small></span>
+          <span class="t"><b>Random shuffle</b><small>A truly random order, with no weighting.</small></span>
         </li>
         <li class="row">
           <span class="idx">2</span>

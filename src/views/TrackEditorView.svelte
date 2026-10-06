@@ -752,7 +752,7 @@
       </section>
 
       <section class="range-section">
-        <div class="range-heading"><div><h3>Loop</h3><p>Repeat one section several times. Plays includes the first pass.</p></div><span class="loop-chip">{loopRange ? "Set" : "Off"}</span></div>
+        <div class="range-heading"><div><h3>Loop</h3><p>Repeat one section several times. Plays is how many times it plays in all.</p></div><span class="loop-chip">{loopRange ? "Set" : "Off"}</span></div>
         {#if loopRange}
           <div class="exact-row loop-row" class:selected={selected?.type === "loop"}>
             <button class="region-index" onclick={() => (selected = { type: "loop", key: loopRange._key })} aria-label="Select loop"><span></span>LP</button>

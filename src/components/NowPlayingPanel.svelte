@@ -13,6 +13,8 @@
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
   import Icon from "./Icon.svelte";
+  import WindowControls from "./WindowControls.svelte";
+  import { drawsWindowControls } from "../lib/window-frame.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { haze } from "../lib/ambient.svelte.js";
   import { formatTime } from "../lib/time.js";
@@ -49,9 +51,10 @@
   let headSentinel = $state(null);
 
   const videoShown = $derived(Boolean(canvasUrl) && canvasReady && !preferCover);
-  /** The head is the cover-or-Canvas choice, so it is there only while
-      there is one. */
-  const hasHead = $derived(Boolean(current) && canvasReady);
+  /** The cover-or-Canvas choice, there only while there is one. */
+  const canSwap = $derived(Boolean(current) && canvasReady);
+  /** The head holds that choice and, on Windows, the window's controls. */
+  const hasHead = $derived(canSwap || drawsWindowControls);
 
   /* The haze lays out differently when the video covers the panel: what is
      under it is never seen. Written from an effect so every path in and out
@@ -500,15 +503,20 @@
   {/if}
 
   {#if hasHead}
-    <header class="np-head" class:glass-strip={headOver}>
-      <button
-        class="np-swap glass-plate"
-        type="button"
-        title={videoShown ? "Show the cover art" : "Show the Canvas animation"}
-        onclick={swapSurface}
-      >
-        <Icon name="swap" size={11} />{videoShown ? "Cover" : "Canvas"}
-      </button>
+    <!-- Its empty part moves the window: the panel is the window's top
+         right corner. -->
+    <header class="np-head" class:glass-strip={headOver} data-tauri-drag-region="deep">
+      {#if canSwap}
+        <button
+          class="np-swap glass-plate"
+          type="button"
+          title={videoShown ? "Show the cover art" : "Show the Canvas animation"}
+          onclick={swapSurface}
+        >
+          <Icon name="swap" size={11} />{videoShown ? "Cover" : "Canvas"}
+        </button>
+      {/if}
+      {#if drawsWindowControls}<WindowControls />{/if}
     </header>
   {/if}
 </aside>
