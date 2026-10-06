@@ -1,7 +1,7 @@
 [package]
-name = "renderer"
-version = "0.1.19"
-description = "A Tauri App"
+name = "spotifine"
+version = "0.2.0"
+description = "Spotifine, Spotify without the bloat"
 authors = ["you"]
 edition = "2021"
 
@@ -11,11 +11,18 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "renderer_lib"
+name = "spotifine_lib"
 # Desktop-only: `main.rs` links this as a plain Rust library. The scaffold's
 # `staticlib`/`cdylib` outputs exist for mobile and FFI consumers, and cost a
 # 142 MB static archive plus its link time on every build for nothing here.
 crate-type = ["rlib"]
+
+# The executable is what Task Manager, Activity Monitor and the installers
+# show, so it carries the product name as written: `Spotifine.exe` and
+# `Spotifine.app/Contents/MacOS/Spotifine`.
+[[bin]]
+name = "Spotifine"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

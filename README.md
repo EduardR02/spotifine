@@ -1,4 +1,4 @@
-# Renderer
+# Spotifine
 
 Spotify for Windows and macOS, without the bloat.
 
@@ -25,18 +25,20 @@ and adds some quality-of-life improvements:
 
 ## Install
 
+The [download page](https://eduardr02.github.io/spotifine/) picks the right
+file for your computer.
+
 You need a Spotify Premium account. On first launch the app opens the Spotify
 login in your browser.
 
-- **Windows:** download the setup `.exe` from [Releases](../../releases) and
-  run it.
-- **macOS 14+ (Apple Silicon):** download `renderer-macos-aarch64.zip` from
-  [Releases](../../releases), extract `renderer.app` and open it. The app is
+- **Windows:** download `Spotifine-windows-x64-setup.exe` from
+  [Releases](../../releases) and run it.
+- **macOS 14+ (Apple Silicon):** download `Spotifine-macos-arm64.zip` from
+  [Releases](../../releases), extract `Spotifine.app` and open it. The app is
   ad-hoc signed, not notarized, so Gatekeeper may ask you to approve it. Only
   do that for builds you trust.
 
-From v0.1.19 on, Settings can check for and install updates. Install v0.1.19
-itself by hand.
+Settings checks for and installs updates.
 
 ## Not affiliated with Spotify
 
@@ -83,11 +85,11 @@ Some extra things I added because we control playback here:
 - A mark on songs that are already in the local audio cache.
 
 Canvas, the short looping video some songs have, is an account setting on
-Spotify's side. Renderer shows it whenever it's on for your account.
+Spotify's side. Spotifine shows it whenever it's on for your account.
 
 ### Likes, follows and devices
 
-Without any setup, Renderer can read your Liked Songs and the artists you
+Without any setup, Spotifine can read your Liked Songs and the artists you
 follow, but can't change them. To like songs, follow artists and people, see
 your saved podcasts, and play on your other devices, connect a Spotify
 developer app of your own. It's free, takes two minutes, and is a second
@@ -99,7 +101,7 @@ authorization for the same account, not another account.
    `http://127.0.0.1:5589/personal-api/callback`. Under the APIs you plan to
    use, tick **Web API**. Accept the terms and save.
 3. Open the app's settings, copy its **Client ID** and paste it into
-   Renderer's Settings. Only the Client ID: never the Client Secret.
+   Spotifine's Settings. Only the Client ID: never the Client Secret.
 4. Choose **Connect**. Spotify asks you, in the browser, to allow access to
    your library and follows.
 5. To play on other devices, choose **Allow** next to device access. Spotify
@@ -140,15 +142,15 @@ bun tauri build
 The installer lands in `target/release/bundle/nsis/` on Windows, and the app in
 `target/release/bundle/macos/` on macOS. For development, build the playback
 engine once with `bun run build:engine`, then run `bun tauri dev`. The checks
-are `cargo test -p renderer-engine`, `cargo test -p renderer`, `bun test` and
+are `cargo test -p renderer-engine`, `cargo test -p spotifine`, `bun test` and
 `bun run build`.
 
-Publishing a GitHub release runs the [release workflow](../../actions/workflows/macos-build.yml),
+Publishing a GitHub release runs the [release workflow](../../actions/workflows/release.yml),
 which builds, tests and signs both platforms and attaches the installers and
 the update files.
 
-Your login and caches stay on your computer, under `%LOCALAPPDATA%\SpotifyRenderer`
-on Windows or `~/Library/Application Support/SpotifyRenderer` on macOS. The
+Your login and caches stay on your computer, under `%LOCALAPPDATA%\Spotifine`
+on Windows or `~/Library/Application Support/Spotifine` on macOS. The
 developer-app authorization is kept in the system's credential store. Neither
 sign-in gives this project your Spotify password.
 

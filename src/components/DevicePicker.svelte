@@ -137,7 +137,7 @@
         </div>
         {@render row(
           "This computer", "computer", "", !remote, transferring === "local", false,
-          remote ? "Bring playback back here, paused" : "Renderer is playing here",
+          remote ? "Bring playback back here, paused" : "Spotifine is playing here",
           () => select(),
         )}
         {#if devices.length}
@@ -148,7 +148,7 @@
           {@render row(
             device.name, glyph, label, remote === device.id, transferring === device.id,
             !active || !device.id || device.is_restricted,
-            device.is_restricted ? `${device.name} can't be controlled` : remote === device.id ? `Renderer is playing on ${device.name}` : `Play on ${device.name}`,
+            device.is_restricted ? `${device.name} can't be controlled` : remote === device.id ? `Spotifine is playing on ${device.name}` : `Play on ${device.name}`,
             () => select(device),
           )}
         {/each}
@@ -199,7 +199,7 @@
     font-family: var(--font-small); font-size: var(--t-11);
   }
   .device-state { display: grid; place-items: center; width: 14px; flex: none; margin-left: calc(var(--s2) - var(--s3)); color: var(--accent); }
-  /* Where Renderer plays now is foam, glyph and name, with a check at the
+  /* Where Spotifine plays now is foam, glyph and name, with a check at the
      end: the one row that says "here". */
   .device-row.selected { color: var(--accent); }
   .device-row.selected > :global(.icon:first-child) { color: var(--accent); }

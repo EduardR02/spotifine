@@ -32,7 +32,7 @@ jobs:
           bun run build
           bun run build:engine
           cargo test -p renderer-engine
-          cargo test -p renderer
+          cargo test -p spotifine
       - name: Build and sign macOS app and updater archive
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -40,29 +40,29 @@ jobs:
           set -euo pipefail
           test -n "$TAURI_SIGNING_PRIVATE_KEY"
           bun tauri build
-          app=target/release/bundle/macos/renderer.app
+          app=target/release/bundle/macos/Spotifine.app
+          test -x "$app/Contents/MacOS/Spotifine"
           test -x "$app/Contents/Resources/PlaybackEngine"
           codesign --verify --deep --strict "$app"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.renderer.client
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.spotifine.client
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 14.0
           archive="$app.tar.gz"
           test -s "$archive"
           test -s "$archive.sig"
           mkdir -p archive-check
           tar -xzf "$archive" -C archive-check
-          codesign --verify --deep --strict archive-check/renderer.app
-          ditto -c -k --sequesterRsrc --keepParent "$app" renderer-macos.zip
+          codesign --verify --deep --strict archive-check/Spotifine.app
           mkdir -p release-assets
-          cp "$archive" release-assets/renderer-macos-aarch64.app.tar.gz
-          cp "$archive.sig" release-assets/renderer-macos-aarch64.app.tar.gz.sig
-          cp renderer-macos.zip release-assets/renderer-macos-aarch64.zip
+          ditto -c -k --sequesterRsrc --keepParent "$app" release-assets/Spotifine-macos-arm64.zip
+          cp "$archive" release-assets/Spotifine-macos-arm64.app.tar.gz
+          cp "$archive.sig" release-assets/Spotifine-macos-arm64.app.tar.gz.sig
       - name: Smoke-launch the app and bundled engine
         shell: bash
         run: |
           set -euo pipefail
-          app=target/release/bundle/macos/renderer.app
-          log="$HOME/Library/Application Support/SpotifyRenderer/logs/renderer.log"
-          "$app/Contents/MacOS/renderer" > runner-app.log 2>&1 &
+          app=target/release/bundle/macos/Spotifine.app
+          log="$HOME/Library/Application Support/Spotifine/logs/spotifine.log"
+          "$app/Contents/MacOS/Spotifine" > runner-app.log 2>&1 &
           app_pid=$!
           trap 'kill "$app_pid" 2>/dev/null || true' EXIT
           for attempt in {1..20}; do
@@ -81,7 +81,7 @@ jobs:
           exit 1
       - uses: actions/upload-artifact@v4
         with:
-          name: renderer-macos-aarch64
+          name: spotifine-macos
           path: release-assets/
           if-no-files-found: error
           retention-days: 14
@@ -119,11 +119,11 @@ jobs:
           test -s "${installers[0]}"
           test -s "${installers[0]}.sig"
           mkdir -p release-assets
-          cp "${installers[0]}" release-assets/renderer-windows-x86_64-setup.exe
-          cp "${installers[0]}.sig" release-assets/renderer-windows-x86_64-setup.exe.sig
+          cp "${installers[0]}" release-assets/Spotifine-windows-x64-setup.exe
+          cp "${installers[0]}.sig" release-assets/Spotifine-windows-x64-setup.exe.sig
       - uses: actions/upload-artifact@v4
         with:
-          name: renderer-windows-x86_64
+          name: spotifine-windows
           path: release-assets/
           if-no-files-found: error
           retention-days: 14
@@ -137,7 +137,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: renderer-*
+          pattern: spotifine-*
           merge-multiple: true
           path: release-assets
       - name: Publish complete signed release and latest.json
@@ -148,9 +148,10 @@ jobs:
         run: |
           set -euo pipefail
           cd release-assets
-          mac=renderer-macos-aarch64.app.tar.gz
-          win=renderer-windows-x86_64-setup.exe
-          for file in "$mac" "$mac.sig" "$win" "$win.sig" renderer-macos-aarch64.zip; do
+          mac=Spotifine-macos-arm64.app.tar.gz
+          win=Spotifine-windows-x64-setup.exe
+          zip=Spotifine-macos-arm64.zip
+          for file in "$mac" "$mac.sig" "$win" "$win.sig" "$zip"; do
             test -s "$file"
           done
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release.json
@@ -175,5 +176,5 @@ jobs:
             }' > latest.json
           jq -e '.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+([+-][0-9A-Za-z.-]+)?$")' latest.json > /dev/null
           jq -e '.pub_date != "null" and (.platforms | length == 2) and (.platforms | all(.[]; (.url | startswith("https://")) and (.signature | length > 0)))' latest.json > /dev/null
-          gh release upload "$RELEASE_TAG" "$mac" "$mac.sig" "$win" "$win.sig" renderer-macos-aarch64.zip --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$RELEASE_TAG" "$mac" "$mac.sig" "$win" "$win.sig" "$zip" --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload "$RELEASE_TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"

@@ -477,7 +477,7 @@ fn oauth_response(status: &str, accent: &str, heading: &str, message: &str) -> S
     let page = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>Renderer</title><style>{OAUTH_PAGE_STYLE}</style></head><body><main>\
+         <title>Spotifine</title><style>{OAUTH_PAGE_STYLE}</style></head><body><main>\
          <div class=\"rule\" style=\"background:{accent}\"></div>\
          <h1>{heading}</h1><p>{message}</p></main></body></html>"
     );
@@ -493,7 +493,7 @@ fn oauth_success_response() -> String {
         "200 OK",
         OAUTH_SUCCESS_ACCENT,
         "Signed in",
-        "Renderer has your Spotify session. You can close this tab and go back to the app.",
+        "Spotifine has your Spotify session. You can close this tab and go back to the app.",
     )
 }
 
@@ -503,7 +503,7 @@ fn oauth_failed_response() -> String {
         OAUTH_FAILED_ACCENT,
         "Sign-in was not completed",
         "Spotify did not send an authorisation code back. Close this tab and click Log in again \
-         in Renderer.",
+         in Spotifine.",
     )
 }
 

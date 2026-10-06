@@ -41,7 +41,7 @@ test("real mode never substitutes fixture profiles or accepts personal writes", 
     expect(mocked).toEqual([]);
     const before = forwarded.length;
     for (const cmd of ["personal_api_configure", "personal_api_authorize", "personal_api_set_saved", "select_output"]) {
-      await expect(mode.invoke(cmd, {})).rejects.toThrow("native Renderer app");
+      await expect(mode.invoke(cmd, {})).rejects.toThrow("native Spotifine app");
     }
     expect(forwarded.length).toBe(before);
     expect(forwarded.some(({ cmd }) => cmd === "personal_api_devices")).toBe(false);

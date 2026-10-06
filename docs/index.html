@@ -1,0 +1,655 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spotifine: Spotify without the bloat</title>
+<meta name="description" content="Spotify for Windows and macOS, without the bloat. A light desktop client with true random shuffle, playback speed, and cutting or looping parts of a song.">
+<meta name="theme-color" content="#080808">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Spotifine">
+<meta property="og:description" content="Spotify for Windows and macOS, without the bloat.">
+<meta property="og:url" content="https://eduardr02.github.io/spotifine/">
+<meta property="og:image" content="https://eduardr02.github.io/spotifine/now-playing.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%239ccfd8'/%3E%3Cstop offset='1' stop-color='%23ebbcba'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='24' height='24' rx='5' fill='url(%23g)'/%3E%3Cg transform='translate(1.8 1.6) scale(.85)' fill='none' stroke='%23080808' stroke-width='2.1' stroke-linejoin='round'%3E%3Cpath d='M9.3 17.6V6.1l9.4-2.1v11.7'/%3E%3Ccircle cx='6.8' cy='17.6' r='2.6' fill='%23080808' stroke='none'/%3E%3Ccircle cx='16.2' cy='15.7' r='2.6' fill='%23080808' stroke='none'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="preload" as="image" href="now-playing.webp" type="image/webp" fetchpriority="high">
+<style>
+/* The app's own design system (src/styles/app.css), trimmed to what this
+   page wears: the same greys, the same four accents, the same glass. */
+:root {
+  color-scheme: dark;
+
+  --bg-0: #080808;
+  --fg:   #f2f2f2;
+  --fg-1: #c4c4c4;
+  --fg-2: #acacac;
+  --fg-3: #8b8b8b;
+
+  --foam:     #9ccfd8;
+  --rose:     #ebbcba;
+  --love:     #eb6f92;
+  --accent:   var(--foam);
+  --accent-hi:  color-mix(in srgb, var(--foam) 78%, #ffffff);
+  --accent-lo:  color-mix(in srgb, var(--foam) 82%, var(--bg-0));
+  --accent-ink: var(--bg-0);
+  --accent-wash: color-mix(in srgb, var(--foam) 14%, transparent);
+  --accent-grad: linear-gradient(140deg, var(--foam) 0%, var(--rose) 100%);
+
+  --line:   rgba(255, 255, 255, 0.06);
+  --line-2: rgba(255, 255, 255, 0.11);
+  --hover:  rgba(255, 255, 255, 0.05);
+  --raise-1: rgba(255, 255, 255, 0.03);
+  --raise-2: rgba(255, 255, 255, 0.075);
+  --raise-3: rgba(255, 255, 255, 0.11);
+
+  --font-display: "Segoe UI Variable Display", "Segoe UI", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-text:    "Segoe UI Variable Text", "Segoe UI", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-small:   "Segoe UI Variable Small", "Segoe UI", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --w-body: 430;
+  --w-med:  520;
+  --w-semi: 600;
+  --w-bold: 650;
+
+  --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+  --s5: 20px; --s6: 24px; --s7: 32px; --s8: 48px; --s9: 64px;
+  --r1: 3px; --r2: 6px; --r3: 10px; --r4: 14px; --rf: 999px;
+
+  --d1: 90ms;
+  --d2: 160ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  --tint-chrome: rgb(10 11 14 / 0.36);
+  --tint-pane:   rgb(11 12 15 / 0.38);
+  --tint-active: rgb(8 9 12 / 0.55);
+  --lift-card:   rgba(255, 255, 255, 0.03);
+  --glass-sheen: linear-gradient(158deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0) 34%);
+  --glass-rim:   linear-gradient(145deg,
+                   rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.14) 14%,
+                   rgba(255, 255, 255, 0.06) 36%, rgba(255, 255, 255, 0.03) 68%,
+                   rgba(255, 255, 255, 0.08));
+  --rim-w: 1px;
+  --lift-plane:  0 1px 1px rgba(0, 0, 0, 0.16), 0 16px 40px -22px rgba(0, 0, 0, 0.7);
+  --lift-raised: 0 1px 1px rgba(0, 0, 0, 0.14), 0 12px 28px -18px rgba(0, 0, 0, 0.7);
+
+  --gutter: 16px;
+  --page: 1200px;
+}
+@media (resolution < 1.25dppx) {
+  :root {
+    --rim-w: 1.5px;
+    --glass-rim: linear-gradient(145deg,
+                   rgba(255, 255, 255, 0.25), rgba(255, 255, 255, 0.1) 14%,
+                   rgba(255, 255, 255, 0.045) 36%, rgba(255, 255, 255, 0.022) 68%,
+                   rgba(255, 255, 255, 0.06));
+  }
+}
+@media (min-width: 720px) { :root { --gutter: 32px; } }
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg-0);
+  color: var(--fg);
+  font-family: var(--font-text);
+  font-size: 15px;
+  font-weight: var(--w-body);
+  line-height: 1.5;
+  font-feature-settings: "kern" 1;
+  overflow-x: clip;
+}
+h1, h2, h3, p, ol, ul { margin: 0; }
+p, li { text-wrap: pretty; }
+ol, ul { padding: 0; list-style: none; }
+img { display: block; max-width: 100%; height: auto; }
+a { color: inherit; }
+b { font-weight: var(--w-semi); color: var(--fg); }
+::selection { background: var(--accent-wash); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: var(--r1); }
+
+/* THE HAZE. In the app, the playing record's own picture, seen through a
+   light lens, lights the window. Here the record is the screenshot: the same
+   picture the hero shows, blurred into the light the page stands in. Still,
+   no scrim. Drawn once; nothing re-blurs it while the page scrolls. */
+.haze {
+  position: fixed; inset: 0; z-index: -1;
+  overflow: hidden; pointer-events: none;
+  background: #0a1420;
+}
+.haze::before {
+  content: ""; position: absolute; inset: -14vmax;
+  background: url("now-playing.webp") 62% 40% / cover no-repeat;
+  filter: blur(72px) saturate(1.5) brightness(0.46);
+  transform: translateZ(0);
+}
+
+.wrap {
+  width: 100%;
+  max-width: calc(var(--page) + 2 * var(--gutter));
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+}
+
+/* THE MATERIAL: tint, sheen, a rim that catches the light at the top left
+   and fades round the edge, and a lift. No backdrop filter: the haze is
+   already frosted, as the app's planes are. */
+.glass { position: relative; isolation: isolate; }
+.glass::before {
+  content: ""; position: absolute; inset: 0; z-index: 2;
+  border-radius: inherit; padding: var(--rim-w);
+  background: var(--glass-rim);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  pointer-events: none;
+}
+.chrome { background: var(--glass-sheen), var(--tint-chrome); box-shadow: var(--lift-plane); }
+.pane   { background: var(--glass-sheen), var(--tint-pane);   box-shadow: var(--lift-plane); }
+.card   { background: var(--glass-sheen), var(--lift-card);   box-shadow: var(--lift-raised); }
+
+.mark {
+  display: grid; place-items: center; flex: none;
+  width: 28px; height: 28px; border-radius: 7px;
+  background: var(--accent-grad); color: var(--accent-ink);
+}
+.mark svg { width: 17px; height: 17px; }
+.mark.big {
+  width: 44px; height: 44px; border-radius: var(--r3);
+  box-shadow: 0 10px 26px -10px color-mix(in srgb, var(--rose) 55%, transparent);
+}
+.mark.big svg { width: 24px; height: 24px; }
+
+.tag {
+  display: inline-flex; align-items: center;
+  height: 19px; padding: 0 var(--s2) 0 9px;
+  border-radius: var(--rf);
+  background: var(--foam); color: var(--bg-0);
+  font-family: var(--font-small);
+  font-size: 10px; font-weight: var(--w-bold);
+  letter-spacing: 0.14em; text-transform: uppercase;
+  white-space: nowrap;
+}
+.caps {
+  font-family: var(--font-small);
+  font-size: 11px; font-weight: var(--w-semi);
+  letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--fg-2);
+}
+
+/* ------------------------------------------------------------- header */
+.top { padding-top: var(--s4); }
+.bar {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s4);
+  height: 52px; padding: 0 var(--s2) 0 var(--s3);
+  border-radius: var(--r4);
+}
+.brand {
+  display: flex; align-items: center; gap: 10px;
+  font-family: var(--font-display); font-size: 16px; font-weight: var(--w-semi);
+  letter-spacing: -0.01em; text-decoration: none;
+}
+.navlink {
+  display: inline-flex; align-items: center; gap: var(--s2);
+  height: 34px; padding: 0 var(--s3); border-radius: var(--r2);
+  color: var(--fg-1); font-size: 13.5px; text-decoration: none;
+  transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+}
+.navlink:hover { color: var(--fg); background: var(--hover); }
+.navlink svg { width: 16px; height: 16px; flex: none; }
+
+/* --------------------------------------------------------------- hero */
+.hero {
+  display: grid; gap: var(--s7);
+  padding-top: 40px; padding-bottom: var(--s8);
+  align-items: center;
+}
+@media (min-width: 1040px) {
+  .hero { grid-template-columns: minmax(0, 400px) minmax(0, 1fr); gap: 56px; padding-top: 72px; padding-bottom: var(--s9); }
+}
+.intro { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
+.intro .mark { margin-bottom: var(--s4); }
+h1 {
+  margin-top: var(--s3);
+  font-family: var(--font-display);
+  font-size: clamp(54px, 13vw, 92px);
+  font-weight: var(--w-bold);
+  line-height: 0.98;
+  letter-spacing: -0.045em;
+  margin-left: -0.04em;
+}
+.pitch {
+  margin-top: var(--s4);
+  font-family: var(--font-display);
+  font-size: clamp(20px, 4.6vw, 24px);
+  font-weight: var(--w-med);
+  line-height: 1.25;
+  letter-spacing: -0.012em;
+  max-width: 22ch;
+}
+.lede {
+  margin-top: var(--s3);
+  color: var(--fg-1);
+  max-width: 38ch;
+}
+
+.get { margin-top: var(--s7); display: flex; flex-direction: column; align-items: flex-start; gap: var(--s3); max-width: 100%; }
+.dl {
+  display: inline-flex; align-items: center; gap: 14px;
+  max-width: 100%;
+  min-height: 62px; padding: 10px 30px 10px 22px;
+  border-radius: var(--rf);
+  background: var(--accent); color: var(--accent-ink);
+  text-decoration: none;
+  box-shadow: 0 16px 36px -16px color-mix(in srgb, var(--foam) 75%, transparent);
+  transition: background-color var(--d1) var(--ease), transform var(--d2) var(--ease);
+}
+.dl:hover { background: var(--accent-hi); }
+.dl:active { background: var(--accent-lo); transform: translateY(1px); }
+.dl svg { width: 24px; height: 24px; flex: none; }
+.dl span { display: flex; flex-direction: column; min-width: 0; }
+.dl b {
+  color: inherit; font-family: var(--font-display);
+  font-size: 18px; font-weight: var(--w-bold); line-height: 1.2; letter-spacing: -0.005em;
+}
+.dl small { font-size: 12.5px; font-weight: var(--w-med); line-height: 1.3; opacity: 0.74; }
+
+.alt { color: var(--fg-2); font-size: 13.5px; padding-left: var(--s2); }
+.alt a, .foot a, .lede a {
+  color: var(--accent); text-decoration: none;
+  background: linear-gradient(currentColor 0 0) 0 100% / 0 1px no-repeat;
+  transition: background-size var(--d2) var(--ease);
+}
+.alt a:hover, .foot a:hover, .lede a:hover { background-size: 100% 1px; }
+.alt .sep { margin: 0 6px; color: var(--fg-3); }
+
+.notes { margin-top: var(--s5); display: flex; flex-direction: column; gap: var(--s2); }
+.note { display: flex; gap: 10px; align-items: flex-start; color: var(--fg-1); font-size: 13.5px; }
+.note svg { width: 16px; height: 16px; flex: none; margin-top: 2px; color: var(--accent); }
+.note.warn svg { color: var(--love); }
+.note[hidden] { display: none; }
+
+.shot {
+  border-radius: var(--r4);
+  overflow: hidden;
+  background: #0b1520;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25), 0 40px 90px -36px rgba(0, 0, 0, 0.9);
+  min-width: 0;
+}
+.shot img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; }
+@media (max-width: 1039px) {
+  .shot { margin: 0 calc(-1 * var(--s1)); }
+}
+
+/* ------------------------------------------------------ below the hero */
+/* Laid out the way the app is: a reading pane, and a panel beside it. On a
+   narrower screen the panel, how to open the app, comes first. */
+.lower { display: grid; gap: var(--s6); align-items: start; padding-bottom: var(--s6); }
+@media (min-width: 1040px) {
+  .lower { grid-template-columns: minmax(0, 1fr) 392px; }
+  .start  { grid-column: 2; grid-row: 1; }
+  .extras { grid-column: 1; grid-row: 1; }
+}
+h2 {
+  font-family: var(--font-display);
+  font-size: clamp(26px, 6vw, 32px);
+  font-weight: var(--w-bold);
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+  text-wrap: balance;
+}
+.start { border-radius: var(--r4); padding: var(--s6) var(--s3) var(--s3); }
+.start-head { padding: 0 var(--s3) var(--s5); }
+.start-head h2 { font-size: 23px; font-weight: var(--w-semi); letter-spacing: -0.015em; }
+.start-head p { margin-top: var(--s2); color: var(--fg-1); font-size: 14px; }
+
+/* One card per system. The visitor's own comes first and is lit the way
+   the app lights a selected row: a foam rail and a wash. */
+.firstrun { display: grid; gap: var(--s3); }
+@media (min-width: 720px) and (max-width: 1039px) { .firstrun { grid-template-columns: 1fr 1fr; } }
+.os {
+  border-radius: var(--r3);
+  padding: var(--s5);
+  min-width: 0;
+}
+.os.yours {
+  background:
+    linear-gradient(100deg, var(--accent-wash), transparent 70%),
+    var(--glass-sheen), var(--tint-active);
+}
+.os.yours::after {
+  content: ""; position: absolute; left: 0; top: 22px; bottom: 22px; width: 2px;
+  border-radius: 0 2px 2px 0; background: var(--accent);
+}
+.os-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s3); flex-wrap: wrap; }
+.os h3 {
+  font-family: var(--font-display); font-size: 20px; font-weight: var(--w-semi);
+  letter-spacing: -0.012em;
+}
+.os .file {
+  font-family: "Cascadia Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px; color: var(--fg-3);
+  overflow-wrap: anywhere;
+}
+.os .here { display: none; margin-left: var(--s2); vertical-align: 3px; }
+.os.yours .here { display: inline-flex; }
+.steps { margin-top: var(--s4); counter-reset: step; display: flex; flex-direction: column; gap: var(--s3); }
+.steps li {
+  counter-increment: step;
+  display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: var(--s3);
+  color: var(--fg-1);
+}
+.steps li::before {
+  content: counter(step);
+  display: grid; place-items: center;
+  width: 26px; height: 26px; border-radius: var(--rf);
+  background: var(--raise-2);
+  color: var(--fg); font-size: 12.5px; font-weight: var(--w-semi);
+  font-variant-numeric: tabular-nums;
+}
+.os.yours .steps li::before { background: color-mix(in srgb, var(--foam) 22%, transparent); color: var(--accent); }
+.steps li > span { padding-top: 2px; }
+
+/* The extras, as the app lays out a playlist: a header, a column head,
+   and rows, the first one playing. */
+.list { border-radius: var(--r4); padding: var(--s6) var(--s3) var(--s4); }
+.list-top { display: flex; gap: var(--s5); align-items: flex-end; padding: 0 var(--s3) var(--s6); }
+.cover {
+  display: grid; place-items: center; flex: none;
+  width: 112px; height: 112px; border-radius: var(--r3);
+  background: var(--accent-grad); color: var(--accent-ink);
+  box-shadow: 0 18px 40px -18px color-mix(in srgb, var(--rose) 60%, transparent);
+}
+.cover svg { width: 52px; height: 52px; }
+.list-top h2 { margin-top: var(--s2); }
+.list-top p { margin-top: var(--s2); color: var(--fg-1); max-width: 60ch; }
+@media (max-width: 599px) {
+  .list-top { flex-direction: column; align-items: flex-start; gap: var(--s4); }
+  .cover { width: 72px; height: 72px; }
+  .cover svg { width: 34px; height: 34px; }
+}
+.cols, .row {
+  display: grid; align-items: center;
+  grid-template-columns: 32px 40px minmax(0, 1fr);
+  column-gap: var(--s4);
+  padding: 0 var(--s3);
+}
+.cols { height: 34px; border-bottom: 1px solid var(--line); margin-bottom: var(--s2); }
+.cols .idx { text-align: center; }
+.row {
+  min-height: 60px; padding-top: 10px; padding-bottom: 10px;
+  border-radius: var(--r2);
+  transition: background-color var(--d1) var(--ease);
+}
+.row:hover { background: var(--hover); }
+.row .idx { text-align: center; color: var(--fg-2); font-variant-numeric: tabular-nums; font-size: 13.5px; }
+.art {
+  display: grid; place-items: center;
+  width: 40px; height: 40px; border-radius: var(--r1);
+  background: var(--raise-2); color: var(--fg-1);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+}
+.art svg { width: 20px; height: 20px; }
+.row .t { display: flex; flex-direction: column; min-width: 0; }
+.row .t b { font-size: 15px; font-weight: var(--w-med); line-height: 1.3; }
+.row .t small { font-size: 13px; color: var(--fg-2); line-height: 1.4; margin-top: 2px; }
+.row.playing {
+  background:
+    linear-gradient(90deg, var(--accent-wash), transparent 78%),
+    linear-gradient(var(--raise-2) 0 0), var(--tint-active);
+  box-shadow: inset 2px 0 var(--accent);
+}
+.row.playing .t b { color: var(--accent); }
+.row.playing .art { color: var(--accent); }
+.vu { display: inline-flex; align-items: flex-end; justify-content: center; gap: 2px; height: 14px; }
+.vu i { width: 3px; height: 100%; border-radius: 1px; background: var(--accent); transform-origin: bottom; transform: scaleY(0.5); }
+.vu i:nth-child(2) { transform: scaleY(0.9); }
+.vu i:nth-child(3) { transform: scaleY(0.65); }
+.also {
+  margin: var(--s4) var(--s3) 0; padding-top: var(--s4);
+  border-top: 1px solid var(--line);
+  color: var(--fg-2); font-size: 13.5px;
+}
+
+/* ------------------------------------------------------------- footer */
+.foot {
+  border-radius: var(--r4);
+  padding: var(--s5) var(--s6);
+  margin-bottom: var(--s4);
+  display: grid; gap: var(--s3);
+  color: var(--fg-2); font-size: 13px;
+}
+@media (min-width: 900px) {
+  .foot { grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--s7); }
+}
+.foot nav { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s5); font-size: 13.5px; }
+
+/* --------------------------------------------------------------- motion */
+@media (prefers-reduced-motion: no-preference) {
+  .rise { animation: rise 460ms var(--ease) both; animation-delay: calc(var(--i, 0) * 55ms); }
+  .shot { animation: settle 720ms var(--ease) 200ms both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+  @keyframes settle { from { opacity: 0; transform: translateY(18px) scale(0.985); } }
+  .vu i { animation: vu 1.1s ease-in-out infinite alternate; }
+  .vu i:nth-child(2) { animation-duration: 0.8s; animation-delay: -0.3s; }
+  .vu i:nth-child(3) { animation-duration: 1.3s; animation-delay: -0.6s; }
+  @keyframes vu { from { transform: scaleY(0.25); } to { transform: scaleY(1); } }
+}
+</style>
+</head>
+<body>
+<div class="haze" aria-hidden="true"></div>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-note" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M9.3 17.6V6.1l9.4-2.1v11.7"/><circle cx="6.8" cy="17.6" r="2.6" fill="currentColor" stroke="none"/><circle cx="16.2" cy="15.7" r="2.6" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.6v11.2m-4.6-4.6 4.6 4.6 4.6-4.6"/><path d="M4.4 15.6v2.6c0 1.2 1 2.2 2.2 2.2h10.8c1.2 0 2.2-1 2.2-2.2v-2.6"/></symbol>
+  <symbol id="i-out" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4.4h5.6V10M19.4 4.6 11 13"/><path d="M17.6 13.8v4c0 1-.8 1.8-1.8 1.8H6.2c-1 0-1.8-.8-1.8-1.8V8.2c0-1 .8-1.8 1.8-1.8h4"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.4"/><path d="m8.4 12.3 2.5 2.5 4.9-5.2"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M12 11v5.2M12 7.8v.1"/></symbol>
+  <symbol id="i-shuffle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 18h1.4c1.3 0 2.5-.6 3.2-1.7l6-8.6c.8-1.1 2-1.7 3.3-1.7h5"/><path d="m18 2.6 3.6 3.4-3.6 3.4"/><path d="M2.5 6h1.8c1.4 0 2.7.9 3.4 2.1"/><path d="M21.5 18h-5.3c-1.3 0-2.5-.7-3.2-1.8l-.5-.7"/><path d="m18 14.6 3.6 3.4-3.6 3.4"/></symbol>
+  <symbol id="i-skipped" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M6.1 6.1 17.9 17.9"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.4V12l3 2.5"/></symbol>
+  <symbol id="i-scissors" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6.4" cy="6.6" r="2.6"/><circle cx="6.4" cy="17.4" r="2.6"/><path d="M8.6 8.1 20 17.4M8.6 15.9 20 6.6"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="10.6" cy="10.6" r="6.4"/><path d="m15.6 15.6 5 5"/></symbol>
+  <symbol id="i-artist" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8.2" r="3.9"/><path d="M4.6 20.4c.9-3.7 3.9-6 7.4-6s6.5 2.3 7.4 6"/></symbol>
+</svg>
+
+<header class="top wrap">
+  <div class="bar glass chrome rise">
+    <a class="brand" href="./" aria-label="Spotifine home">
+      <span class="mark"><svg aria-hidden="true"><use href="#i-note"/></svg></span>Spotifine
+    </a>
+    <a class="navlink" href="https://github.com/EduardR02/spotifine">
+      GitHub<svg aria-hidden="true"><use href="#i-out"/></svg>
+    </a>
+  </div>
+</header>
+
+<main>
+  <section class="hero wrap">
+    <div class="intro">
+      <span class="mark big rise" style="--i:1"><svg aria-hidden="true"><use href="#i-note"/></svg></span>
+      <span class="tag rise" style="--i:2">Free and open source</span>
+      <h1 class="rise" style="--i:3">Spotifine</h1>
+      <p class="pitch rise" style="--i:4">Spotify for Windows and macOS, without the bloat.</p>
+      <p class="lede rise" style="--i:5">Light enough to leave open all day, and it does what the official app won't: true random shuffle, playback speed, and cutting or looping parts of a song.</p>
+
+      <div class="get rise" style="--i:6">
+        <a class="dl" id="dl" href="https://github.com/EduardR02/spotifine/releases/latest/download/Spotifine-windows-x64-setup.exe">
+          <svg aria-hidden="true"><use href="#i-download"/></svg>
+          <span><b id="dl-label">Download for Windows</b><small id="dl-meta">64-bit installer</small></span>
+        </a>
+        <p class="alt">
+          Also for <a id="dl-other" href="https://github.com/EduardR02/spotifine/releases/latest/download/Spotifine-macos-arm64.zip">Mac (Apple Silicon)</a><span class="sep" aria-hidden="true">·</span><a href="https://github.com/EduardR02/spotifine/releases">All releases</a>
+        </p>
+      </div>
+
+      <div class="notes rise" style="--i:7">
+        <p class="note"><svg aria-hidden="true"><use href="#i-check"/></svg><span>Needs Spotify Premium. The first launch opens the Spotify login in your browser.</span></p>
+        <p class="note warn" id="intel" hidden><svg aria-hidden="true"><use href="#i-info"/></svg><span>This looks like an Intel Mac. Spotifine runs on Apple Silicon Macs (M1 and later) with macOS 14 or newer.</span></p>
+        <p class="note" id="elsewhere" hidden><svg aria-hidden="true"><use href="#i-info"/></svg><span>Spotifine is for Windows PCs and Apple Silicon Macs. Open this page on one of those to download it.</span></p>
+      </div>
+    </div>
+
+    <figure class="shot glass" style="margin:0">
+      <img src="now-playing.webp" width="1600" height="900" fetchpriority="high"
+           alt="Spotifine playing a playlist, with the song's video Canvas in the Now Playing panel">
+    </figure>
+  </section>
+
+  <div class="lower wrap">
+  <section class="start glass pane" aria-labelledby="first-run">
+    <div class="start-head">
+      <h2 id="first-run">The first launch</h2>
+      <p>Spotifine isn't signed with a paid developer certificate, so your computer asks once whether you trust it.</p>
+    </div>
+    <div class="firstrun" id="firstrun">
+      <article class="os glass card" id="os-windows">
+        <div class="os-head">
+          <h3>Windows<span class="tag here">This computer</span></h3>
+          <span class="file">Spotifine-windows-x64-setup.exe</span>
+        </div>
+        <ol class="steps">
+          <li><span>Run the installer you downloaded.</span></li>
+          <li><span>If a blue box says <b>Windows protected your PC</b>, choose <b>More info</b>, then <b>Run anyway</b>.</span></li>
+          <li><span>Spotifine opens the Spotify login in your browser. Sign in, and you're listening.</span></li>
+        </ol>
+      </article>
+      <article class="os glass card" id="os-mac">
+        <div class="os-head">
+          <h3>Mac<span class="tag here">This computer</span></h3>
+          <span class="file">Spotifine-macos-arm64.zip</span>
+        </div>
+        <ol class="steps">
+          <li><span>Unzip the download, move <b>Spotifine</b> to Applications and open it.</span></li>
+          <li><span>If macOS won't open it, close the message and go to <b>System Settings&nbsp;→ Privacy &amp; Security</b>.</span></li>
+          <li><span>Scroll down, choose <b>Open Anyway</b> and confirm. Then sign in to Spotify in your browser.</span></li>
+        </ol>
+      </article>
+    </div>
+  </section>
+
+  <section class="extras" aria-labelledby="extras">
+    <div class="list glass pane">
+      <div class="list-top">
+        <div class="cover" aria-hidden="true"><svg><use href="#i-note"/></svg></div>
+        <div>
+          <span class="tag">Extras</span>
+          <h2 id="extras">What the official app won't do</h2>
+          <p>On top of the essentials: playlists, albums, artist pages, search, the queue, credits, radio and podcasts. No home feed, no AI DJ, no merch.</p>
+        </div>
+      </div>
+      <div class="cols caps" aria-hidden="true"><span class="idx">#</span><span></span><span>Title</span></div>
+      <ol>
+        <li class="row playing">
+          <span class="idx"><span class="vu" aria-hidden="true"><i></i><i></i><i></i></span></span>
+          <span class="art"><svg aria-hidden="true"><use href="#i-shuffle"/></svg></span>
+          <span class="t"><b>Random shuffle</b><small>Every song gets the same chance, the first one too.</small></span>
+        </li>
+        <li class="row">
+          <span class="idx">2</span>
+          <span class="art"><svg aria-hidden="true"><use href="#i-skipped"/></svg></span>
+          <span class="t"><b>Skip songs without removing them</b><small>Keep a track in a playlist but leave it out of normal playback.</small></span>
+        </li>
+        <li class="row">
+          <span class="idx">3</span>
+          <span class="art"><svg aria-hidden="true"><use href="#i-clock"/></svg></span>
+          <span class="t"><b>Playback speed</b><small>Anywhere from 0.5× to 4×.</small></span>
+        </li>
+        <li class="row">
+          <span class="idx">4</span>
+          <span class="art"><svg aria-hidden="true"><use href="#i-scissors"/></svg></span>
+          <span class="t"><b>Cut or loop part of a song</b><small>Cut out a section or loop an exact range, edited on a waveform, set per playlist.</small></span>
+        </li>
+        <li class="row">
+          <span class="idx">5</span>
+          <span class="art"><svg aria-hidden="true"><use href="#i-search"/></svg></span>
+          <span class="t"><b>Spotify links open here</b><small>Paste a shared link into search and it opens in the app, not the web player.</small></span>
+        </li>
+        <li class="row">
+          <span class="idx">6</span>
+          <span class="art"><svg aria-hidden="true"><use href="#i-artist"/></svg></span>
+          <span class="t"><b>Whole discographies</b><small>Play everything an artist released, continuously.</small></span>
+        </li>
+      </ol>
+      <p class="also">Also: 320 kbps and gapless, media keys and lock screen controls, listening history kept on your computer, and updates from Settings.</p>
+    </div>
+  </section>
+  </div>
+</main>
+
+<footer class="wrap">
+  <div class="foot glass chrome">
+    <p>Unofficial, and not affiliated with Spotify AB. “Spotify” is their trademark, used here only to say what this connects to. Running an unofficial client likely breaks Spotify's Terms of Use and could get an account suspended. Your call.</p>
+    <nav aria-label="Project">
+      <a href="https://github.com/EduardR02/spotifine">Source on GitHub</a>
+      <a href="https://github.com/EduardR02/spotifine/releases">All releases</a>
+      <a href="https://github.com/EduardR02/spotifine/blob/main/LICENSE">MIT license</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const latest = "https://github.com/EduardR02/spotifine/releases/latest/download/";
+  const builds = {
+    windows: { file: "Spotifine-windows-x64-setup.exe", label: "Download for Windows", meta: "64-bit installer", name: "Windows" },
+    mac: { file: "Spotifine-macos-arm64.zip", label: "Download for Mac", meta: "Apple Silicon · macOS 14 or later", name: "Mac (Apple Silicon)" },
+  };
+
+  const ua = navigator.userAgent;
+  const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+  const mac = /mac/i.test(platform) || /macintosh|mac os x/i.test(ua);
+  // An iPad's Safari asks for the desktop site and calls itself a Mac; its
+  // touch screen gives it away. A Mac reports no touch points.
+  const ipad = mac && !navigator.userAgentData && navigator.maxTouchPoints > 2;
+  const handheld = /android|iphone|ipad|ipod|mobile/i.test(ua) || ipad;
+  const windows = !handheld && (/win/i.test(platform) || /windows/i.test(ua));
+  const os = handheld ? null : windows ? "windows" : mac ? "mac" : null;
+
+  const $ = (id) => document.getElementById(id);
+  if (!os) {
+    $("elsewhere").hidden = false;
+    return;
+  }
+
+  const build = builds[os];
+  const other = builds[os === "mac" ? "windows" : "mac"];
+  $("dl").href = latest + build.file;
+  $("dl-label").textContent = build.label;
+  $("dl-meta").textContent = build.meta;
+  $("dl-other").href = latest + other.file;
+  $("dl-other").textContent = other.name;
+
+  const card = $(os === "mac" ? "os-mac" : "os-windows");
+  card.classList.add("yours");
+  $("firstrun").prepend(card);
+
+  if (os === "mac") {
+    intelMac().then((intel) => { if (intel) $("intel").hidden = false; });
+  }
+
+  // Only says Intel when a browser says so outright; anything unclear is
+  // taken to be Apple Silicon, the only Mac it is built for.
+  async function intelMac() {
+    try {
+      const data = navigator.userAgentData;
+      if (data && data.getHighEntropyValues) {
+        const { architecture } = await data.getHighEntropyValues(["architecture"]);
+        if (architecture) return architecture === "x86";
+      }
+    } catch {}
+    try {
+      const gl = document.createElement("canvas").getContext("webgl");
+      const info = gl && gl.getExtension("WEBGL_debug_renderer_info");
+      const gpu = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : "";
+      if (/apple m\d/i.test(gpu)) return false;
+      return /intel|radeon|amd|nvidia|geforce/i.test(gpu);
+    } catch {}
+    return false;
+  }
+})();
+</script>
+</body>
+</html>

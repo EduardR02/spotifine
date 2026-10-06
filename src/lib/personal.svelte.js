@@ -6,7 +6,7 @@ import { session, sessionEpoch, playback, lookupSavedIn, artistFollowChanged, ap
 /*
  * The personal Spotify app: the owner's own developer app for the same
  * account, which can WRITE to the library — likes, follows — and route
- * Renderer playback to a Spotify Connect device. It is never asked what is saved: Liked Songs is
+ * Spotifine playback to a Spotify Connect device. It is never asked what is saved: Liked Songs is
  * answered by the shell's membership index (`get_track_playlists`) and the
  * followed artists by the engine's own list, both local. The one exception is
  * whether you follow a USER, which nothing local knows (`followsUser`).

@@ -19,7 +19,7 @@ use url::Url;
 use crate::app::{load_app_settings, update_app_settings, AppSettings, AppState};
 
 const REDIRECT: &str = "http://127.0.0.1:5589/personal-api/callback";
-const VAULT_SERVICE: &str = "SpotifyRenderer.PersonalApi";
+const VAULT_SERVICE: &str = "Spotifine.PersonalApi";
 const VAULT_USER: &str = "spotify-developer-grant";
 const LIBRARY_SCOPES: &str = "user-library-read user-library-modify user-follow-read user-follow-modify";
 const DEVICE_SCOPES: &str = "user-read-playback-state user-modify-playback-state";

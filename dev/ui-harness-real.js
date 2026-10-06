@@ -216,7 +216,7 @@ export async function createRealMode(h) {
     if (READ_COMMANDS.has(cmd)) return forward(cmd, args);
     if (LOCAL_MOCK.has(cmd)) return mock.invoke(cmd, args);
     ignored[cmd] = (ignored[cmd] ?? 0) + 1;
-    throw new Error(`${cmd} cannot run in the read-only real-account harness. Use the native Renderer app for authorization, library changes, settings, or Spotify output selection.`);
+    throw new Error(`${cmd} cannot run in the read-only real-account harness. Use the native Spotifine app for authorization, library changes, settings, or Spotify output selection.`);
   }
 
   /* ------------------------------------------------------------- scene */

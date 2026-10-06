@@ -98,8 +98,8 @@ fn run_controls(
     receiver: std::sync::mpsc::Receiver<Update>,
 ) {
     let config = PlatformConfig {
-        dbus_name: "renderer",
-        display_name: "Renderer",
+        dbus_name: "spotifine",
+        display_name: "Spotifine",
         hwnd: hwnd.map(|value| value as *mut std::ffi::c_void),
     };
     let mut controls = match MediaControls::new(config) {

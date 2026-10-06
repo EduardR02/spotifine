@@ -11,7 +11,7 @@ node_modules/
 .idea/
 *.swp
 
-# App-owned runtime state (lives under %LOCALAPPDATA%\SpotifyRenderer)
+# App-owned runtime state (lives under %LOCALAPPDATA%\Spotifine)
 *.dat
 *.log
 

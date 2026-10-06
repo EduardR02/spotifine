@@ -31,7 +31,7 @@
      that app, and the README's step-by-step guide to it. All fixed. */
   const REDIRECT_URI = "http://127.0.0.1:5589/personal-api/callback";
   const DASHBOARD = "https://developer.spotify.com/dashboard";
-  const GUIDE = "https://github.com/EduardR02/renderer#likes-follows-and-devices";
+  const GUIDE = "https://github.com/EduardR02/spotifine#likes-follows-and-devices";
   let clientId = $state("");
   let clientIdVisible = $state(false);
   const storedClientId = $derived(personal.status?.client_id ?? "");
@@ -294,7 +294,7 @@
     <div class="set-group personal-app">
       <h2>Likes, follows &amp; devices</h2>
       <p class="set-intro">
-        Your own free Spotify developer app, for this same account, lets Renderer like songs,
+        Your own free Spotify developer app, for this same account, lets Spotifine like songs,
         follow artists and people, list your saved podcasts and play on your other devices.
         <button class="link-more inline-link" onclick={() => openUrl(GUIDE).catch(() => {})}>Setup guide</button>
       </p>
@@ -422,7 +422,7 @@
       <div class="set-row">
         <div>
           <div class="k">Launch at login</div>
-          <div class="d">Starts Renderer when you sign in.</div>
+          <div class="d">Starts Spotifine when you sign in.</div>
           {#if settingErrors.launchAtLogin}<div class="inline-error" role="alert">{settingErrors.launchAtLogin}</div>{/if}
         </div>
         <div class="set-ctl">

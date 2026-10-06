@@ -370,27 +370,27 @@ pub struct PlaylistTracksEntry {
 // Data directory
 // ---------------------------------------------------------------------------
 
-/// Keeps the existing Windows data directory; macOS uses the user's
-/// Application Support directory so the library and playback state survive
-/// restarts instead of landing in the temporary-directory fallback.
+/// `%LOCALAPPDATA%\Spotifine` on Windows; macOS uses the user's Application
+/// Support directory so the library and playback state survive restarts
+/// instead of landing in the temporary-directory fallback.
 pub fn data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         return PathBuf::from(std::env::var_os("HOME").expect("macOS home directory unavailable"))
-            .join("Library/Application Support/SpotifyRenderer");
+            .join("Library/Application Support/Spotifine");
     }
     #[cfg(not(target_os = "macos"))]
     {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(local).join("SpotifyRenderer");
+            return PathBuf::from(local).join("Spotifine");
         }
         if let Some(profile) = std::env::var_os("USERPROFILE") {
             return PathBuf::from(profile)
                 .join("AppData")
                 .join("Local")
-                .join("SpotifyRenderer");
+                .join("Spotifine");
         }
-        std::env::temp_dir().join("SpotifyRenderer")
+        std::env::temp_dir().join("Spotifine")
     }
 }
 
@@ -556,7 +556,7 @@ pub fn clear_playback_snapshot() -> Result<(), String> {
     Ok(())
 }
 
-/// Diagnostic logs under the app data directory: `renderer.log` and the
+/// Diagnostic logs under the app data directory: `spotifine.log` and the
 /// engine's `playback_engine.log`.
 pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
@@ -697,7 +697,7 @@ pub fn tracks_cache_bytes(playlists: &[PlaylistTracksEntry]) -> Option<Vec<u8>> 
     match serde_json::to_vec(&tracks_cache_ref(playlists)) {
         Ok(bytes) => Some(bytes),
         Err(error) => {
-            eprintln!("SpotifyRenderer: could not serialize the playlist tracks cache: {error}");
+            eprintln!("Spotifine: could not serialize the playlist tracks cache: {error}");
             None
         }
     }
@@ -709,7 +709,7 @@ pub fn write_tracks_cache_bytes(dir: &Path, bytes: &[u8]) {
     let path = dir.join("playlist_tracks_cache.json");
     if let Err(error) = std::fs::write(&path, bytes) {
         eprintln!(
-            "SpotifyRenderer: could not write cache {}: {error}",
+            "Spotifine: could not write cache {}: {error}",
             path.display()
         );
     }
@@ -1159,7 +1159,7 @@ fn write_json_cache<T: Serialize>(path: PathBuf, value: &T) {
         .and_then(|bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()));
     if let Err(error) = result {
         eprintln!(
-            "SpotifyRenderer: could not write cache {}: {error}",
+            "Spotifine: could not write cache {}: {error}",
             path.display()
         );
     }

@@ -40,11 +40,11 @@ async function tauriPage() {
   }
 }
 
-function runningRenderers() {
-  const csv = execFileSync("tasklist", ["/FI", "IMAGENAME eq renderer.exe", "/FO", "CSV", "/NH"], {
+function runningApps() {
+  const csv = execFileSync("tasklist", ["/FI", "IMAGENAME eq Spotifine.exe", "/FO", "CSV", "/NH"], {
     encoding: "utf8",
   });
-  return csv.split(/\r?\n/).map((line) => line.match(/^"renderer\.exe","(\d+)"/i)?.[1]).filter(Boolean);
+  return csv.split(/\r?\n/).map((line) => line.match(/^"Spotifine\.exe","(\d+)"/i)?.[1]).filter(Boolean);
 }
 
 function elevated() {
@@ -86,8 +86,8 @@ async function main() {
   if (args.has("--help")) {
     done(0, [
       "Usage: bun dev/real-app.js [--debug [--build]]",
-      "Default: launch target/release/renderer.exe from a non-admin shell with a per-process WebView2 port.",
-      "--debug --build: build target/debug/renderer.exe with a temporary full-window Tauri override, then launch it.",
+      "Default: launch target/release/Spotifine.exe from a non-admin shell with a per-process WebView2 port.",
+      "--debug --build: build target/debug/Spotifine.exe with a temporary full-window Tauri override, then launch it.",
       "--debug: launch an already-built debug app; rebuild if REAL_APP_CDP_PORT changed.",
       "The debug app uses target/release/PlaybackEngine.exe and your real account/state. No production configuration is changed.",
       `Port: ${CDP_PORT}. Give the harness dev server the same REAL_APP_CDP_PORT.`,
@@ -108,10 +108,10 @@ async function main() {
   if (before.answered && !before.page) {
     throw new Error(`Something answers on port ${CDP_PORT}, but it is not the app. Pick another port with REAL_APP_CDP_PORT.`);
   }
-  const pids = runningRenderers();
+  const pids = runningApps();
   if (pids.length) {
     done(2, [
-      `renderer.exe is already running (pid ${pids.join(", ")}).`,
+      `Spotifine.exe is already running (pid ${pids.join(", ")}).`,
       "Quit the native app before launching or rebuilding it; this helper never closes an existing app.",
       "For an elevated shell use `bun dev/real-app.js --debug --build`; otherwise use a non-admin shell for the release app.",
       `The real harness may read genuine cached data while offline, but unavailable reads fail rather than using fixtures: ${harness}`,
@@ -133,7 +133,7 @@ async function main() {
     if (code !== 0) throw new Error(`Debug build failed (${code ?? "terminated"}); the app was not launched.`);
   }
 
-  const exe = path.join(root, "target", debug ? "debug" : "release", "renderer.exe");
+  const exe = path.join(root, "target", debug ? "debug" : "release", "Spotifine.exe");
   const engine = path.join(root, "target", "release", "PlaybackEngine.exe");
   if (!fs.existsSync(exe) || !fs.existsSync(engine)) {
     throw new Error(debug

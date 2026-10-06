@@ -13,7 +13,7 @@
  *          dev/.real-cache/, which is gitignored: it is the owner's account.
  *   cache  that last live answer, when the app is closed or has no port.
  *   disk   for a few commands, the app's own persisted state under
- *          %LOCALAPPDATA%\SpotifyRenderer (queue, library, the 25 most
+ *          %LOCALAPPDATA%\Spotifine (queue, library, the 25 most
  *          recently opened playlists, history, settings) — read, never written.
  * When the stored answers disagree, the newer one wins. When nothing answers,
  * the reply is 404 and the harness falls back to its mock.
@@ -230,7 +230,7 @@ class AnswerCache {
 /** Mirrors `data_dir()` in src-tauri/src/app.rs. */
 export function appDataDir() {
   const base = process.env.LOCALAPPDATA ?? path.join(process.env.USERPROFILE ?? "", "AppData", "Local");
-  return path.join(base, "SpotifyRenderer");
+  return path.join(base, "Spotifine");
 }
 
 /**

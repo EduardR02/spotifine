@@ -107,7 +107,7 @@ fixtures.episode = {
 };
 fixtures.show = {
   id: "show1", uri: "spotify:show:show1", name: "Listening Notes",
-  publisher: "Renderer Radio", description: "Stories told entirely in sound.",
+  publisher: "Spotifine Radio", description: "Stories told entirely in sound.",
   cover_url: "", episodes: [
     fixtures.episode,
     { ...fixtures.episode, published_at: Date.UTC(2026, 8, 21),

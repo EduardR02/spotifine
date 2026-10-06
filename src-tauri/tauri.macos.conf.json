@@ -1,5 +1,4 @@
 {
-  "identifier": "com.renderer.client",
   "build": {
     "beforeBuildCommand": "bun run build && bun run build:engine && codesign --force --sign - target/release/PlaybackEngine"
   },

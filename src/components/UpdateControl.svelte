@@ -123,7 +123,7 @@
 
 <div class="set-row">
   <div>
-    <div class="k">Renderer {currentVersion || ""}</div>
+    <div class="k">Spotifine {currentVersion || ""}</div>
     {#if status}<div class="d" role="status">{status}</div>{/if}
     {#if errorMessage}<div class="inline-error" role="alert">{errorMessage}</div>{/if}
   </div>

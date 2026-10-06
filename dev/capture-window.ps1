@@ -5,9 +5,9 @@
 # is sharp. This avoids the question entirely: it marks itself DPI-aware, asks
 # Windows for the window's real device pixels, and encodes straight to PNG.
 #
-#   .\dev\capture-window.ps1 -Process renderer -Out docs\raw-library.png
+#   .\dev\capture-window.ps1 -Process Spotifine -Out docs\raw-library.png
 param(
-  [string]$Process = "renderer",
+  [string]$Process = "Spotifine",
   [Parameter(Mandatory = $true)][string]$Out
 )
 

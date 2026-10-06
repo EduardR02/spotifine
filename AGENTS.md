@@ -17,7 +17,7 @@ Common checks:
 
 ```text
 cargo test -p renderer-engine
-cargo test -p renderer
+cargo test -p spotifine
 bun run build
 bun test
 bun tauri build

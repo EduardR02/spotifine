@@ -3,7 +3,7 @@
 //! The app previously logged nowhere: engine lifecycle events (spawn, exit,
 //! ready, error, retry) and library failures went to stderr, which is
 //! invisible in a GUI launch. This module appends timestamped lines to
-//! `app::logs_dir()/renderer.log` with plain `std::fs` — no dependencies, no
+//! `app::logs_dir()/spotifine.log` with plain `std::fs` — no dependencies, no
 //! async, safe to call from the engine reader thread. Timestamps are UTC,
 //! matching the engine's own log (`playback_engine.log`), so the two files
 //! line up for diagnosis.
@@ -19,16 +19,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// no-op.
 static LOG_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// Rolls `renderer.log` once past this size, keeping one previous
+/// Rolls `spotifine.log` once past this size, keeping one previous
 /// generation — the same policy as the engine's own log.
 const APP_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Opens `logs/renderer.log` under the given directory for appends,
+/// Opens `logs/spotifine.log` under the given directory for appends,
 /// rolling an oversized previous run aside first. Idempotent; the last call
 /// wins (tests point it at a scratch dir).
 pub fn init(logs_dir: PathBuf) {
     let _ = std::fs::create_dir_all(&logs_dir);
-    let path = logs_dir.join("renderer.log");
+    let path = logs_dir.join("spotifine.log");
     // Keep writers out until rotation and its announcement are complete.
     let mut log_file = LOG_FILE.lock().expect("app log lock");
     if let Some((bytes, previous)) = rotate_file(&path, APP_LOG_MAX_BYTES) {
@@ -162,7 +162,7 @@ mod tests {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("renderer.log");
+        let path = dir.join("spotifine.log");
         append_to(&path, "INFO", "engine spawned (pid 123)");
         append_to(&path, "WARN", "engine exited; respawning in 2s");
         let contents = std::fs::read_to_string(&path).expect("log file written");
@@ -192,7 +192,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("renderer.log");
+        let path = dir.join("spotifine.log");
         std::fs::write(&path, vec![b'x'; APP_LOG_MAX_BYTES as usize]).unwrap();
 
         init(dir.clone());

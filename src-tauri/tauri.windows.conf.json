@@ -1,9 +1,8 @@
 {
-  "identifier": "com.renderer.app",
   "app": {
     "windows": [
       {
-        "title": "Renderer",
+        "title": "Spotifine",
         "visible": false,
         "width": 1200,
         "height": 800,

@@ -390,7 +390,7 @@
 <aside class="sidebar glass-chrome" use:frost>
   <nav class="nav">
     <button class="nav-item" class:active={route.name === "library"} onclick={() => navigate("library")}>
-      <!-- The renderer's mark, where the outline house used to be. It came off
+      <!-- Spotifine's mark, where the outline house used to be. It came off
            an inert branding block above this nav; the rail is short enough that
            48px of it was worth a whole library row, and Home is the one
            destination that is also "the app", so the mark still says what it

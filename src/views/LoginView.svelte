@@ -23,7 +23,7 @@
 >
   <div class="page-head">
     <span class="login-mark"><Icon name="note" size={20} /></span>
-    <span class="tag">Renderer</span>
+    <span class="tag">Spotifine</span>
     <h1 class="page-title">Sign in to start listening</h1>
     <p class="sub">
       Authorisation opens in your browser. Nothing is stored here but the

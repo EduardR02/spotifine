@@ -4068,35 +4068,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "renderer"
-version = "0.1.19"
-dependencies = [
- "base64 0.22.1",
- "keyring",
- "parking_lot",
- "rand 0.8.7",
- "renderer-engine",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "souvlaki",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-opener",
- "tauri-plugin-process",
- "tauri-plugin-single-instance",
- "tauri-plugin-updater",
- "tokio",
- "url",
- "windows 0.44.0",
-]
-
-[[package]]
 name = "renderer-engine"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "block2",
@@ -4883,6 +4856,33 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "spotifine"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "keyring",
+ "parking_lot",
+ "rand 0.8.7",
+ "renderer-engine",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "souvlaki",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-opener",
+ "tauri-plugin-process",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-updater",
+ "tokio",
+ "url",
+ "windows 0.44.0",
 ]
 
 [[package]]
