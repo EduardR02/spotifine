@@ -87,6 +87,12 @@ Some extra things I added because we control playback here:
 Canvas, the short looping video some songs have, is an account setting on
 Spotify's side. Spotifine shows it whenever it's on for your account.
 
+Drag the left edge of the now-playing panel to resize it. The width is
+remembered; double-click the edge to reset it. As the playlist narrows, album
+and then date-added disappear, while title, artist and duration stay visible.
+The panel leaves at least 400px for the main pane and never grows wider than
+the Canvas can fill at the window's height and display resolution.
+
 ### Likes, follows and devices
 
 Without any setup, Spotifine can read your Liked Songs, the artists you follow

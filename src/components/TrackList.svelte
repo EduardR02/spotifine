@@ -23,7 +23,6 @@
   import { observeStuck } from "../lib/sticky.js";
   import { rowWindow } from "../lib/virtual.js";
   import { scrollbar } from "../lib/scrollbar.js";
-  import { PANE_MIN } from "../lib/layout.js";
   import { pressTrack, justDragged, registerReorderZone, trackDrag } from "../lib/dnd.svelte.js";
 
   let {
@@ -203,12 +202,10 @@
      Sorting by artist survives the column: the title head is two controls
      rather than one, because the cell it names genuinely holds two things.
 
-     The DROP ORDER is a design decision and is written out below rather than
-     encoded in breakpoints scattered through a stylesheet. Space is taken from
-     CONTEXT before IDENTITY:
+     The DROP ORDER takes space from optional metadata before identity:
 
-       1. Added      — when you saved it matters least
-       2. Album      — where it came from
+       1. Album      — the first optional column to give way
+       2. Added      — when you saved it
        3. Plays      — how popular it is
        4. Artwork    — last, and only in the extreme
 
@@ -225,11 +222,9 @@
 
   /* Pane width, in CSS px, below which each column stops earning its keep.
      Measured against the pane rather than the window — see `ui.paneWidth`.
-     Added and album go where the title would fall under 155px, with and
-     without the date beside it: 640 is also the narrowest the now-playing
-     panel ever leaves the pane (layout.js, PANE_MIN), so the four columns
-     stay whenever it is open. */
-  const NEEDS = { added: PANE_MIN, album: 544, plays: 540, art: 430 };
+     These are independent of the panel's minimum reading-pane width:
+     album drops first, then added; title/artist and duration always stay. */
+  const NEEDS = { album: 640, added: 544, plays: 540, art: 430 };
   /* Below this the 16px column gap becomes 12px: at a narrow pane the gaps are
      a bigger share of the row than any single column. */
   const DENSE_BELOW = 780;

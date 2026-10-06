@@ -43,17 +43,14 @@ export function detailArtSize(pane) {
    aside on its own until there is room again, without touching whether it
    was asked to be open.
 
-   PANE_MIN is the narrowest pane the track table keeps all its columns at
-   — title and artist, album, added, duration (TrackList, NEEDS.added).
-   Picked from the owner's library, 966 tracks in 12 playlists: at 640 the
-   title column is 155px and shows 87% of the titles whole (92% of the
-   artist lines), the album column 113px and 76% of the albums.
+   PANE_MIN protects title/artist and duration, not optional metadata.
+   At 400px, with album, added and artwork dropped, the title cell has
+   196px after the narrow pane's padding, row padding, gaps and controls.
+   TrackList owns the independent thresholds for its optional columns.
 
-   PANEL_MIN holds the head, the hero and the cards. It is a little under
-   280 so the panel does not blink out between 1181 and 1183px, where the
-   rail is still at its wide size (app.css, NARROW WINDOW).
+   PANEL_MIN holds the head, the hero and the cards.
    ===================================================================== */
-export const PANE_MIN = 640;
+export const PANE_MIN = 400;
 export const PANEL_MIN = 272;
 const CANVAS_ASPECT = 9 / 16;
 const CANVAS_SHARP = 720 * 1.2;

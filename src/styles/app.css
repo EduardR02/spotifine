@@ -545,7 +545,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    The panel's width is its box, --np-w, set on .app by App.svelte from
    the window (layout.js, THE NOW-PLAYING PANEL'S WIDTH): a third of the
    window or the Canvas's natural width, or what the handle was dragged
-   to, and never so wide that the pane loses a column of the track table.
+   to, while reserving room for title/artist and duration in the pane.
    Its track is that less the gutter it steps out over. It changes on
    every frame of a drag, so it is registered as not inherited: a change
    restyles .app alone instead of every element in the window (measured:
@@ -571,9 +571,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
    The window's floor is 940px. Below 1180 the rail steps down to a size
    that still holds "Driving North at…" and a count, and the pane gets the
-   28px back. The panel gives ground before the pane does: it narrows to
-   leave the track table its columns, and when even its narrowest would
-   not, it steps aside until the window is wide enough again.
+   28px back. Optional track columns give way as the panel grows; the
+   panel narrows to preserve title/artist and duration, and steps aside
+   when even its narrowest would not leave those room.
    ===================================================================== */
 @media (max-width: 1180px) {
   :root { --sidebar-w: 212px; --pane-pad: 18px; }
