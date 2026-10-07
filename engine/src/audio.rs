@@ -204,11 +204,13 @@ fn set_customization(
     // consume the staged target config, emit proof for it, or be deferred.
 
     if discontinuous {
-        if let Some(ring) = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade() {
-            ring.clear();
-        }
+        // Read the user-pause intent as the clear ends it: the decoder's own
+        // stop inside a playing seek also clears `running`, so a second quick
+        // seek must not mistake that stop for a pause.
+        let user_paused = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade()
+            .is_some_and(|ring| ring.clear());
         if let Some(output) = LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade() {
-            output.discard();
+            output.discard_if_paused(user_paused);
         }
     }
 
@@ -1018,12 +1020,15 @@ impl OutputControl {
         }
     }
 
-    fn discard(&self) {
-        // Stop/Start preserves native submitted PCM. Only a genuine user
-        // pause may retain it; every decoder discontinuity needs a new stream.
-        self.pause();
-        self.status.abandon_attempt();
-        self.stream.lock().unwrap_or_else(PoisonError::into_inner).take();
+    /// Reopening the device costs an audible gap, so a playing discontinuity
+    /// keeps the stream: what the device still holds is one period (~10 ms) of
+    /// the old position. During a user pause that period would play on resume,
+    /// however long after, so the next start opens a fresh stream instead.
+    fn discard_if_paused(&self, user_paused: bool) {
+        let mut stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
+        if user_paused && !self.status.running.load(Ordering::Acquire) {
+            stream.take();
+        }
     }
 }
 
@@ -1508,8 +1513,9 @@ impl Sink for OutputSink {
         Ok(())
     }
 
-    /// A genuine user pause retains the callback cursor and native buffer.
-    /// Decoder discontinuities discard the native stream when staged.
+    /// Stops callbacks and keeps the native stream. The decoder stops the sink
+    /// inside every seek and at a loop pass, so dropping the stream here would
+    /// reopen the device on each of them (see [`OutputControl::discard_if_paused`]).
     fn stop(&mut self) -> SinkResult<()> {
         self.output.pause();
         let retaining = self.ring.retaining_pause.load(Ordering::Acquire);
@@ -2242,12 +2248,13 @@ mod tests {
         eprintln!("native lifecycle: idle=0, played={paused}, paused={paused}, resumed={stopped}, stopped={stopped}");
     }
 
-    /// Uses only silent PCM on the default device. A playing discontinuity
-    /// replaces native submitted audio; a natural queue EOF drains its tail
-    /// before callbacks are stopped.
+    /// Uses only silent PCM on the default device. A seek while playing is the
+    /// decoder's stop → seek → start, which must keep the native stream; the
+    /// natural end of the queue must leave a tail that drains, after which the
+    /// engine's stop silences the callbacks for good.
     #[test]
     #[ignore = "requires a default output device"]
-    fn native_discontinuity_replaces_submitted_audio_and_queue_eof_stops_callbacks() {
+    fn native_stream_survives_a_playing_seek_and_stops_after_the_queue_drains() {
         let _guard = customization_guard();
         let revision = configured(None, 1.0, 0, 1);
         let mut sink = open(cpal::default_host(), AudioFormat::F32);
@@ -2260,22 +2267,22 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         configured(None, 1.0, 30_000, 1);
-        assert!(sink.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_none(),
-            "a playing seek must discard the WASAPI-submitted buffer");
+        assert!(sink.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_some(),
+            "a playing seek keeps the native stream");
         sink.stop().unwrap();
         // A second seek lands while librespot is still between the first
         // one's stop and start: not a user pause either.
         let seek = configured(None, 1.0, 40_000, 1);
         sink.start().unwrap();
-        assert!(sink.output.status.attempt.load(Ordering::Acquire) > opened,
-            "playing seeks must open a fresh native buffer");
+        assert_eq!(sink.output.status.attempt.load(Ordering::Acquire), opened,
+            "quick seeks while playing must not reopen the device");
         assert!(sink.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_some());
         let before = sink.output.status.callbacks.load(Ordering::Relaxed);
         sink.queue(sink.ring.generation.load(Ordering::Acquire), seek,
             vec![0.0; tenth], None, 1.0).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert!(sink.output.status.callbacks.load(Ordering::Relaxed) > before,
-            "the replacement stream runs after the seek");
+            "the kept stream runs after the seek");
 
         finish_natural_boundary().unwrap();
         finish_output_tail().unwrap();

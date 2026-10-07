@@ -230,10 +230,7 @@ half a percent slow and slightly flat. This one converts exactly, and tests pin
 both the timing and the quality.
 Load and seek configuration is committed by the decoder thread; each PCM packet
 carries its owning revision and exact source frame. Codec preroll and trimming
-keep cuts and loops aligned after a seek. A discontinuous jump replaces the
-native output stream to discard audio already submitted to the device, while
-ordinary pause/resume and natural gapless boundaries retain their buffers.
-An empty output callback zero-fills the rest of its block after one ring probe.
+keep cuts and loops aligned after a seek. An empty output callback zero-fills the rest of its block after one ring probe.
 
 Tauri and a web frontend are an odd pick for this. I used them because the UI
 needed the most iteration and HTML and CSS were much faster to work in.
