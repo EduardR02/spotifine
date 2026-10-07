@@ -25,7 +25,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
 use librespot_playback::config::AudioFormat;
 use librespot_playback::convert::Converter;
-use librespot_playback::decoder::AudioPacket;
+use librespot_playback::decoder::{AudioPacket, AudioPacketPosition};
+use librespot_playback::player::DecoderTransition;
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
 use renderer_engine::protocol::TrackEdit;
 use tokio::sync::mpsc;
@@ -53,6 +54,7 @@ const LIVE_RING_POISON_MSG: &str = "live sample ring should not be poisoned";
 static LIVE_PROCESSING: Mutex<Weak<Mutex<AudioProcessing>>> = Mutex::new(Weak::new());
 const LIVE_PROCESSING_POISON_MSG: &str = "live audio processing registry should not be poisoned";
 static CUSTOMIZATION_REVISION: AtomicU64 = AtomicU64::new(0);
+static COMMITTED_REVISION: AtomicU64 = AtomicU64::new(0);
 static CUSTOMIZATION_SPEED: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
 static CUSTOMIZATION: Mutex<Customization> = Mutex::new(Customization {
     config: None,
@@ -137,8 +139,8 @@ pub fn install_signal_sender(sender: mpsc::UnboundedSender<AudioSignal>) {
         .expect("audio signal sender should not be poisoned") = Some(sender);
 }
 
-/// Installs a discontinuous customization at a known finite-loop pass.
-/// The engine supplies the pass for loads, seeks, and internal loop jumps.
+/// Stages a discontinuous customization for its owning decoder command.
+/// The command commits it after any old in-flight decoder read has returned.
 pub fn configure_customization_at_loop_pass(
     edit: Option<TrackEdit>,
     speed: f32,
@@ -148,9 +150,8 @@ pub fn configure_customization_at_loop_pass(
     set_customization(edit, speed, position_ms, true, loop_pass)
 }
 
-/// Installs the next gapless track without discarding audio already queued from
-/// the natural boundary. The outgoing pipeline is flushed separately by
-/// [`finish_natural_boundary`].
+/// Stages a gapless track while retaining outgoing audio and filter history.
+/// The outgoing pipeline is flushed separately by [`finish_natural_boundary`].
 pub fn configure_customization_after_natural_boundary(
     edit: Option<TrackEdit>,
     speed: f32,
@@ -199,30 +200,55 @@ fn set_customization(
         .fetch_add(1, Ordering::Release)
         .wrapping_add(1);
     drop(customization);
-    let output = LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade();
-    if let Some(output) = &output {
-        // The same native stream spans a natural boundary before the next
-        // decoder write. Its failure still belongs to the new configured load.
-        output.status.revision.store(revision, Ordering::Release);
-        output.status.ready.store(false, Ordering::Release);
-    }
+    // Writes retain the decoder's revision, so an in-flight old read cannot
+    // consume the staged target config, emit proof for it, or be deferred.
 
     if discontinuous {
-        // Read the user-pause intent as the clear ends it: librespot's own
-        // stop inside a playing seek also clears `running`, so a second quick
-        // seek must not mistake that stop for a pause.
-        let user_paused = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade()
-            .is_some_and(|ring| ring.clear());
-        if let Some(output) = output {
-            output.discard_if_paused(user_paused);
+        if let Some(ring) = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade() {
+            ring.clear();
+        }
+        if let Some(output) = LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade() {
+            output.discard();
         }
     }
 
     revision
 }
 
+/// Binds the staged revision to a command handled on the decoder thread.
+pub fn decoder_transition(revision: u64, discontinuous: bool) -> DecoderTransition {
+    DecoderTransition {
+        revision,
+        discontinuous,
+        commit: Box::new(move || {
+            let customization = CUSTOMIZATION.lock().expect("audio customization should not be poisoned");
+            if CUSTOMIZATION_REVISION.load(Ordering::Acquire) != revision {
+                return false;
+            }
+            COMMITTED_REVISION.store(revision, Ordering::Release);
+            if let Some(output) = LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade() {
+                output.status.revision.store(revision, Ordering::Release);
+                output.status.ready.store(false, Ordering::Release);
+            }
+            drop(customization);
+            true
+        }),
+        is_current: Box::new(move || current_decoder_revision(revision)),
+    }
+}
+
+fn current_decoder_revision(revision: u64) -> bool {
+    CUSTOMIZATION_REVISION.load(Ordering::Acquire) == revision
+        && COMMITTED_REVISION.load(Ordering::Acquire) == revision
+}
+
 pub fn customization_revision() -> u64 {
     CUSTOMIZATION_REVISION.load(Ordering::Acquire)
+}
+
+pub fn customization_pending(revision: u64) -> bool {
+    CUSTOMIZATION_REVISION.load(Ordering::Acquire) == revision
+        && COMMITTED_REVISION.load(Ordering::Acquire) != revision
 }
 
 /// Flushes the delayed WSOLA overlap region at decoder EOF without resetting
@@ -363,6 +389,8 @@ struct SampleRing {
     /// letting up to a packet of stale sound trail the stop.
     generation: AtomicU64,
     retaining_pause: AtomicBool,
+    #[cfg(test)]
+    empty_pops: AtomicU64,
 }
 
 #[derive(Default)]
@@ -438,6 +466,8 @@ impl SampleRing {
             space_freed: Condvar::new(),
             generation: AtomicU64::new(0),
             retaining_pause: AtomicBool::new(false),
+            #[cfg(test)]
+            empty_pops: AtomicU64::new(0),
         })
     }
 
@@ -606,7 +636,11 @@ impl SampleRing {
     /// Takes the next packet, or `None` when the producer has fallen behind.
     fn pop(&self) -> Option<RingPacket> {
         let mut state = self.lock();
-        let packet = state.packets.pop_front()?;
+        let Some(packet) = state.packets.pop_front() else {
+            #[cfg(test)]
+            self.empty_pops.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         state.queued_samples -= packet.samples.len();
         if let Some(timing) = packet.timing {
             let previous = state.audible;
@@ -782,6 +816,7 @@ struct LiveSource {
     pos: usize,
     /// Silence is emitted in whole frames so an underrun cannot swap channels.
     silence_remaining: usize,
+    underrun: bool,
 }
 
 impl LiveSource {
@@ -793,6 +828,7 @@ impl LiveSource {
             packet: RingPacket::default(),
             pos: 0,
             silence_remaining: 0,
+            underrun: false,
         }
     }
 
@@ -807,8 +843,19 @@ impl LiveSource {
             data.fill(T::EQUILIBRIUM);
             return;
         }
-        for frame in data.chunks_exact_mut(channels) {
+        let mut frames = data.chunks_exact_mut(channels);
+        while let Some(frame) = frames.next() {
             let left = self.next().unwrap_or(0.0) * gain;
+            if self.underrun {
+                // Do not lock an empty ring once per silent frame. The next
+                // native callback checks for newly produced audio.
+                frame.fill(T::EQUILIBRIUM);
+                for remaining in frames {
+                    remaining.fill(T::EQUILIBRIUM);
+                }
+                self.silence_remaining = 0;
+                return;
+            }
             let right = self.next().unwrap_or(0.0) * gain;
             if channels == 1 {
                 frame[0] = T::from_sample((left + right) * 0.5);
@@ -825,6 +872,7 @@ impl Iterator for LiveSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.underrun = false;
         if self.silence_remaining > 0 {
             self.silence_remaining -= 1;
             return Some(0.0);
@@ -854,6 +902,7 @@ impl Iterator for LiveSource {
                     // Underrun, or simply paused/stopped. Packets hold whole
                     // frames, so this is always a frame boundary.
                     self.silence_remaining = NUM_CHANNELS as usize - 1;
+                    self.underrun = true;
                     return Some(0.0);
                 }
             }
@@ -969,14 +1018,12 @@ impl OutputControl {
         }
     }
 
-    fn discard_if_paused(&self, user_paused: bool) {
-        let mut stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
-        if user_paused && !self.status.running.load(Ordering::Acquire) {
-            // A seek/load during a user pause invalidates the WASAPI buffer
-            // too, not just the callback cursor. The next start opens a fresh
-            // native stream.
-            stream.take();
-        }
+    fn discard(&self) {
+        // Stop/Start preserves native submitted PCM. Only a genuine user
+        // pause may retain it; every decoder discontinuity needs a new stream.
+        self.pause();
+        self.status.abandon_attempt();
+        self.stream.lock().unwrap_or_else(PoisonError::into_inner).take();
     }
 }
 
@@ -999,14 +1046,17 @@ struct AudioProcessing {
 }
 
 impl AudioProcessing {
-    fn synchronize_pipeline(&mut self, revision: u64) {
+    fn synchronize_pipeline(&mut self, revision: u64) -> bool {
         if self.pipeline_revision == revision {
-            return;
+            return current_decoder_revision(revision);
         }
         let (config, discontinuous) = {
             let mut customization = CUSTOMIZATION
                 .lock()
                 .expect("audio customization should not be poisoned");
+            if !current_decoder_revision(revision) {
+                return false;
+            }
             let config = customization.config.clone();
             let discontinuous = std::mem::take(&mut customization.discontinuous);
             (config, discontinuous)
@@ -1019,6 +1069,7 @@ impl AudioProcessing {
                 resampler.reset();
             }
         }
+        true
     }
 
     fn synchronize_speed(&mut self, pending: &mut Vec<f32>) -> Option<f32> {
@@ -1050,6 +1101,7 @@ impl AudioProcessing {
     fn render_packet(
         &mut self,
         samples: Vec<f32>,
+        source_frame: u64,
         pipeline_scratch: &mut Vec<f32>,
         resampler_scratch: &mut Vec<f32>,
     ) -> (Vec<f32>, Option<u32>) {
@@ -1060,7 +1112,7 @@ impl AudioProcessing {
         resampler_scratch.clear();
         let (filtered, loop_to) = match &mut self.pipeline {
             Some(pipeline) => {
-                let loop_to = pipeline.process(&samples, pipeline_scratch);
+                let loop_to = pipeline.process(source_frame, &samples, pipeline_scratch);
                 (&pipeline_scratch[..], loop_to)
             }
             None => (&samples[..], None),
@@ -1115,7 +1167,7 @@ pub struct OutputSink {
     ready_revision: Option<u64>,
     /// Pause can cancel native opening before the rate is known. Retain
     /// in-flight decoded packets unprocessed until the resumed open.
-    deferred: VecDeque<(u64, AudioPacket)>,
+    deferred: VecDeque<(u64, AudioPacketPosition, AudioPacket)>,
 }
 
 /// Maps a u16 volume (librespot's 0..=65535 scale) to the audible gain used
@@ -1334,7 +1386,7 @@ pub fn default_device_presence() -> DevicePresence {
 pub struct SilentSink;
 
 impl Sink for SilentSink {
-    fn write(&mut self, _packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
+    fn write(&mut self, _position: AudioPacketPosition, _packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
         Ok(())
     }
 }
@@ -1378,7 +1430,7 @@ impl Drop for OutputSink {
 
 impl Sink for OutputSink {
     fn start(&mut self) -> SinkResult<()> {
-        let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
+        let revision = COMMITTED_REVISION.load(Ordering::Acquire);
         self.output.status.revision.store(revision, Ordering::Release);
         self.output.status.running.store(true, Ordering::Release);
         self.output.status.ready.store(false, Ordering::Release);
@@ -1405,13 +1457,20 @@ impl Sink for OutputSink {
             self.output.pending.lock().unwrap_or_else(PoisonError::into_inner).take();
             match opened {
                 Ok((stream, config)) => {
+                    let mut native = self.output.stream.lock().unwrap_or_else(PoisonError::into_inner);
+                    if !self.output.status.running.load(Ordering::Acquire)
+                        || self.output.status.attempt.load(Ordering::Acquire) != attempt
+                        || !current_decoder_revision(revision)
+                    {
+                        return Ok(());
+                    }
                     self.output_rate = config.sample_rate().0;
                     self.ring.capacity.store(write_ahead_samples(self.output_rate), Ordering::Relaxed);
                     let mut processing = self.processing.lock().unwrap_or_else(PoisonError::into_inner);
                     processing.output_rate = self.output_rate;
                     processing.resampler = Resampler::new(SAMPLE_RATE, self.output_rate, NUM_CHANNELS as u16);
                     eprintln!("audio output: {} Hz, {} channels, {:?}", self.output_rate, config.channels(), config.sample_format());
-                    *self.output.stream.lock().unwrap_or_else(PoisonError::into_inner) = Some(stream);
+                    *native = Some(stream);
                     *self.output.error.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 }
                 Err((error, blocked)) => {
@@ -1449,12 +1508,8 @@ impl Sink for OutputSink {
         Ok(())
     }
 
-    /// Stops callbacks and keeps the native stream. librespot stops the sink
-    /// inside every seek (pause → seek → play) and at a loop pass, so dropping
-    /// the stream here reopened the device on each of them. A discontinuity
-    /// during a user pause is the one case whose submitted device buffer must
-    /// not be heard on resume, and the customization reset already drops the
-    /// stream for exactly that case (see [`OutputControl::discard_if_paused`]).
+    /// A genuine user pause retains the callback cursor and native buffer.
+    /// Decoder discontinuities discard the native stream when staged.
     fn stop(&mut self) -> SinkResult<()> {
         self.output.pause();
         let retaining = self.ring.retaining_pause.load(Ordering::Acquire);
@@ -1464,9 +1519,12 @@ impl Sink for OutputSink {
         }
         Ok(())
     }
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+    fn write(&mut self, position: AudioPacketPosition, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+        let revision = position.revision;
+        if !current_decoder_revision(revision) {
+            return Ok(());
+        }
         let ring_generation = self.ring.generation.load(Ordering::Acquire);
-        let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
         // librespot answers every write error with a pause it reports as an
         // ordinary one, so each error also tells the engine its cause: an
         // unplayable packet fails the track, a dead device the output.
@@ -1495,7 +1553,7 @@ impl Sink for OutputSink {
             && self.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_none()
         {
             // Held for the resumed open; the replayed write reports it then.
-            self.deferred.push_back((ring_generation, packet));
+            self.deferred.push_back((ring_generation, position, packet));
             return Ok(());
         }
         // Once the packet is accepted, and before any processing: the question
@@ -1516,7 +1574,9 @@ impl Sink for OutputSink {
 
         let processing = Arc::clone(&self.processing);
         let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
-        processing.synchronize_pipeline(revision);
+        if !processing.synchronize_pipeline(revision) {
+            return Ok(());
+        }
         self.pipeline_scratch.clear();
         if let Some(speed) = processing.synchronize_speed(&mut self.pipeline_scratch) {
             // The retiring stretcher hands its lookahead to exact 1x, so these
@@ -1537,7 +1597,7 @@ impl Sink for OutputSink {
         }
 
         let (queued, loop_to_ms) = processing.render_packet(
-            samples_f32, &mut self.pipeline_scratch, &mut self.resampler_scratch,
+            samples_f32, position.source_frame, &mut self.pipeline_scratch, &mut self.resampler_scratch,
         );
         let speed = processing.speed;
         drop(processing);
@@ -1560,13 +1620,13 @@ impl OutputSink {
             if !self.output.status.running.load(Ordering::Acquire) {
                 break;
             }
-            let Some((generation, packet)) = self.deferred.pop_front() else { break; };
+            let Some((generation, position, packet)) = self.deferred.pop_front() else { break; };
             if generation != self.ring.generation.load(Ordering::Acquire) {
                 continue;
             }
             let remaining = self.deferred.len();
             // Converter's f32 path has no dither/config state.
-            self.write(packet, &mut Converter::new(None))?;
+            self.write(position, packet, &mut Converter::new(None))?;
             if self.deferred.len() > remaining {
                 // Pause raced this write and retained it again. Restore its
                 // place ahead of the still-unprocessed packets.
@@ -1632,6 +1692,114 @@ mod tests {
         vec![1.0; samples]
     }
 
+    fn configured(edit: Option<TrackEdit>, speed: f32, position_ms: u32, pass: u32) -> u64 {
+        let revision = configure_customization_at_loop_pass(edit, speed, position_ms, pass);
+        (decoder_transition(revision, true).commit)();
+        revision
+    }
+
+    fn configured_natural(edit: Option<TrackEdit>, speed: f32, position_ms: u32) -> u64 {
+        let revision = configure_customization_after_natural_boundary(edit, speed, position_ms);
+        (decoder_transition(revision, false).commit)();
+        revision
+    }
+
+    fn packet_position(source_frame: u64) -> AudioPacketPosition {
+        AudioPacketPosition {
+            source_frame,
+            position_ms: (source_frame * 1_000 / u64::from(SAMPLE_RATE)) as u32,
+            revision: COMMITTED_REVISION.load(Ordering::Acquire),
+            skipped: false,
+        }
+    }
+
+    #[test]
+    fn an_inflight_decoder_read_cannot_consume_or_report_a_staged_target() {
+        use librespot_playback::decoder::{AudioDecoder, DecoderError, DecoderResult};
+        use renderer_engine::protocol::TimeRange;
+        struct BlockedDecoder {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl AudioDecoder for BlockedDecoder {
+            fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+                Ok(position_ms)
+            }
+            fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                Ok(Some((AudioPacketPosition {
+                    position_ms: 0, source_frame: 0, revision: 0, skipped: false,
+                }, AudioPacket::Samples(vec![0.25; 882]))))
+            }
+        }
+
+        let _guard = customization_guard();
+        let old_revision = configured(None, 1.0, 0, 1);
+        let (signals, mut receiver) = mpsc::unbounded_channel();
+        install_signal_sender(signals);
+        let mut sink = open(cpal::default_host(), AudioFormat::F32);
+        claim_live(&LIVE_RING, &sink.ring, LIVE_RING_POISON_MSG);
+        claim_live(&LIVE_PROCESSING, &sink.processing, LIVE_PROCESSING_POISON_MSG);
+        claim_live(&LIVE_OUTPUT, &sink.output, LIVE_OUTPUT_POISON_MSG);
+        let (entered, reading) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (transition_tx, transition_rx) = std::sync::mpsc::channel::<DecoderTransition>();
+        let worker = std::thread::spawn(move || {
+            let mut decoder = BlockedDecoder { entered, release: blocked };
+            let (mut position, pcm) = decoder.next_packet().unwrap().unwrap();
+            // This is the owning player's revision, not a write-time global.
+            position.revision = old_revision;
+            sink.write(position.clone(), pcm, &mut Converter::new(None)).unwrap();
+            sink.write(position, AudioPacket::Raw(vec![1]), &mut Converter::new(None)).unwrap();
+            assert!(sink.deferred.is_empty(), "stale reads must not survive as deferred audio");
+            assert_eq!(sink.signalled_revision, None);
+            assert!(sink.processing.lock().unwrap_or_else(PoisonError::into_inner).pipeline.is_none());
+            let transition = transition_rx.recv().unwrap();
+            assert!((transition.commit)());
+            sink.output.status.running.store(true, Ordering::Release);
+            sink.write(AudioPacketPosition {
+                position_ms: 100, source_frame: 4_410, revision: transition.revision, skipped: false,
+            }, AudioPacket::Samples(vec![0.75; 2_646]), &mut Converter::new(None)).unwrap();
+            assert_eq!(sink.ring.queued_samples(), 882,
+                "only the target's final 10 ms survives its 20 ms cut");
+            sink
+        });
+        reading.recv_timeout(Duration::from_secs(1)).unwrap();
+        let target = configure_customization_at_loop_pass(Some(TrackEdit {
+            cuts: vec![TimeRange { start_ms: 100, end_ms: 120 }], loop_range: None,
+        }), 1.0, 100, 1);
+        let transition = decoder_transition(target, true);
+        release.send(()).unwrap();
+        transition_tx.send(transition).unwrap();
+        let sink = worker.join().unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(AudioSignal::Output { revision }) if revision == target));
+        assert!(receiver.try_recv().is_err(), "old PCM and malformed data emit no target proof/failure");
+        drop(sink);
+    }
+
+    #[test]
+    fn superseded_transitions_cannot_commit_and_the_latest_transition_can() {
+        let _guard = customization_guard();
+        let old = configure_customization_at_loop_pass(None, 1.0, 100, 1);
+        let old_transition = decoder_transition(old, true);
+        assert!(!(old_transition.is_current)());
+        let latest = configure_customization_at_loop_pass(None, 2.0, 200, 1);
+        assert!(!(old_transition.commit)());
+        assert!(!(old_transition.is_current)());
+        assert!(customization_pending(latest));
+        let latest_transition = decoder_transition(latest, true);
+        assert!(!(latest_transition.is_current)());
+        assert!((latest_transition.commit)());
+        assert!((latest_transition.is_current)());
+        assert!(current_decoder_revision(latest));
+        assert!(!customization_pending(latest));
+        let replacement = configure_customization_at_loop_pass(None, 1.0, 300, 1);
+        assert!(!(latest_transition.is_current)());
+        assert!((decoder_transition(replacement, true).commit)());
+        assert!(!customization_pending(replacement));
+    }
+
     #[test]
     fn native_open_timeout_does_not_join_a_blocked_driver_and_drops_late_output() {
         struct LateOutput(std::sync::mpsc::Sender<()>);
@@ -1677,12 +1845,12 @@ mod tests {
     #[test]
     fn cancelled_open_retains_raw_audio_for_the_resumed_device_rate_and_seek_discards_it() {
         let _guard = customization_guard();
-        configure_customization_at_loop_pass(None, 1.0, 0, 1);
+        configured(None, 1.0, 0, 1);
         let mut sink = open(cpal::default_host(), AudioFormat::F32);
         let samples: Vec<f64> = (0..1024).map(|n| (n as f64 / 64.0).sin() * 0.25).collect();
         sink.ring.pause_at(Instant::now());
-        for chunk in samples.chunks(512) {
-            sink.write(AudioPacket::Samples(chunk.to_vec()), &mut Converter::new(None)).unwrap();
+        for (index, chunk) in samples.chunks(512).enumerate() {
+            sink.write(packet_position(index as u64 * 256), AudioPacket::Samples(chunk.to_vec()), &mut Converter::new(None)).unwrap();
         }
         sink.stop().unwrap();
         sink.output_rate = OUT_RATE;
@@ -1703,7 +1871,7 @@ mod tests {
         assert_eq!(rendered, expected, "retained packets must use the resumed rate without drops/repeats");
         sink.output.status.running.store(false, Ordering::Release);
         sink.ring.pause_at(Instant::now());
-        sink.write(AudioPacket::Samples(samples), &mut Converter::new(None)).unwrap();
+        sink.write(packet_position(0), AudioPacket::Samples(samples), &mut Converter::new(None)).unwrap();
         sink.ring.clear();
         sink.output.status.running.store(true, Ordering::Release);
         sink.drain_deferred().unwrap();
@@ -1832,6 +2000,41 @@ mod tests {
             "audio resumes on the left channel"
         );
         assert_eq!(source.next(), Some(6.0));
+    }
+
+    #[test]
+    fn an_empty_callback_checks_the_ring_once_and_resumes_on_a_left_frame() {
+        for channels in [1, 2, 6] {
+            let ring = test_ring();
+            let mut source = LiveSource::new(Arc::clone(&ring));
+            let mut buffer = vec![1.0f32; 480 * channels];
+            source.render(&mut buffer, channels, true, 1.0);
+            assert!(buffer.iter().all(|sample| *sample == 0.0));
+            assert_eq!(ring.empty_pops.load(Ordering::Relaxed), 1);
+
+            ring.push(vec![0.2, 0.6], Duration::from_millis(50)).unwrap();
+            source.render(&mut buffer, channels, true, 1.0);
+            if channels == 1 {
+                assert_eq!(buffer[0], 0.4);
+            } else {
+                assert_eq!(&buffer[..2], &[0.2, 0.6]);
+            }
+            assert!(buffer[channels..].iter().all(|sample| *sample == 0.0));
+            assert_eq!(ring.empty_pops.load(Ordering::Relaxed), 2,
+                "an underrun after real audio is still checked only once");
+
+            ring.push(vec![0.3, 0.7, 0.4, 0.8], Duration::from_millis(50)).unwrap();
+            let mut first = vec![0.0f32; channels];
+            source.render(&mut first, channels, true, 1.0);
+            ring.clear();
+            ring.push(vec![0.5, 0.9], Duration::from_millis(50)).unwrap();
+            source.render(&mut first, channels, true, 1.0);
+            if channels == 1 {
+                assert_eq!(first[0], 0.7);
+            } else {
+                assert_eq!(&first[..2], &[0.5, 0.9]);
+            }
+        }
     }
 
     /// Packet boundaries must neither alter resampled values nor add frames.
@@ -1980,11 +2183,11 @@ mod tests {
     #[test]
     fn device_failure_surfaces_on_write_without_fallible_stop() {
         let _guard = customization_guard();
+        configured(None, 1.0, 0, 1);
         let mut sink = open(cpal::default_host(), AudioFormat::F32);
         sink.output.fail("device disappeared");
         sink.stop().expect("librespot stop must remain infallible");
-        let error = sink.write(AudioPacket::Samples(vec![0.25, -0.25]),
-            &mut Converter::new(None)).unwrap_err();
+        let error = sink.write(packet_position(0), AudioPacket::Samples(vec![0.25, -0.25]), &mut Converter::new(None)).unwrap_err();
         assert!(matches!(error, SinkError::OnWrite(message) if message == "device disappeared"));
     }
 
@@ -1994,6 +2197,7 @@ mod tests {
     #[ignore = "requires a default output device"]
     fn native_stream_is_lazy_and_stops_callbacks_while_paused() {
         let _guard = customization_guard();
+        configured(None, 1.0, 0, 1);
         let mut sink = open(cpal::default_host(), AudioFormat::F32);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(sink.output.status.callbacks.load(Ordering::Relaxed), 0,
@@ -2004,6 +2208,7 @@ mod tests {
             customization_revision(), vec![0.0; sink.output_rate as usize / 10 * 2], None, 1.0).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(sink.output.status.callbacks.load(Ordering::Relaxed) > 0, "first play must run the device");
+        let retained_attempt = sink.output.status.attempt.load(Ordering::Acquire);
         pause_output();
         sink.stop().unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -2014,10 +2219,12 @@ mod tests {
         sink.start().unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(sink.output.status.callbacks.load(Ordering::Relaxed) > paused, "resume must run the retained device");
+        assert_eq!(sink.output.status.attempt.load(Ordering::Acquire), retained_attempt,
+            "ordinary pause/resume retains the native submitted buffer");
         pause_output();
         sink.stop().unwrap();
         let opened = sink.output.status.attempt.load(Ordering::Acquire);
-        let seek_revision = configure_customization_at_loop_pass(None, 1.0, 5_000, 1);
+        let seek_revision = configured(None, 1.0, 5_000, 1);
         sink.start().unwrap();
         assert!(!sink.output.status.failed.load(Ordering::Acquire));
         assert!(sink.output.status.attempt.load(Ordering::Acquire) > opened,
@@ -2035,15 +2242,14 @@ mod tests {
         eprintln!("native lifecycle: idle=0, played={paused}, paused={paused}, resumed={stopped}, stopped={stopped}");
     }
 
-    /// Run explicitly on a machine with an output device. A seek while playing
-    /// is librespot's pause → seek → play, which must keep the native stream;
-    /// the natural end of the queue must leave a tail that drains, after which
-    /// the engine's stop silences the callbacks for good.
+    /// Uses only silent PCM on the default device. A playing discontinuity
+    /// replaces native submitted audio; a natural queue EOF drains its tail
+    /// before callbacks are stopped.
     #[test]
     #[ignore = "requires a default output device"]
-    fn native_stream_survives_a_playing_seek_and_stops_after_the_queue_drains() {
+    fn native_discontinuity_replaces_submitted_audio_and_queue_eof_stops_callbacks() {
         let _guard = customization_guard();
-        let revision = configure_customization_at_loop_pass(None, 1.0, 0, 1);
+        let revision = configured(None, 1.0, 0, 1);
         let mut sink = open(cpal::default_host(), AudioFormat::F32);
         sink.start().unwrap();
         assert!(!sink.output.status.failed.load(Ordering::Acquire));
@@ -2053,21 +2259,23 @@ mod tests {
             vec![0.0; 2 * tenth], None, 1.0).unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
-        configure_customization_at_loop_pass(None, 1.0, 30_000, 1);
+        configured(None, 1.0, 30_000, 1);
+        assert!(sink.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_none(),
+            "a playing seek must discard the WASAPI-submitted buffer");
         sink.stop().unwrap();
         // A second seek lands while librespot is still between the first
         // one's stop and start: not a user pause either.
-        let seek = configure_customization_at_loop_pass(None, 1.0, 40_000, 1);
+        let seek = configured(None, 1.0, 40_000, 1);
         sink.start().unwrap();
-        assert_eq!(sink.output.status.attempt.load(Ordering::Acquire), opened,
-            "quick seeks while playing must not reopen the device");
+        assert!(sink.output.status.attempt.load(Ordering::Acquire) > opened,
+            "playing seeks must open a fresh native buffer");
         assert!(sink.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_some());
         let before = sink.output.status.callbacks.load(Ordering::Relaxed);
         sink.queue(sink.ring.generation.load(Ordering::Acquire), seek,
             vec![0.0; tenth], None, 1.0).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert!(sink.output.status.callbacks.load(Ordering::Relaxed) > before,
-            "the kept stream runs after the seek");
+            "the replacement stream runs after the seek");
 
         finish_natural_boundary().unwrap();
         finish_output_tail().unwrap();
@@ -2179,7 +2387,7 @@ mod tests {
     #[test]
     fn exact_one_customization_returns_the_converter_packet_without_stretcher_or_copy() {
         let _guard = customization_guard();
-        let revision = configure_customization_at_loop_pass(Some(TrackEdit::default()), 1.0, 0, 1);
+        let revision = configured(Some(TrackEdit::default()), 1.0, 0, 1);
         let mut processing = AudioProcessing {
             resampler: None,
             pipeline_revision: revision.wrapping_sub(1),
@@ -2193,9 +2401,7 @@ mod tests {
         let bits: Vec<_> = samples.iter().map(|sample| sample.to_bits()).collect();
         let mut pipeline_scratch = Vec::new();
         let mut resampler_scratch = Vec::new();
-        let (output, loop_to) = processing.render_packet(
-            samples, &mut pipeline_scratch, &mut resampler_scratch,
-        );
+        let (output, loop_to) = processing.render_packet(samples, 0, &mut pipeline_scratch, &mut resampler_scratch);
         assert_eq!(output.as_ptr(), allocation);
         assert_eq!(output.iter().map(|sample| sample.to_bits()).collect::<Vec<_>>(), bits);
         assert_eq!(loop_to, None);
@@ -2227,7 +2433,7 @@ mod tests {
         let mut expected = Vec::new();
         reference.process(&samples, &mut expected);
         reference.finish(&mut expected);
-        let (output, marker) = processing.render_packet(samples, &mut Vec::new(), &mut Vec::new());
+        let (output, marker) = processing.render_packet(samples, 0, &mut Vec::new(), &mut Vec::new());
         assert_eq!(output.len(), 4_800 * NUM_CHANNELS as usize,
             "the 34 lookahead frames cannot be discarded at the loop reset");
         assert_eq!(output, expected);
@@ -2265,7 +2471,7 @@ mod tests {
         // guard. A run one of their discontinuities lands in is repeated, not
         // judged: the sticky flag it leaves would reset the resampler here.
         for _ in 0..100 {
-            let revision = configure_customization_at_loop_pass(None, 1.0, 0, 1);
+            let revision = configured(None, 1.0, 0, 1);
             let mut processing = AudioProcessing {
                 resampler: Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16),
                 pipeline_revision: revision.wrapping_sub(1), pipeline: None,
@@ -2274,16 +2480,14 @@ mod tests {
             processing.synchronize_pipeline(revision);
             let mut pipeline_scratch = Vec::new();
             let mut resampler_scratch = Vec::new();
-            let (mut output, marker) = processing.render_packet(samples[..split].to_vec(),
-                &mut pipeline_scratch, &mut resampler_scratch);
+            let (mut output, marker) = processing.render_packet(samples[..split].to_vec(), 0, &mut pipeline_scratch, &mut resampler_scratch);
             assert_eq!(marker, None);
-            let natural = configure_customization_after_natural_boundary(None, 1.0, 0);
+            let natural = configured_natural(None, 1.0, 0);
             processing.synchronize_pipeline(natural);
             if natural != revision.wrapping_add(1) || customization_revision() != natural {
                 continue;
             }
-            let (tail, marker) = processing.render_packet(samples[split..].to_vec(),
-                &mut pipeline_scratch, &mut resampler_scratch);
+            let (tail, marker) = processing.render_packet(samples[split..].to_vec(), 0, &mut pipeline_scratch, &mut resampler_scratch);
             assert_eq!(marker, None);
             output.extend(tail);
             processing.resampler.as_mut().unwrap().finish(&mut output);
@@ -2347,10 +2551,7 @@ mod tests {
         let mut resampler_scratch = Vec::new();
         let prefix = SAMPLE_RATE as usize / 50;
         let suffix = SAMPLE_RATE as usize * 2 / 25;
-        let (first, _) = processing.lock().unwrap_or_else(PoisonError::into_inner).render_packet(
-            vec![0.25; prefix * NUM_CHANNELS as usize],
-            &mut pipeline_scratch, &mut resampler_scratch,
-        );
+        let (first, _) = processing.lock().unwrap_or_else(PoisonError::into_inner).render_packet(vec![0.25; prefix * NUM_CHANNELS as usize], 0, &mut pipeline_scratch, &mut resampler_scratch);
         ring.pause_at(at + Duration::from_millis(50));
         ring.stop_processing(&processing);
         assert_eq!(ring.audible_elapsed_at(revision, at + Duration::from_secs(5)), Some(13_050.0));
@@ -2360,10 +2561,7 @@ mod tests {
             at + Duration::from_secs(5) + Duration::from_millis(25)), Some(13_075.0));
         assert_eq!((0..6).map(|_| source.next().unwrap()).collect::<Vec<_>>(),
             vec![2.0, -2.0, 3.0, -3.0, 4.0, -4.0]);
-        let (last, _) = processing.lock().unwrap_or_else(PoisonError::into_inner).render_packet(
-            vec![0.25; suffix * NUM_CHANNELS as usize],
-            &mut pipeline_scratch, &mut resampler_scratch,
-        );
+        let (last, _) = processing.lock().unwrap_or_else(PoisonError::into_inner).render_packet(vec![0.25; suffix * NUM_CHANNELS as usize], 0, &mut pipeline_scratch, &mut resampler_scratch);
         let mut tail = Vec::new();
         processing.lock().unwrap_or_else(PoisonError::into_inner)
             .pipeline.as_mut().unwrap().finish(&mut tail);
@@ -2402,14 +2600,14 @@ mod tests {
         *LIVE_RING.lock().expect(LIVE_RING_POISON_MSG) = Arc::downgrade(&ring);
 
         ring.push(packet(1024), Duration::from_millis(50)).unwrap();
-        configure_customization_after_natural_boundary(None, 1.0, 0);
+        configured_natural(None, 1.0, 0);
         assert_eq!(
             ring.queued_samples(),
             1024,
             "a natural track boundary must leave the audible tail queued"
         );
 
-        configure_customization_at_loop_pass(None, 1.25, 0, 1);
+        configured(None, 1.25, 0, 1);
         assert_eq!(
             ring.queued_samples(),
             0,
@@ -2431,7 +2629,7 @@ mod tests {
         });
         let input = vec![0.25; frames * NUM_CHANNELS as usize];
         let mut already_emitted = Vec::new();
-        pipeline.process(&input, &mut already_emitted);
+        pipeline.process(0, &input, &mut already_emitted);
         let processing = Arc::new(Mutex::new(AudioProcessing {
             resampler: None,
             pipeline_revision: CUSTOMIZATION_REVISION.load(Ordering::Acquire),

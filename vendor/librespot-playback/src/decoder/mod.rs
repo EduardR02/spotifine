@@ -64,6 +64,10 @@ impl AudioPacket {
 #[derive(Debug, Clone)]
 pub struct AudioPacketPosition {
     pub position_ms: u32,
+    /// Absolute 44.1-kHz source frame of the first decoded PCM frame.
+    pub source_frame: u64,
+    /// Assigned by the player owning the decoder transition, never the sink.
+    pub revision: u64,
     pub skipped: bool,
 }
 

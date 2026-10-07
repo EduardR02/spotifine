@@ -319,6 +319,8 @@ export function isPlayingSource(context) {
 }
 let playingRequestGeneration = 0;
 let playingAuthorityGeneration = 0;
+let seekRequestGeneration = 0;
+let seekAuthorityGeneration = 0;
 let volumeRequestGeneration = 0;
 let volumeAuthorityGeneration = 0;
 let volumePendingGeneration = null;
@@ -564,6 +566,11 @@ function namedQueueRevision(value) {
 
 export function applyPlayback(payload) {
   if (!payload) return;
+  if ("position_ms" in payload || "playing" in payload || "buffering" in payload
+    || "current_uri" in payload || "current_index" in payload
+    || "output_device_id" in payload || "audible_playback_speed" in payload) {
+    seekAuthorityGeneration += 1;
+  }
   // The requested control value can change before queued audio reaches that
   // rate. Only an audible boundary changes the clock; a partial rate update
   // without a position still preserves the old-rate projection at the seam.
@@ -631,6 +638,10 @@ export function applyPlayback(payload) {
     playback.upcoming = incomingOrder;
     orderRevision = incomingOrderRevision;
   }
+  if (payload.cache_marks_reset === true) propagateCacheMarks(null);
+  if (Array.isArray(payload.uncached_ids) && payload.uncached_ids.length) {
+    propagateCacheMarks(new Set(payload.uncached_ids), false);
+  }
   let cachedIds = Array.isArray(payload.cached_ids) && payload.cached_ids.length
     ? new Set(payload.cached_ids) : null;
   if (!queueHeld) {
@@ -642,27 +653,67 @@ export function applyPlayback(payload) {
   maybeStartDeferredSearch();
 }
 
-/** Download IDs are additive metadata, independent of queue/order revisions. */
+/** Cache deltas update rows and late reads without replacing their identity. */
 const cacheMarkListeners = new Set();
+let cacheMarksVersion = 0;
+const pendingCacheReads = new Set();
+const CACHE_PAYLOAD_KEYS = ["tracks", "top_tracks", "queue", "track", "releases", "episodes", "entries", "playback"];
+
+function markPayload(value, pending) {
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const row of value) markPayload(row, pending);
+    return;
+  }
+  if (value.uri?.startsWith("spotify:track:") || value.uri?.startsWith("spotify:episode:")) {
+    if (pending.reset || pending.marks.has(value.id)) value.cached = pending.marks.get(value.id) ?? false;
+  }
+  if (Array.isArray(value.cached_ids)) {
+    value.cached_ids = value.cached_ids.filter((id) =>
+      pending.marks.get(id) !== false && (!pending.reset || pending.marks.get(id) === true));
+  }
+  for (const key of CACHE_PAYLOAD_KEYS) {
+    if (value[key]) markPayload(value[key], pending);
+  }
+}
+
+function cacheMarkedRead(command, args) {
+  const pending = { version: cacheMarksVersion, reset: false, marks: new Map() };
+  pendingCacheReads.add(pending);
+  return invoke(command, args).then((value) => {
+    if (pending.version !== cacheMarksVersion) markPayload(value, pending);
+    return value;
+  }).finally(() => pendingCacheReads.delete(pending));
+}
 
 export function watchCacheMarks(listener) {
   cacheMarkListeners.add(listener);
   return () => cacheMarkListeners.delete(listener);
 }
 
-function propagateCacheMarks(ids) {
-  applyCacheMarks(playback.queue, ids);
-  for (const view of [detail.playlist, detail.album, detail.artist, detail.radio]) {
-    applyCacheMarks(view?.tracks, ids);
-    applyCacheMarks(view?.top_tracks, ids);
+function propagateCacheMarks(ids, cached = true) {
+  cacheMarksVersion++;
+  for (const pending of pendingCacheReads) {
+    if (ids === null) {
+      pending.reset = true;
+      pending.marks.clear();
+    } else {
+      for (const id of ids) pending.marks.set(id, cached);
+    }
   }
-  applyCacheMarks(search.results?.tracks, ids);
+  applyCacheMarks(playback.queue, ids, cached);
+  for (const view of [detail.playlist, detail.album, detail.artist, detail.radio]) {
+    applyCacheMarks(view?.tracks, ids, cached);
+    applyCacheMarks(view?.top_tracks, ids, cached);
+  }
+  applyCacheMarks(search.results?.tracks, ids, cached);
   // Kept pages are shown again as they are, so they carry the marks too.
   for (const page of cataloguePageCache.values()) {
-    for (const release of page?.releases ?? []) applyCacheMarks(release?.tracks, ids);
+    for (const release of page?.releases ?? []) applyCacheMarks(release?.tracks, ids, cached);
   }
-  applyCacheMarks(likedFirstPage?.page?.tracks, ids);
-  for (const listener of cacheMarkListeners) listener(ids);
+  applyCacheMarks(likedFirstPage?.page?.tracks, ids, cached);
+  for (const page of playlistRecommendationsCache.values()) applyCacheMarks(page.tracks, ids, cached);
+  for (const listener of cacheMarkListeners) listener(ids, cached);
 }
 
 export function applySession(payload) {
@@ -944,6 +995,15 @@ let creditsSeq = 0;
  */
 export const trackCredits = $state({ id: null, loading: false, data: null, error: null });
 const creditsCache = new Map();
+const CREDITS_CACHE_MAX = 128;
+
+function keepCredits(id, data) {
+  creditsCache.delete(id);
+  creditsCache.set(id, data);
+  if (creditsCache.size > CREDITS_CACHE_MAX) {
+    creditsCache.delete(creditsCache.keys().next().value);
+  }
+}
 let panelCreditsSeq = 0;
 
 export function loadTrackCredits(track) {
@@ -962,6 +1022,7 @@ export function loadTrackCredits(track) {
   trackCredits.error = null;
   if (creditsCache.has(id)) {
     trackCredits.data = creditsCache.get(id);
+    keepCredits(id, trackCredits.data);
     trackCredits.loading = false;
     return;
   }
@@ -971,7 +1032,7 @@ export function loadTrackCredits(track) {
     .browseTrackCredits(id)
     .then((data) => {
       if (seq !== panelCreditsSeq) return;
-      creditsCache.set(id, data ?? null);
+      keepCredits(id, data ?? null);
       trackCredits.data = data ?? null;
       trackCredits.loading = false;
     })
@@ -1415,6 +1476,7 @@ export function openCredits(track) {
   // Opened from the now-playing panel, the payload is usually already here.
   if (creditsCache.has(id)) {
     credits.data = creditsCache.get(id);
+    keepCredits(id, credits.data);
     credits.loading = false;
     return;
   }
@@ -1422,7 +1484,7 @@ export function openCredits(track) {
     .browseTrackCredits(id)
     .then((data) => {
       if (seq !== creditsSeq) return;
-      creditsCache.set(id, data ?? null);
+      keepCredits(id, data ?? null);
       credits.data = data ?? null;
       credits.loading = false;
     })
@@ -2134,7 +2196,7 @@ function browseLikedFirstPage() {
   if (likedFirstPagePending && likedFirstPagePending.epoch === epoch) {
     return likedFirstPagePending.promise;
   }
-  const pending = invoke("browse_liked_songs", { cursor: null })
+  const pending = cacheMarkedRead("browse_liked_songs", { cursor: null })
     .then((page) => {
       /* Only the walk the hub is still tracking may cache its answer. An
          invalidation — a change of account, or news about what is saved — and a
@@ -2238,8 +2300,7 @@ export function refreshCacheStats() {
 
 export async function clearCache(kind) {
   const payload = await api.clearCache(kind);
-  // A successful explicit wipe is the only cache message that unsets marks,
-  // and it unsets them in place: kept pages need no second fetch.
+  // Reset kept pages and fence reads that were already in flight.
   if (kind === "audio") propagateCacheMarks(null);
   cacheStats.audio = payload?.audio ?? null;
   cacheStats.covers = payload?.covers ?? null;
@@ -2297,6 +2358,7 @@ function requestPlaying(target) {
   const at = positionMs();
   const generation = ++playingRequestGeneration;
   const authority = playingAuthorityGeneration;
+  seekAuthorityGeneration += 1;
   playback.playing = target;
   anchorPlayhead(at);
   syncPlayheadTicker();
@@ -2352,7 +2414,8 @@ export const api = {
   previous: () => invoke("previous"),
   seek: (ms) => {
     const target = Math.max(0, Math.round(ms));
-    const wasPlaying = playback.playing;
+    const generation = ++seekRequestGeneration;
+    const authority = seekAuthorityGeneration;
     const previousPosition = positionMs();
     // Anchor optimistically: without this the knob snaps back to the last
     // engine sync until the next heartbeat lands, then jumps forward again.
@@ -2360,10 +2423,10 @@ export const api = {
     // both the paused and playing paths.
     anchorPlayhead(target);
     return invoke("seek", { positionMs: target }).catch((error) => {
-      // Keep the optimistic projection honest if the command is rejected,
-      // especially for a paused seek where an error must not look like play.
-      playback.playing = wasPlaying;
-      anchorPlayhead(previousPosition);
+      // A seek owns only its projection, not play/pause or a newer engine sync.
+      if (generation === seekRequestGeneration && authority === seekAuthorityGeneration) {
+        anchorPlayhead(previousPosition);
+      }
       throw error;
     });
   },
@@ -2431,7 +2494,7 @@ export const api = {
    * whole thing back, which is what the paging exists to stop.
    */
   getHistory: (offset = 0, limit = 100, query = "", sort = "recent") =>
-    invoke("get_history", { offset, limit, query, sort }),
+    cacheMarkedRead("get_history", { offset, limit, query, sort }),
   clearHistory: () => invoke("clear_history"),
   getTrackEdit: (trackId, playlistId = null) =>
     invoke("get_track_edit", { trackId, playlistId }),
@@ -2471,10 +2534,10 @@ export const api = {
    * how many covers the results reference (tracks + albums + artists), so 10
    * asks for ~30 instead of ~120. Both halves of the win come from this number.
    */
-  search: (query, limit = SEARCH_LIMIT) => invoke("search", { query, limit }),
-  browseTrack: (id) => invoke("browse_track", { id }),
+  search: (query, limit = SEARCH_LIMIT) => cacheMarkedRead("search", { query, limit }),
+  browseTrack: (id) => cacheMarkedRead("browse_track", { id }),
   browseArtistCatalogue: (id, releaseTypes = ["albums", "singles"], offset = 0, limit = 4) =>
-    invoke("browse_artist_catalogue", { id, releaseTypes, offset, limit }),
+    cacheMarkedRead("browse_artist_catalogue", { id, releaseTypes, offset, limit }),
   touchPlaylist: (id) => invoke("touch_playlist", { id }),
   touchPlaylistActivity: (id) => invoke("touch_playlist_activity", { id }),
   /** Containers of the user that hold `uri` — the saved mark's data. */
@@ -2498,8 +2561,8 @@ export const api = {
   /* Canvas is an account preference on Spotify's side; this turns it on there
      when it is off. Resolves to whether anything was written. */
   enableAccountCanvas: () => invoke("enable_account_canvas"),
-  browseShow: (id) => invoke("browse_show", { id }),
-  browseEpisode: (id) => invoke("browse_episode", { id }),
+  browseShow: (id) => cacheMarkedRead("browse_show", { id }),
+  browseEpisode: (id) => cacheMarkedRead("browse_episode", { id }),
   browseProfile: (username) => invoke("browse_profile", { username }),
   /**
    * The collection is walked by cursor; only the first page is deduplicated and
@@ -2508,14 +2571,14 @@ export const api = {
    * merged.
    */
   browseLikedSongs: (cursor = null) =>
-    cursor == null ? browseLikedFirstPage() : invoke("browse_liked_songs", { cursor }),
-  browsePlaylist: (id) => invoke("browse_playlist", { id }),
-  browseRadio: (id) => invoke("browse_radio", { id }),
-  browsePlaylistRecommendations: (id) => invoke("browse_playlist_recommendations", { id }),
-  browseAlbum: (id) => invoke("browse_album", { id }),
-  browseArtist: (id) => invoke("browse_artist", { id }),
+    cursor == null ? browseLikedFirstPage() : cacheMarkedRead("browse_liked_songs", { cursor }),
+  browsePlaylist: (id) => cacheMarkedRead("browse_playlist", { id }),
+  browseRadio: (id) => cacheMarkedRead("browse_radio", { id }),
+  browsePlaylistRecommendations: (id) => cacheMarkedRead("browse_playlist_recommendations", { id }),
+  browseAlbum: (id) => cacheMarkedRead("browse_album", { id }),
+  browseArtist: (id) => cacheMarkedRead("browse_artist", { id }),
   browseArtistSongwriter: (id, name) =>
-    invoke("browse_artist_songwriter", { id, name }),
+    cacheMarkedRead("browse_artist_songwriter", { id, name }),
   browseFollowedArtists: () => invoke("browse_followed_artists"),
   browseSavedShows: () => invoke("browse_saved_shows"),
   createPlaylist: (name) => invoke("create_playlist", { name }),
@@ -2535,7 +2598,7 @@ export const api = {
     invoke("reorder_playlist_tracks", { id, from, to }),
   login: () => invoke("login"),
   logout: () => invoke("logout"),
-  getState: () => invoke("get_state"),
+  getState: () => cacheMarkedRead("get_state"),
 };
 /**
  * Session-scoped recommendation cache.
@@ -2791,6 +2854,7 @@ export async function initEvents() {
         const position = Number(e.payload);
         if (!Number.isFinite(position)) return;
         positionEvents += 1;
+        seekAuthorityGeneration += 1;
         playback.position_ms = Math.max(0, Math.round(position));
         anchorPlayhead(playback.position_ms);
       },

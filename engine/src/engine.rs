@@ -1,5 +1,6 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,12 @@ use renderer_engine::protocol::{
     RepeatMode, Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
     TrackRef, VolumeEvent,
 };
+
+pub struct CacheSignal {
+    id: String,
+    generation: u64,
+    lease: Arc<Mutex<bool>>,
+}
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
 /// restart window (OnPrevious in app.cpp) so both sides agree.
@@ -213,6 +220,10 @@ pub struct Engine {
     cached_marks: Vec<String>,
     /// How much of [`Self::cached_marks`] the last state carried.
     emitted_cached_marks: usize,
+    uncached_marks: Vec<String>,
+    invalidated_cache_ids: HashSet<String>,
+    cache_evictions: HashMap<String, Arc<Mutex<bool>>>,
+    cache_sender: Option<mpsc::UnboundedSender<CacheSignal>>,
     /// The track the latest load was for. Its audio is on disk by the time it
     /// is left, so the next track change asks the cache about it.
     loaded_track_id: Option<String>,
@@ -568,6 +579,10 @@ impl Engine {
             emitted_order_revision: None,
             cached_marks: Vec::new(),
             emitted_cached_marks: 0,
+            uncached_marks: Vec::new(),
+            invalidated_cache_ids: HashSet::new(),
+            cache_evictions: HashMap::new(),
+            cache_sender: None,
             loaded_track_id: None,
             drain_stop_at: None,
             audio_probe_generation: None,
@@ -746,6 +761,7 @@ impl Engine {
         let queue = sending_rows.then_some(self.state.queue.as_slice());
         let upcoming = sending_order.then(|| self.upcoming_indices());
         let cached_ids = sending_marks.then_some(self.cached_marks.as_slice());
+        let uncached_ids = (!self.uncached_marks.is_empty()).then_some(self.uncached_marks.as_slice());
         self.writer.send(&StateEvent {
             kind: "state",
             ready: self.state.ready,
@@ -781,6 +797,7 @@ impl Engine {
             order_revision,
             upcoming,
             cached_ids,
+            uncached_ids,
             error: self.state.error.as_deref(),
         })?;
         self.emitted_rows_revision = Some(queue_revision);
@@ -790,6 +807,7 @@ impl Engine {
             self.cached_marks.clear();
         }
         self.emitted_cached_marks = self.cached_marks.len();
+        self.uncached_marks.clear();
         Ok(())
     }
 
@@ -989,15 +1007,17 @@ impl Engine {
         self.update_position(self.audible_position().unwrap_or(position_ms));
     }
 
-    fn prepare_audio_resume(&mut self) {
+    fn prepare_audio_resume(&mut self) -> Option<librespot_playback::player::DecoderTransition> {
         if !self.state.playing && self.current_load_produced_audio
-            && self.audible_position().is_none()
+            && self.audible_position().is_none() && !crate::audio::customization_pending(self.audio_revision)
         {
             // An unsolicited stop/device loss may have discarded output. Its
             // decoder-paused offset is the next real packet's origin. Normal
             // user pauses retain a consumer clock and never rebuild here.
             self.configure_current_audio_at_loop_pass(self.state.position_ms, self.loop_pass);
+            return Some(crate::audio::decoder_transition(self.audio_revision, true));
         }
+        None
     }
 
     /// Advances the reported position from the latest anchor and reports
@@ -1078,6 +1098,7 @@ impl Engine {
             .into_iter()
             .chain(current)
             .filter(|id| !self.cached_marks.contains(id))
+            .filter(|id| !self.invalidated_cache_ids.contains(id))
             .filter(|id| !self.state.queue.iter().any(|track| track.id == *id && track.cached))
             .collect();
         if candidates.is_empty() {
@@ -1437,6 +1458,7 @@ impl Engine {
     /// task spawn so the two teardown modes remain an explicit state
     /// transition and can be tested without connecting to Spotify.
     fn begin_cached_authentication(&mut self, preserve_active_playback: bool) -> u64 {
+        self.cancel_cache_evictions();
         if !preserve_active_playback {
             self.shutdown_playback();
         }
@@ -2172,30 +2194,75 @@ impl Engine {
             })
     }
 
-    /// Best-effort eviction of cached song audio, off the command loop.
-    /// A failed load can leave a corrupt/truncated cache entry; removing every
-    /// format lets the next attempt fetch clean audio.
-    fn evict_track_audio_cache(&self, track_uri: SpotifyUri) {
-        // Episodes never read this cache, including old entries. Do not delete
-        // those files merely because a temporary-only episode load failed.
-        if !matches!(track_uri, SpotifyUri::Track { .. }) {
-            return;
+    pub fn set_cache_sender(&mut self, sender: mpsc::UnboundedSender<CacheSignal>) {
+        self.cache_sender = Some(sender);
+    }
+
+    fn invalidate_cache_mark(&mut self, id: &str) {
+        self.invalidated_cache_ids.insert(id.to_owned());
+        self.cached_marks.retain(|held| held != id);
+        self.emitted_cached_marks = 0;
+        for track in &mut self.state.queue {
+            if track.id == id { track.cached = false; }
         }
-        let Some(session) = self.session.clone() else {
-            return;
-        };
-        let Some(cache) = session.cache().cloned() else {
-            return;
-        };
+        if !self.uncached_marks.iter().any(|held| held == id) {
+            self.uncached_marks.push(id.to_owned());
+        }
+    }
+
+    /// Cancel deletion before a new load can write the same track. Deletion
+    /// holds this short lease only around cache file removal, never network I/O.
+    fn prepare_cache_reload(&self, uri: &SpotifyUri) {
+        if let Ok(id) = uri.to_id() {
+            if let Some(lease) = self.cache_evictions.get(&id) {
+                *lease.lock() = false;
+            }
+        }
+    }
+
+    fn cancel_cache_evictions(&mut self) {
+        for (_, lease) in self.cache_evictions.drain() { *lease.lock() = false; }
+    }
+
+    pub fn on_cache_signal(&mut self, signal: CacheSignal) -> bool {
+        let matching = self.cache_evictions.get(&signal.id)
+            .is_some_and(|lease| Arc::ptr_eq(lease, &signal.lease));
+        if !matching { return false; }
+        self.cache_evictions.remove(&signal.id);
+        if signal.generation != self.generation || !*signal.lease.lock() { return false; }
+        // Failed removals remain untrusted too: a fresh, audible load must
+        // vouch for the cache before an old file can regain its badge.
+        self.invalidate_cache_mark(&signal.id);
+        true
+    }
+
+    fn evict_track_audio_cache(&mut self, track_uri: SpotifyUri) {
+        if !matches!(track_uri, SpotifyUri::Track { .. }) { return; }
+        let Ok(id) = track_uri.to_id() else { return; };
+        self.invalidate_cache_mark(&id);
+        let (Some(session), Some(sender)) = (self.session.clone(), self.cache_sender.clone()) else { return; };
+        let Some(cache) = session.cache().cloned() else { return; };
+        let lease = Arc::new(Mutex::new(true));
+        if let Some(previous) = self.cache_evictions.insert(id.clone(), Arc::clone(&lease)) {
+            *previous.lock() = false;
+        }
+        let generation = self.generation;
         tokio::spawn(async move {
-            let Ok(track) = librespot_metadata::Track::get(&session, &track_uri).await else {
-                return;
-            };
-            for file_id in track.files.values() {
-                if let Err(error) = cache.remove_file(*file_id) {
-                    eprintln!("could not evict cached audio file {file_id}: {error}");
+            if let Ok(track) = librespot_metadata::Track::get(&session, &track_uri).await {
+                // A session replacement or new load cancels the lease before
+                // it can create a new download this old job would remove.
+                if !session.is_invalid() {
+                    let active = lease.lock();
+                    if *active {
+                        for file_id in track.files.values() {
+                            if let Err(error) = cache.remove_file(*file_id) {
+                                eprintln!("could not evict cached audio file {file_id}: {error}");
+                            }
+                        }
+                    }
                 }
             }
+            let _ = sender.send(CacheSignal { id, generation, lease });
         });
     }
 
@@ -2288,6 +2355,14 @@ impl Engine {
                     return false;
                 }
                 self.current_load_produced_audio = true;
+                if let Some(id) = self.loaded_track_id.clone() {
+                    if self.invalidated_cache_ids.remove(&id) {
+                        for track in &mut self.state.queue {
+                            if track.id == id { track.cached = false; }
+                        }
+                    }
+                    self.mark_cached_tracks(None);
+                }
                 // Audio starts here, so this is where the playhead starts
                 // moving from: the position it holds is the offset the load was
                 // asked for (or the last position an event reported for it),
@@ -2994,8 +3069,8 @@ impl Engine {
             }
         } else {
             let player = Arc::clone(self.player()?);
-            self.prepare_audio_resume();
-            player.play();
+            let transition = self.prepare_audio_resume();
+            player.play(transition);
         }
         self.state.playing = true;
         self.update_position(self.state.position_ms);
@@ -3113,21 +3188,12 @@ impl Engine {
             self.clear_error();
             return Ok(true);
         }
-        // Pause retains queued audio instantly; seek clears it before reloading.
-        // Seeking while paused skips librespot's full read-ahead wait
-        // (preload_data_before_playback is a no-op in the Paused state).
-        // Capture the intent before pausing: a paused seek must remain paused,
-        // while a playing seek resumes at the target without a UI blip.
+        // One owning command pauses, seeks, commits the sample origin and
+        // resumes only the captured intent. Old in-flight reads cannot adopt
+        // this revision between separately queued pause/seek/play commands.
         let was_playing = self.state.playing;
-        let player = self.player()?;
-        player.pause();
-        player.seek(position);
-        if was_playing {
-            // Its blocking read fetches the target range itself, so the jump
-            // lands in roughly one network round trip instead of a drain of
-            // buffered audio plus a full 3-second-window fetch.
-            player.play();
-        }
+        self.player()?.seek(position, was_playing,
+            crate::audio::decoder_transition(self.audio_revision, true));
         self.update_position(position);
         self.clear_error();
         Ok(true)
@@ -3622,7 +3688,9 @@ impl Engine {
         let outgoing = std::mem::replace(&mut self.loaded_track_id, incoming)
             .filter(|outgoing| self.loaded_track_id.as_ref() != Some(outgoing));
         if let Some(player) = player {
-            player.load(uri, start_playing, position_ms);
+            self.prepare_cache_reload(&uri);
+            player.load(uri, start_playing, position_ms,
+                crate::audio::decoder_transition(self.audio_revision, !natural_boundary));
         }
         self.mark_cached_tracks(outgoing);
         Ok(())
@@ -3646,6 +3714,7 @@ impl Engine {
         let (Some(player), Some(uri)) = (&self.player, self.preload_target()) else {
             return;
         };
+        self.prepare_cache_reload(&uri);
         player.preload(uri);
     }
 
@@ -4338,6 +4407,7 @@ impl Engine {
     }
 
     fn shutdown_playback(&mut self) {
+        self.cancel_cache_evictions();
         self.finalize_listening(false);
         self.stop_playback_handles();
     }
@@ -4631,6 +4701,46 @@ mod tests {
     use librespot_playback::player::{Player, PlayerEvent};
     use renderer_engine::protocol::{AuthState, Command, LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef};
 
+
+    #[test]
+    fn eviction_invalidates_marks_even_on_failure_and_new_load_cancels_late_completion() {
+        let (mut engine, _) = test_engine();
+        let id = "0123456789ABCDEFGHIJKL";
+        let uri = SpotifyUri::from_uri(&format!("spotify:track:{id}")).unwrap();
+        engine.state.queue = vec![TrackRef { id: id.into(), uri: format!("spotify:track:{id}"),
+            cached: true, ..Default::default() }];
+        engine.cached_marks.push(id.into());
+        engine.invalidate_cache_mark(id);
+        assert!(!engine.state.queue[0].cached);
+        assert!(engine.cached_marks.is_empty());
+        assert_eq!(engine.uncached_marks, [id]);
+        let lease = Arc::new(parking_lot::Mutex::new(true));
+        engine.cache_evictions.insert(id.into(), Arc::clone(&lease));
+        // No usable file after a failed eviction may regain an old positive.
+        let signal = super::CacheSignal { id: id.into(), generation: engine.generation, lease: Arc::clone(&lease) };
+        assert!(engine.on_cache_signal(signal));
+        assert!(engine.invalidated_cache_ids.contains(id));
+        engine.cache_evictions.insert(id.into(), Arc::clone(&lease));
+        engine.prepare_cache_reload(&uri);
+        assert!(!*lease.lock());
+        engine.invalidated_cache_ids.remove(id);
+        engine.state.queue[0].cached = true;
+        let late = super::CacheSignal { id: id.into(), generation: engine.generation, lease };
+        assert!(!engine.on_cache_signal(late));
+        assert!(engine.state.queue[0].cached);
+    }
+
+    #[test]
+    fn eviction_from_previous_generation_cannot_invalidate_new_session_rows() {
+        let (mut engine, _) = test_engine();
+        let lease = Arc::new(parking_lot::Mutex::new(true));
+        engine.cache_evictions.insert("a".into(), Arc::clone(&lease));
+        engine.state.queue = vec![TrackRef { id: "a".into(), cached: true, ..Default::default() }];
+        let generation = engine.generation;
+        engine.generation = generation.wrapping_add(1);
+        assert!(!engine.on_cache_signal(super::CacheSignal { id: "a".into(), generation, lease }));
+        assert!(engine.state.queue[0].cached);
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn idle_and_paused_engines_have_no_work_timer() {
         let (mut engine, _) = test_engine();
@@ -4852,7 +4962,7 @@ mod tests {
     struct TestSink;
 
     impl Sink for TestSink {
-        fn write(&mut self, _packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
+        fn write(&mut self, _position: librespot_playback::decoder::AudioPacketPosition, _packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
             Ok(())
         }
     }
@@ -4961,7 +5071,7 @@ mod tests {
             Ok(())
         }
 
-        fn write(&mut self, _packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
+        fn write(&mut self, _position: librespot_playback::decoder::AudioPacketPosition, _packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
             Ok(())
         }
     }
@@ -8282,7 +8392,8 @@ mod tests {
         engine.current_load_produced_audio = true;
         engine.audio_revision = u64::MAX;
         engine.audio_start_position_ms = 0;
-        engine.prepare_audio_resume();
+        let transition = engine.prepare_audio_resume().expect("discarded output needs a decoder-owned transition");
+        assert!((transition.commit)());
         assert_eq!(engine.state.position_ms, 25_000);
         assert!(!engine.state.playing);
         assert_eq!(engine.loop_pass, 2);

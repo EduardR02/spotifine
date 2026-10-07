@@ -21,8 +21,7 @@
   const remoteName = $derived(playback.output_device_name);
   $effect(() => {
     if (active) return;
-    generation++;
-    open = false;
+    dismiss();
     devices = [];
   });
 

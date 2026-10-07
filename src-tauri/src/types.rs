@@ -1311,6 +1311,9 @@ pub struct PlaybackState {
     /// retains known marks; these IDs can refer to visible off-queue rows.
     #[serde(deserialize_with = "cache_ids_or_none", skip_serializing_if = "Option::is_none")]
     pub cached_ids: Option<Vec<String>>,
+    /// Cache removals apply before additions from the same engine payload.
+    #[serde(deserialize_with = "cache_ids_or_none", skip_serializing_if = "Option::is_none")]
+    pub uncached_ids: Option<Vec<String>>,
     #[serde(deserialize_with = "string_or_default")]
     pub error: String,
 }
@@ -1346,6 +1349,7 @@ impl Default for PlaybackState {
             order_revision: 0,
             upcoming: Vec::new(),
             cached_ids: None,
+            uncached_ids: None,
             error: String::new(),
         }
     }
@@ -1384,6 +1388,9 @@ impl Serialize for PlaybackEvent<'_> {
         }
         if self.include_order {
             map.serialize_entry("upcoming", &state.upcoming)?;
+        }
+        if let Some(ids) = &state.uncached_ids {
+            map.serialize_entry("uncached_ids", ids)?;
         }
         if let Some(ids) = &state.cached_ids {
             map.serialize_entry("cached_ids", ids)?;

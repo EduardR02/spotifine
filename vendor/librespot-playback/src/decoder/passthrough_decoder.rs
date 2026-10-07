@@ -209,6 +209,8 @@ impl<R: Read + Seek> AudioDecoder for PassthroughDecoder<R> {
                 let position_ms = Self::position_pcm_to_ms(pckgp_page);
                 let packet_position = AudioPacketPosition {
                     position_ms,
+                    source_frame: pckgp_page,
+                    revision: 0,
                     skipped: false,
                 };
 

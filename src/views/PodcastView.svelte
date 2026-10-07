@@ -202,12 +202,12 @@
   const source = $derived(isShow ? `show:${data?.id ?? ""}` : `episode:${data?.track?.id ?? ""}`);
   const playingHere = $derived(isShow ? isPlayingSource(source) : !!record?.uri && record.uri === playingUri);
 
-  $effect(() => watchCacheMarks((ids) => {
+  $effect(() => watchCacheMarks((ids, cached) => {
     if (isShow) {
       for (const episode of allEpisodes) {
-        if (episode.track) applyCacheMarks([episode.track], ids);
+        if (episode.track) applyCacheMarks([episode.track], ids, cached);
       }
-    } else if (record) applyCacheMarks([record], ids);
+    } else if (record) applyCacheMarks([record], ids, cached);
   }));
 
   async function startEpisodeQueue(episode) {

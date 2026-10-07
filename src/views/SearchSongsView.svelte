@@ -34,7 +34,7 @@
   });
 
   /* Download marks reach these songs in place. */
-  $effect(() => watchCacheMarks((ids) => applyCacheMarks(tracks, ids)));
+  $effect(() => watchCacheMarks((ids, cached) => applyCacheMarks(tracks, ids, cached)));
 
   function playFrom(index) {
     if (tracks.length) api.playQueue(tracks, index, "search").catch(() => {});

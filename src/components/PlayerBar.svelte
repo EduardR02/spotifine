@@ -18,12 +18,74 @@
   import ArtistLinks from "./ArtistLinks.svelte";
   import Slider from "./Slider.svelte";
   import DevicePicker from "./DevicePicker.svelte";
+  import Menu from "./Menu.svelte";
   import { formatTime } from "../lib/time.js";
   import { morphLayout } from "../lib/layout.js";
   import { frost } from "../lib/ambient.svelte.js";
   import { panel as nowPlayingPanel, nowPlayingShown } from "../lib/panel.svelte.js";
   import { scrollbar } from "../lib/scrollbar.js";
   import { listen } from "@tauri-apps/api/event";
+
+  const CONTROLS_KEY = "sr.player-bar-controls";
+  const CONTROL_OPTIONS = [
+    { key: "speed", label: "Speed controls", icon: "clock" },
+    { key: "mute", label: "Mute button", icon: "volume" },
+    { key: "artwork", label: "Cover artwork", icon: "album" },
+    { key: "metadata", label: "Title and artist", icon: "artist" },
+    { key: "library", label: "Library checkmark / heart", icon: "heart" },
+  ];
+
+  // Restore before first paint, like the now-playing panel preferences.
+  function readControls() {
+    let saved;
+    try {
+      saved = JSON.parse(localStorage.getItem(CONTROLS_KEY));
+    } catch {
+      // Unavailable or invalid storage leaves every control visible.
+    }
+    return {
+      speed: saved?.speed !== false,
+      mute: saved?.mute !== false,
+      artwork: saved?.artwork !== false,
+      metadata: saved?.metadata !== false,
+      library: saved?.library !== false,
+    };
+  }
+
+  const controls = $state(readControls());
+  let playerBar = $state(null);
+  let barMenu = $state(null);
+  const hasNowIcons = $derived(controls.artwork
+    || (controls.library && !!current
+      && (nowSaved.refs.length > 0 || current.uri?.startsWith("spotify:track:"))));
+  const hasNow = $derived(controls.metadata || hasNowIcons);
+
+  function openBarMenu(event) {
+    const keyboard = event.type === "keydown";
+    if (keyboard && event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+    if (event.target.closest(".speed-menu, .p-saved-panel")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    speedOpen = false;
+    savedHushed = true;
+    savedHover = savedFocus = false;
+    const rect = keyboard ? event.target.getBoundingClientRect() : null;
+    barMenu = {
+      at: keyboard
+        ? { x: rect.left + rect.width / 2, y: rect.top }
+        : { x: event.clientX, y: event.clientY },
+    };
+  }
+
+  function toggleControl(key) {
+    controls[key] = !controls[key];
+    if (key === "speed" && !controls.speed) speedOpen = false;
+    try {
+      localStorage.setItem(CONTROLS_KEY, JSON.stringify(controls));
+    } catch {
+      // Like panel width, the preference stays session-local without storage.
+    }
+  }
 
   let dragPos = $state(null);
 
@@ -587,10 +649,14 @@
   </svg>
 {/snippet}
 
-<footer class="player glass-chrome" use:frost>
-  <div class="p-body">
+<div class="player glass-chrome" use:frost bind:this={playerBar}
+  role="toolbar" aria-label="Playback controls" tabindex="0"
+  oncontextmenu={openBarMenu} onkeydown={openBarMenu}>
+  <div class="p-body" class:compact-now={!controls.metadata} class:no-now={!hasNow} class:has-now-icons={hasNowIcons}>
+    {#if hasNow}
     <div class="p-now" class:idle={!current}>
       {#if current}
+        {#if controls.artwork}
         <button
           class="p-art-btn"
           title={current.uri?.startsWith("spotify:episode:") ? "Go to podcast" : "Go to album"}
@@ -604,6 +670,8 @@
             class="p-art"
           />
         </button>
+        {/if}
+        {#if controls.metadata}
         <span class="p-meta">
           <span class="p-title-line">
             {#if current.album_id}
@@ -627,6 +695,8 @@
             />
           {/if}
         </span>
+        {/if}
+        {#if controls.library}
         {#if nowSaved.refs.length}
           <!-- Marks live BESIDE the two-line text block, not inside its first
                line: .p-now centres its children, so the check faces the whole
@@ -695,7 +765,8 @@
             >{@render glassHeart()}</span>
           {/if}
         {/if}
-        {#if editIndicator}
+        {/if}
+        {#if controls.metadata && editIndicator}
           <span
             class="p-edit-indicator"
             title={editIndicator.title}
@@ -708,13 +779,18 @@
       {:else}
         <!-- Idle holds the same 48px slot, so the bar does not jump the moment
              the first track lands. -->
+        {#if controls.artwork}
         <span class="art p-art" aria-hidden="true"></span>
+        {/if}
+        {#if controls.metadata}
         <span class="p-meta">
           <span class="p-title">Nothing playing</span>
           <span class="p-artists">Pick something from your library</span>
         </span>
+        {/if}
       {/if}
     </div>
+    {/if}
 
     <div class="p-center">
       <div class="transport">
@@ -790,6 +866,7 @@
     </div>
 
     <div class="p-right">
+      {#if controls.speed}
       <button
         class="p-speed"
         class:on={speedPercent !== 100}
@@ -841,6 +918,7 @@
         </div>
         {#if speedError}<p class="speed-error" role="status">{speedError}</p>{/if}
       </div>
+      {/if}
       <DevicePicker />
       <!-- With no room the panel steps aside on its own, and the button waits
            for the room rather than changing what was asked for. -->
@@ -853,7 +931,8 @@
       >
         <Icon name="panel" size={18} />
       </button>
-      <div class="p-volume" bind:this={volumeControl}>
+      <div class="p-volume" class:no-mute={!controls.mute} bind:this={volumeControl}>
+        {#if controls.mute}
         <button
           class="btn-round"
           class:on={volumePercent === 0}
@@ -864,6 +943,7 @@
         >
           <Icon name="volume" size={18} />
         </button>
+        {/if}
         <Slider
           min={0}
           max={100}
@@ -882,9 +962,23 @@
       </div>
     </div>
   </div>
-</footer>
+</div>
+
+{#if barMenu}
+  <Menu at={barMenu.at} returnTo={playerBar} label="Player bar controls" onclose={() => (barMenu = null)}>
+    {#each CONTROL_OPTIONS as option, i (option.key)}
+      {#if i === 2}<div class="menu-sep" role="separator"></div>{/if}
+      <button class="menu-item" role="menuitemcheckbox" aria-checked={controls[option.key]}
+        onclick={() => toggleControl(option.key)}>
+        <Icon name={option.icon} size={16} /><span class="menu-label">{option.label}</span>
+        <span class="mark control-check">{#if controls[option.key]}<Icon name="check" size={14} />{/if}</span>
+      </button>
+    {/each}
+  </Menu>
+{/if}
 
 <style>
+  .control-check { width: 14px; height: 14px; }
   .p-volume {
     position: relative;
     display: flex;

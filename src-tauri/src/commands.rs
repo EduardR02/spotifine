@@ -24,11 +24,7 @@ use crate::personal_api::{
 };
 use crate::playback_router::{Action as PlaybackAction, PlaybackRouter};
 use crate::types::{
-    AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail,
-    CacheStats, EpisodeDetail, HistoryPageDetail, LibraryNodeDetail, LikedSongsDetail,
-    PlaybackEvent, Playlist, PlaylistDetail, PlaylistRecommendationsDetail, ProfileDetail, RadioDetail,
-    SearchResult, Show, ShowDetail, SongwriterPlaylist, Track, TrackCreditsDetail, TrackPlaylistRef,
-    TrackWaveform,
+    AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail, CacheStats, EpisodeDetail, HistoryPageDetail, LibraryNodeDetail, LikedSongsDetail, PlaybackEvent, PlaybackState, Playlist, PlaylistDetail, PlaylistRecommendationsDetail, ProfileDetail, RadioDetail, SearchResult, Show, ShowDetail, SongwriterPlaylist, Track, TrackCreditsDetail, TrackPlaylistRef, TrackWaveform
 };
 use parking_lot::Mutex;
 use renderer_engine::protocol::LibraryItem;
@@ -312,6 +308,8 @@ pub async fn set_playlist_track_excluded(
     excluded: bool,
 ) -> Result<(), String> {
     client.set_playlist_track_excluded(&playlist_id, &track_id, excluded).await?;
+    record_playlist_edit(&app, &playlist_id);
+    spawn_refresh_playlist(app.clone(), playlist_id, RefreshCause::Edit);
     // The exclusion is saved. A Spotify device that could not take the new
     // order is the router's to report and retry; it is not a failed save.
     router.eligibility_changed(&app).await;
@@ -374,8 +372,9 @@ pub async fn browse_playlist(
         spawn_refresh_playlist(app, id, RefreshCause::Reopen);
         return Ok(detail);
     }
-    let result = fetch_playlist(&app, &state, &client, &id).await?;
+    let mut result = fetch_playlist(&app, &state, &client, &id).await?;
     if result.applied {
+        client.reconcile_cached_rows(&mut result.detail.tracks, result.cache_generation);
         Ok(result.detail)
     } else {
         let exists = state
@@ -772,6 +771,13 @@ fn library_list_cache(state: &AppState) -> PlaylistListCache {
     }
 }
 
+fn record_playlist_edit(app: &AppHandle, id: &str) {
+    let state = app.state::<Mutex<AppState>>();
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    state.lock().record_playlist_edit(id);
+}
+
 /// Writes a landed library edit into the shell's copy and to disk at once,
 /// fenced like a delete: a rootlist read that was already in flight predates
 /// the edit and must not install over it. The refresh that follows brings
@@ -897,6 +903,7 @@ pub async fn add_playlist_tracks(
     uris: Vec<String>,
 ) -> Result<(), String> {
     client.add_playlist_tracks(&id, &uris).await?;
+    record_playlist_edit(&app, &id);
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
@@ -910,6 +917,7 @@ pub async fn remove_playlist_tracks(
     expected_snapshot_id: Option<String>,
 ) -> Result<(), String> {
     client.remove_playlist_tracks(&id, &uris, expected_snapshot_id.as_deref()).await?;
+    record_playlist_edit(&app, &id);
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
@@ -923,6 +931,7 @@ pub async fn reorder_playlist_tracks(
     to: usize,
 ) -> Result<(), String> {
     client.reorder_playlist_tracks(&id, from, to).await?;
+    record_playlist_edit(&app, &id);
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
@@ -1350,6 +1359,31 @@ fn apply_cached_ids(snapshot: &mut AppState, ids: &[String]) {
     }
 }
 
+fn apply_uncached_ids(snapshot: &mut AppState, ids: &[String]) {
+    if ids.is_empty() { return; }
+    let ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let queue = &mut snapshot.playback.queue;
+    if queue.iter().any(|track| track.cached && ids.contains(track.id.as_str())) {
+        for track in Arc::make_mut(queue) {
+            if ids.contains(track.id.as_str()) { track.cached = false; }
+        }
+    }
+    for entry in &mut snapshot.tracks_cache {
+        for track in &mut entry.tracks {
+            if ids.contains(track.id.as_str()) { track.cached = false; }
+        }
+    }
+}
+
+fn reset_cache_marks(snapshot: &mut AppState) {
+    snapshot.playback.cached_ids = None;
+    snapshot.playback.uncached_ids = None;
+    unmark_cached_rows(&mut snapshot.playback.queue);
+    for entry in &mut snapshot.tracks_cache {
+        for track in &mut entry.tracks { track.cached = false; }
+    }
+}
+
 /// Applies a scalar position heartbeat to the shared snapshot: only the two
 /// playhead scalars change, in place. The engine already distinguishes
 /// heartbeats from real changes, so this never clones or compares the
@@ -1431,6 +1465,13 @@ fn request_restore_state(client: Arc<EngineClient>) {
     });
 }
 
+fn restore_frame_is_publishable(settled: &mut Option<PlaybackState>, state: &PlaybackState) -> bool {
+    let Some(target) = settled.as_ref() else { return true; };
+    if state.auth_state == "ready" && state != target { return false; }
+    *settled = None;
+    true
+}
+
 async fn run_restore_attempt(
     app: &AppHandle,
     client: &Arc<EngineClient>,
@@ -1439,30 +1480,41 @@ async fn run_restore_attempt(
     username: &str,
     restore_retry: &mut RestoreRetry,
     restore_error: &mut Option<(String, String)>,
-) {
-    if let Err(error) = restore_playback(client, snapshot).await {
-        log::warn(&format!("could not restore playback: {error}"));
-        match client.retry_pending_restore_for_generation(generation) {
-            Ok(Some(delay)) => {
-                restore_retry.schedule(delay, tokio::time::Instant::now(), generation, username);
-            }
-            Ok(None) => {
-                let message = format!("could not restore the previous session: {error}");
-                *restore_error = Some((username.to_owned(), message.clone()));
-                let _ = app.emit(
-                    "session",
-                    json!({
-                        "auth_state": "ready",
-                        "username": username,
-                        "error": message,
-                    }),
-                );
-                // With the plan disarmed, publish the engine's actual state.
-                request_restore_state(client.clone());
-            }
-            Err(()) => {} // An exited engine or cleared plan owns no retry or error.
+) -> Option<PlaybackState> {
+    let result = async {
+        restore_playback(client, snapshot).await?;
+        // Replies precede their state lines. A subsequent scalar-free command
+        // is the wire barrier proving every restore state has reached the reader.
+        client.queue_metadata(None).await?;
+        client.complete_pending_restore(generation)
+            .ok_or_else(|| "the engine changed session before restoration settled".to_owned())
+    }.await;
+    let error = match result {
+        Ok(state) => return Some(state),
+        Err(error) => error,
+    };
+    log::warn(&format!("could not restore playback: {error}"));
+    match client.retry_pending_restore_for_generation(generation) {
+        Ok(Some(delay)) => {
+            restore_retry.schedule(delay, tokio::time::Instant::now(), generation, username);
         }
+        Ok(None) => {
+            let message = format!("could not restore the previous session: {error}");
+            *restore_error = Some((username.to_owned(), message.clone()));
+            let _ = app.emit(
+                "session",
+                json!({
+                    "auth_state": "ready",
+                    "username": username,
+                    "error": message,
+                }),
+            );
+            // With the plan disarmed, publish the engine's actual state.
+            request_restore_state(client.clone());
+        }
+        Err(()) => {} // An exited engine or cleared plan owns no retry or error.
     }
+    None
 }
 
 /// Consumes engine state lines, mirrors them into `AppState`, and emits the
@@ -1491,6 +1543,7 @@ pub async fn consume_states(app: AppHandle) {
     let mut library_refresh_during_restore = false;
     let mut restore_retry = RestoreRetry::default();
     let mut restore_started_at = None;
+    let mut settled_restore: Option<PlaybackState> = None;
 
     loop {
         let retry_deadline = restore_retry.deadline;
@@ -1503,7 +1556,7 @@ pub async fn consume_states(app: AppHandle) {
                     restore_retry.take_due(tokio::time::Instant::now())
                 {
                     if let Some(snapshot) = client.begin_pending_retry(generation) {
-                        run_restore_attempt(
+                        settled_restore = run_restore_attempt(
                             &app,
                             &client,
                             &snapshot,
@@ -1519,13 +1572,27 @@ pub async fn consume_states(app: AppHandle) {
             }
         } {
             Ok(StateLine::State(state)) => state,
+            Ok(StateLine::CacheMarksReset) => {
+                reset_cache_marks(&mut app.state::<Mutex<AppState>>().lock());
+                app.state::<Arc<PlaybackRouter>>().apply_cache_marks(true, &[], &[]);
+                let _ = app.emit("state", json!({"cache_marks_reset": true}));
+                continue;
+            }
+            Ok(StateLine::UncachedIds(ids)) => {
+                apply_uncached_ids(&mut app.state::<Mutex<AppState>>().lock(), &ids);
+                app.state::<Arc<PlaybackRouter>>().apply_cache_marks(false, &ids, &[]);
+                let _ = app.emit("state", json!({"uncached_ids": ids}));
+                continue;
+            }
             Ok(StateLine::CachedIds(ids)) => {
                 let state = app.state::<Mutex<AppState>>();
                 apply_cached_ids(&mut state.lock(), &ids);
+                app.state::<Arc<PlaybackRouter>>().apply_cache_marks(false, &[], &ids);
                 let _ = app.emit("state", json!({"cached_ids": ids}));
                 continue;
             }
             Ok(StateLine::Position(heartbeat)) => {
+                if client.restore_is_pending() || settled_restore.is_some() { continue; }
                 // A heartbeat only moved the playhead: freshen the snapshot
                 // scalars in place and forward the existing scalar `position`
                 // event unchanged (a number, no queue payload).
@@ -1540,6 +1607,7 @@ pub async fn consume_states(app: AppHandle) {
                 continue;
             }
             Ok(StateLine::Volume(volume)) => {
+                if client.restore_is_pending() || settled_restore.is_some() { continue; }
                 // A volume step is one number: freshen the cached snapshot in
                 // place — never the queue — and forward it as a partial state,
                 // which `applyPlayback` applies as a volume-only update.
@@ -1553,6 +1621,7 @@ pub async fn consume_states(app: AppHandle) {
                 continue;
             }
             Ok(StateLine::Disconnected) => {
+                settled_restore = None;
                 restore_retry.cancel();
                 restore_error = None;
                 let disconnected = {
@@ -1591,9 +1660,14 @@ pub async fn consume_states(app: AppHandle) {
             // second while this loop is awaiting inside a state arm. Ask for a
             // full state instead of hoping some later line carries the number.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                settled_restore = None;
                 log::warn(&format!(
                     "engine lines skipped ({skipped}); re-requesting state"
                 ));
+                // Lifecycle and negative lanes may have been skipped too.
+                reset_cache_marks(&mut app.state::<Mutex<AppState>>().lock());
+                app.state::<Arc<PlaybackRouter>>().apply_cache_marks(true, &[], &[]);
+                let _ = app.emit("state", json!({"cache_marks_reset": true}));
                 if let Err(error) = client.status().await {
                     log::warn(&format!("could not re-request engine state: {error}"));
                 }
@@ -1601,6 +1675,14 @@ pub async fn consume_states(app: AppHandle) {
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
+        app.state::<Arc<PlaybackRouter>>().apply_cache_marks(false,
+            state.uncached_ids.as_deref().unwrap_or_default(),
+            state.cached_ids.as_deref().unwrap_or_default());
+        if let Some(ids) = &state.uncached_ids {
+            apply_uncached_ids(&mut app.state::<Mutex<AppState>>().lock(), ids);
+            // Invalidations also reach off-queue pages while transport is hidden.
+            let _ = app.emit("state", json!({"uncached_ids": ids}));
+        }
         if let Some(ids) = &state.cached_ids {
             let managed = app.state::<Mutex<AppState>>();
             apply_cached_ids(&mut managed.lock(), ids);
@@ -1610,11 +1692,14 @@ pub async fn consume_states(app: AppHandle) {
                 let _ = app.emit("state", json!({"cached_ids": ids}));
             }
         }
+        // The consumer awaited the commands while the reader kept running.
+        // Publish only after reaching the exact settled frame in wire order.
+        if !restore_frame_is_publishable(&mut settled_restore, &state) { continue; }
 
         // A fresh child reports an authenticated but empty state before its
         // queue/settings are restored. Start restoration once and suppress
         // that blank state plus every intermediate setter state. EngineClient
-        // clears the plan only when the final state matches.
+        // clears the plan on a matching frame or the successful wire barrier.
         if state.auth_state == "ready" && !state.username.is_empty() {
             let managed = app.state::<Mutex<AppState>>();
             let mut guard = managed.lock();
@@ -1653,7 +1738,7 @@ pub async fn consume_states(app: AppHandle) {
         }
         restore_retry.cancel();
         if let Some((snapshot, generation)) = client.begin_pending_restore_with_generation(&state) {
-            run_restore_attempt(
+            settled_restore = run_restore_attempt(
                 &app,
                 &client,
                 &snapshot,
@@ -1755,9 +1840,8 @@ pub async fn consume_states(app: AppHandle) {
     }
 }
 
-/// Applies settings before installing the paused queue. Normal startup ends
-/// here; crash recovery alone follows with Play when the captured state was
-/// playing.
+/// Applies settings, then restores queue and crash-only resume intent in one
+/// engine command. A normal startup remains paused.
 async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) -> Result<(), String> {
     client.set_volume(snapshot.volume).await?;
     client.set_shuffle(snapshot.shuffle).await?;
@@ -1765,11 +1849,9 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) -> 
     client.set_playback_speeds(snapshot.track_speed, snapshot.episode_speed).await?;
     let index = snapshot.current_index.unwrap_or(0);
     client
-        .restore_queue(&snapshot.queue, index, snapshot.position_ms, "", false)
+        .restore_queue(&snapshot.queue, index, snapshot.position_ms, "", false,
+            snapshot.resume_playing && snapshot.current_index.is_some())
         .await?;
-    if snapshot.resume_playing && snapshot.current_index.is_some() {
-        client.play().await?;
-    }
     Ok(())
 }
 
@@ -1936,13 +2018,16 @@ async fn refresh_memberships(state: &Mutex<AppState>, client: &EngineClient, pla
     };
 
     for id in &work {
+        let playlist_generation = state.lock().playlist_generation(id);
         if !library_generation_is_current(&state.lock(), generation) {
             return;
         }
         match client.browse_playlist_membership(id).await {
             Ok(membership) => {
                 let mut guard = state.lock();
-                if !library_generation_is_current(&guard, generation) {
+                if !library_generation_is_current(&guard, generation)
+                    || !guard.playlist_read_is_current(id, playlist_generation) {
+                    guard.membership_refresh_queued = true;
                     return;
                 }
                 *playlists |= upsert_membership(
@@ -2036,13 +2121,19 @@ fn spawn_refresh_playlist(app: AppHandle, id: String, cause: RefreshCause) {
                 a pruned audio cache must not leave phantom marks behind — so
                 a cache-served open showed none, the refresh quietly learned
                 the real ones, and they appeared on the second open. */
-                Ok(result) if result.applied => {
+                Ok(mut result) if result.applied => {
                     // A trigger landed while this fetch was out, so what we
                     // just read may predate the newest committed edit; the
                     // queued pass below speaks instead of this payload.
                     let persistence = state.lock().playlist_persistence.clone();
                     let _serialize = persistence.lock();
-                    if !again && library_generation_is_current(&state.lock(), result.generation) {
+                    let current = {
+                        let guard = state.lock();
+                        library_generation_is_current(&guard, result.generation)
+                            && guard.playlist_read_is_current(&id, result.playlist_generation)
+                    };
+                    if !again && current {
+                        client.reconcile_cached_rows(&mut result.detail.tracks, result.cache_generation);
                         let _ = app.emit("playlist", &result.detail);
                     }
                 }
@@ -2079,6 +2170,8 @@ struct LibraryFetchResult {
 struct PlaylistFetchResult {
     detail: PlaylistDetail,
     generation: u64,
+    playlist_generation: u64,
+    cache_generation: u64,
     applied: bool,
 }
 
@@ -2142,6 +2235,34 @@ async fn fetch_library(
     })
 }
 
+
+fn adopt_playlist_detail(
+    state: &mut AppState,
+    id: &str,
+    generation: u64,
+    playlist_generation: u64,
+    detail: &PlaylistDetail,
+    fetched_at: i64,
+) -> Option<(bool, bool, bool)> {
+    if !library_generation_is_current(state, generation)
+        || !state.playlist_read_is_current(id, playlist_generation) { return None; }
+    let tracks_changed = upsert_tracks_cache(&mut state.tracks_cache, PlaylistTracksEntry {
+        id: detail.playlist.id.clone(),
+        fetched_at: Some(fetched_at),
+        revision: detail.playlist.snapshot_id.clone(),
+        tracks: detail.tracks.clone(),
+        excluded_track_ids: detail.excluded_track_ids.clone(),
+    });
+    let followed = is_followed_playlist(&state.playlists, id);
+    if followed { upsert_playlist(&mut state.playlists, detail.playlist.clone()); }
+    let membership = playlist_qualifies(&detail.playlist, &state.me_id)
+        && upsert_membership(&mut state.memberships, MembershipEntry {
+            id: detail.playlist.id.clone(),
+            revision: detail.playlist.snapshot_id.clone(),
+            uris: detail.tracks.iter().map(|track| track.uri.clone()).collect(),
+        });
+    Some((tracks_changed, followed, membership))
+}
 /// Engine round-trip for one playlist; always updates the bounded tracks
 /// cache, and — for a playlist the user created — the membership index the
 /// saved mark reads. Only a playlist already present in the rootlist-backed
@@ -2152,55 +2273,30 @@ async fn fetch_playlist(
     client: &EngineClient,
     id: &str,
 ) -> Result<PlaylistFetchResult, String> {
-    let generation = state.lock().library_generation;
-    let detail = PlaylistDetail::from(client.browse_playlist(id).await?);
+    let (generation, playlist_generation) = {
+        let guard = state.lock();
+        (guard.library_generation, guard.playlist_generation(id))
+    };
+    let cache_generation = client.cache_generation();
+    let mut detail = PlaylistDetail::from(client.browse_playlist(id).await?);
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
     let (dir, list_cache, tracks_bytes, membership) = {
         let mut guard = state.lock();
-        if !library_generation_is_current(&guard, generation) {
+        client.reconcile_cached_rows(&mut detail.tracks, cache_generation);
+        let Some((tracks_changed, should_persist_library, membership_changed)) =
+            adopt_playlist_detail(&mut guard, id, generation, playlist_generation, &detail, fetched_at)
+        else {
             return Ok(PlaylistFetchResult {
                 detail,
                 generation,
+                playlist_generation,
+                cache_generation,
                 applied: false,
             });
-        }
-        let tracks_changed = upsert_tracks_cache(
-            &mut guard.tracks_cache,
-            PlaylistTracksEntry {
-                id: detail.playlist.id.clone(),
-                fetched_at: Some(fetched_at),
-                revision: detail.playlist.snapshot_id.clone(),
-                tracks: detail.tracks.clone(),
-                excluded_track_ids: detail.excluded_track_ids.clone(),
-            },
-        );
-        let should_persist_library = is_followed_playlist(&guard.playlists, id);
-        if should_persist_library {
-            upsert_playlist(&mut guard.playlists, detail.playlist.clone());
-        }
-        // Every fresh track listing of an owned playlist is authoritative
-        // membership data, whichever path fetched it — an explicit browse, an
-        // edit refresh, or the reconciliation chain. The index is updated
-        // here and only here for playlists.
-        let membership = if playlist_qualifies(&detail.playlist, &guard.me_id) {
-            upsert_membership(
-                &mut guard.memberships,
-                MembershipEntry {
-                    id: detail.playlist.id.clone(),
-                    revision: detail.playlist.snapshot_id.clone(),
-                    uris: detail
-                        .tracks
-                        .iter()
-                        .map(|track| track.uri.clone())
-                        .collect(),
-                },
-            )
-            .then(|| guard.memberships.clone())
-        } else {
-            None
         };
+        let membership = membership_changed.then(|| guard.memberships.clone());
         // A browse that only confirmed what the cache already held owes the
         // disk nothing: this file is 1.5 MB of rows, and re-serializing it
         // under the lock for an unchanged entry is pure churn. The bytes are
@@ -2243,6 +2339,8 @@ async fn fetch_playlist(
     Ok(PlaylistFetchResult {
         detail,
         generation,
+        playlist_generation,
+        cache_generation,
         applied: true,
     })
 }
@@ -2251,6 +2349,62 @@ async fn fetch_playlist(
 mod tests {
     use super::*;
     use crate::types::PlaybackState;
+
+    #[test]
+    fn restore_publication_skips_buffered_intermediates_but_accepts_settled_concurrent_pause() {
+        let final_state = playing_state(0);
+        let mut final_state = PlaybackState { playing: false, ..final_state };
+        let mut settled = Some(final_state.clone());
+        let blank = PlaybackState { auth_state: "ready".into(), ..Default::default() };
+        assert!(!restore_frame_is_publishable(&mut settled, &blank));
+        let old_end = playing_state(200_000);
+        assert!(!restore_frame_is_publishable(&mut settled, &old_end));
+        assert!(restore_frame_is_publishable(&mut settled, &final_state));
+        assert!(settled.is_none());
+        final_state.position_ms = 500;
+        assert!(restore_frame_is_publishable(&mut settled, &final_state));
+        settled = Some(final_state);
+        assert!(restore_frame_is_publishable(&mut settled, &PlaybackState::default()));
+        assert!(settled.is_none());
+    }
+
+    #[test]
+    fn direct_pre_edit_read_cannot_replace_landed_tracks_summary_or_membership() {
+        let mut state = AppState::new(std::path::PathBuf::new());
+        state.me_id = "owner".into();
+        state.playlists.push(crate::types::Playlist { id: "p".into(), owner_id: "owner".into(), ..Default::default() });
+        let generation = state.library_generation;
+        let old_generation = state.playlist_generation("p");
+        let detail = |revision: &str, ids: &[&str]| PlaylistDetail {
+            playlist: crate::types::Playlist { id: "p".into(), name: revision.into(), owner_id: "owner".into(),
+                snapshot_id: revision.into(), ..Default::default() },
+            tracks: ids.iter().map(|id| Track { id: (*id).into(), uri: format!("spotify:track:{id}"), ..Default::default() }).collect(),
+            ..Default::default()
+        };
+        state.record_playlist_edit("p");
+        let current = state.playlist_generation("p");
+        assert!(adopt_playlist_detail(&mut state, "p", generation, current, &detail("new", &["a", "b"]), 2).is_some());
+        assert!(adopt_playlist_detail(&mut state, "p", generation, old_generation, &detail("old", &["a"]), 1).is_none());
+        assert_eq!(state.tracks_cache[0].revision, "new");
+        assert_eq!(state.playlists[0].name, "new");
+        assert!(state.memberships[0].uris.contains("spotify:track:b"));
+    }
+
+    #[test]
+    fn negative_cache_marks_and_session_reset_reach_off_queue_tracks() {
+        let mut state = AppState::new(std::path::PathBuf::new());
+        state.playback.queue = vec![Track { id: "a".into(), cached: true, ..Default::default() }].into();
+        state.tracks_cache.push(PlaylistTracksEntry { id: "p".into(), fetched_at: None, revision: String::new(),
+            tracks: vec![Track { id: "b".into(), cached: true, ..Default::default() }], excluded_track_ids: Vec::new() });
+        apply_uncached_ids(&mut state, &["b".into()]);
+        assert!(!state.tracks_cache[0].tracks[0].cached);
+        assert!(state.playback.queue[0].cached);
+        apply_cached_ids(&mut state, &["b".into()]);
+        assert!(state.tracks_cache[0].tracks[0].cached);
+        reset_cache_marks(&mut state);
+        assert!(!state.playback.queue[0].cached);
+        assert!(!state.tracks_cache[0].tracks[0].cached);
+    }
 
     #[test]
     fn membership_refresh_revalidates_unknown_versions_and_skips_only_proven_unchanged_rows() {

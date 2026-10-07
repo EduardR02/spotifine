@@ -29,6 +29,8 @@
   import { frost, shiftHaze } from "./lib/ambient.svelte.js";
   import { panelLayout, snapPanel } from "./lib/layout.js";
   import { panel, setPanelWidth, nowPlayingShown } from "./lib/panel.svelte.js";
+  import { startPanelDrag } from "./lib/panel-drag.js";
+  import { spaceControlsPlayback } from "./lib/playback-shortcuts.js";
   import { devicesEnabled } from "./lib/personal.svelte.js";
   import { vuMeterStyle } from "./lib/vu-meter.js";
   import { os } from "./lib/window-frame.svelte.js";
@@ -132,6 +134,12 @@
      width it ends on is kept; a double-click goes back to automatic. */
   let dragWidth = $state(null);
   const shownWidth = $derived(dragWidth ?? box.width);
+  let cancelPanelDrag = null;
+
+  $effect(() => {
+    if (!nowPlayingShown()) cancelPanelDrag?.();
+    return () => cancelPanelDrag?.();
+  });
 
   /** Keep `width` (null: automatic), in one step: the grid never sees the
       old width again on the way, and the haze is slid to the new edge until
@@ -145,31 +153,28 @@
   }
 
   function resizePanel(event) {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || event.isPrimary === false || cancelPanelDrag) return;
     event.preventDefault();
-    const handle = event.currentTarget;
-    handle.setPointerCapture(event.pointerId);
     const from = box.width;
-    const x0 = event.clientX;
-    const { min, max } = box;
-    const dpr = window.devicePixelRatio || 1;
     panel.resizing = true;
-    const move = (e) => {
-      const width = snapPanel(Math.min(max, Math.max(min, from + x0 - e.clientX)), dpr);
-      if (width === shownWidth) return;
-      dragWidth = width;
-      shiftHaze(window.innerWidth - width);
-    };
-    const end = () => {
-      handle.removeEventListener("pointermove", move);
-      handle.removeEventListener("lostpointercapture", end);
-      if (dragWidth != null && dragWidth !== from) keepPanelWidth(dragWidth);
-      dragWidth = null;
-      shiftHaze(null);
-      panel.resizing = false;
-    };
-    handle.addEventListener("pointermove", move);
-    handle.addEventListener("lostpointercapture", end);
+    cancelPanelDrag = startPanelDrag(event, {
+      width: from,
+      min: box.min,
+      max: box.max,
+      dpr: window.devicePixelRatio || 1,
+      onChange(width) {
+        if (width === shownWidth) return;
+        dragWidth = width;
+        shiftHaze(window.innerWidth - width);
+      },
+      onEnd(commit) {
+        cancelPanelDrag = null;
+        if (commit && dragWidth != null && dragWidth !== from) keepPanelWidth(dragWidth);
+        dragWidth = null;
+        shiftHaze(null, !commit);
+        panel.resizing = false;
+      },
+    });
   }
 
   /** The keyboard's way: a step per arrow, Home for automatic. */
@@ -476,7 +481,7 @@
         api.previous();
         return;
       }
-      if (e.code === "Space") {
+      if (spaceControlsPlayback(e)) {
         e.preventDefault();
         togglePlay();
       }

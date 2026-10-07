@@ -1441,6 +1441,10 @@ pub struct StateEvent<'a> {
     /// showing it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_ids: Option<&'a [String]>,
+    /// Invalidated audio-cache marks. Apply before `cached_ids`; unlike row
+    /// revisions these can name tracks no longer in the queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncached_ids: Option<&'a [String]>,
     pub error: Option<&'a str>,
 }
 
@@ -1750,6 +1754,7 @@ mod tests {
             order_revision: 9,
             upcoming: Some(vec![2, 1]),
             cached_ids: Some(&cached),
+            uncached_ids: None,
             error: None,
         })
         .unwrap();
@@ -1803,6 +1808,7 @@ mod tests {
             order_revision: 9,
             upcoming: None,
             cached_ids: None,
+            uncached_ids: None,
             error: None,
         })
         .unwrap();
@@ -1843,6 +1849,7 @@ mod tests {
             order_revision: 1,
             upcoming: Some(Vec::new()),
             cached_ids: None,
+            uncached_ids: None,
             error: None,
         })
         .unwrap();
@@ -2392,6 +2399,7 @@ mod tests {
             order_revision: 1,
             upcoming: Some(Vec::new()),
             cached_ids: None,
+            uncached_ids: None,
             error: None,
         })
         .unwrap();
@@ -2422,6 +2430,7 @@ mod tests {
             order_revision: 2,
             upcoming: Some(Vec::new()),
             cached_ids: None,
+            uncached_ids: None,
             error: None,
         })
         .unwrap();

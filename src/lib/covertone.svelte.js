@@ -317,6 +317,18 @@ const readHueOnce = boundedReads((local) => readHue(local), {
 /** key → palette. Reactive so a late extraction repaints the header. */
 const tones = $state({});
 const inflight = new Set();
+const TONE_CACHE_MAX = 512;
+const toneRecency = new Set();
+
+function touchTone(key) {
+  toneRecency.delete(key);
+  toneRecency.add(key);
+  if (toneRecency.size > TONE_CACHE_MAX) {
+    const oldest = toneRecency.values().next().value;
+    toneRecency.delete(oldest);
+    delete tones[oldest];
+  }
+}
 
 /**
  * What is actually on screen, which is what the page is allowed to take its
@@ -359,7 +371,10 @@ export function coverTone(covers, seed = "") {
   const pool = coverPool(covers);
   const key = pool.join("|") || `seed:${seed}`;
   const hit = tones[key];
-  if (hit) return hit;
+  if (hit) {
+    touchTone(key);
+    return hit;
+  }
 
   if (pool.length && !inflight.has(key)) {
     inflight.add(key);
@@ -380,9 +395,11 @@ export function coverTone(covers, seed = "") {
            scale continuous, because a nearly-monochrome sleeve lands on almost
            exactly the same tone through the measured path. */
         tones[key] = best ? palette(best.hue, best.chroma) : identityTone(seed || key, 0.022);
+        touchTone(key);
       })
       .catch(() => {
         tones[key] = identityTone(seed || key);
+        touchTone(key);
       })
       .finally(() => inflight.delete(key));
   }

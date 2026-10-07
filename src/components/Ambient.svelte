@@ -212,9 +212,9 @@
     return Boolean(v && v.y <= 0.5 && v.y + v.h >= geo.h - 0.5 && v.x + v.w >= geo.w - 0.5);
   }
 
-  $effect(() => watchShift((edge) => {
+  $effect(() => watchShift((edge, cancel) => {
     dragEdge = edge;
-    if (edge != null) for (const entry of stack) slide(entry, edge);
+    if (edge != null || cancel) for (const entry of stack) slide(entry, edge);
   }));
 
   /** Slide a layer's pictures so their seam is at `edge`; null puts them

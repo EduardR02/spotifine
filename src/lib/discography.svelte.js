@@ -133,8 +133,8 @@ export function createCataloguePaging({
   }
 
   /* Download marks reach the songs already on screen, in place. */
-  $effect(() => watchCacheMarks((ids) => {
-    for (const release of releases) applyCacheMarks(release.tracks, ids);
+  $effect(() => watchCacheMarks((ids, cached) => {
+    for (const release of releases) applyCacheMarks(release.tracks, ids, cached);
   }));
 
   return {

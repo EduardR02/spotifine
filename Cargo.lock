@@ -4086,6 +4086,7 @@ dependencies = [
  "librespot-protocol",
  "oauth2",
  "objc2-core-audio",
+ "parking_lot",
  "protobuf",
  "protobuf-json-mapping",
  "reqwest 0.12.28",

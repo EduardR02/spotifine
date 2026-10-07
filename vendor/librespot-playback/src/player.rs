@@ -54,6 +54,15 @@ const LOAD_HANDLES_POISON_MSG: &str = "load handles mutex should not be poisoned
 
 pub type PlayerResult = Result<(), Error>;
 
+/// A decoder command owns its output revision. The commit runs on the player
+/// thread after any old read/write completes; a superseded command is skipped.
+pub struct DecoderTransition {
+    pub revision: u64,
+    pub discontinuous: bool,
+    pub commit: Box<dyn FnOnce() -> bool + Send>,
+    pub is_current: Box<dyn Fn() -> bool + Send>,
+}
+
 pub struct Player {
     commands: Option<mpsc::UnboundedSender<PlayerCommand>>,
     thread_handle: Option<thread::JoinHandle<()>>,
@@ -78,6 +87,8 @@ struct PlayerInternal {
     preload: PlayerPreload,
     sink: Box<dyn Sink>,
     sink_status: SinkStatus,
+    decoder_revision: u64,
+    decoder_is_current: Option<Box<dyn Fn() -> bool + Send>>,
     sink_event_callback: Option<SinkEventCallback>,
     volume_getter: Box<dyn VolumeGetter + Send>,
     event_senders: Vec<mpsc::UnboundedSender<PlayerEvent>>,
@@ -104,14 +115,19 @@ enum PlayerCommand {
         track_id: SpotifyUri,
         play: bool,
         position_ms: u32,
+        transition: DecoderTransition,
     },
     Preload {
         track_id: SpotifyUri,
     },
-    Play,
+    Play(Option<DecoderTransition>),
     Pause,
     Stop,
-    Seek(u32),
+    Seek {
+        position_ms: u32,
+        play: bool,
+        transition: DecoderTransition,
+    },
     SetSession(Session),
     AddEventSender(mpsc::UnboundedSender<PlayerEvent>),
     SetSinkEventCallback(Option<SinkEventCallback>),
@@ -493,6 +509,8 @@ impl Player {
                 preload: PlayerPreload::None,
                 sink: sink_builder(),
                 sink_status: SinkStatus::Closed,
+                decoder_revision: 0,
+                decoder_is_current: None,
                 sink_event_callback: None,
                 volume_getter,
                 event_senders: vec![],
@@ -541,11 +559,12 @@ impl Player {
         }
     }
 
-    pub fn load(&self, track_id: SpotifyUri, start_playing: bool, position_ms: u32) {
+    pub fn load(&self, track_id: SpotifyUri, start_playing: bool, position_ms: u32, transition: DecoderTransition) {
         self.command(PlayerCommand::Load {
             track_id,
             play: start_playing,
             position_ms,
+            transition,
         });
     }
 
@@ -553,8 +572,8 @@ impl Player {
         self.command(PlayerCommand::Preload { track_id });
     }
 
-    pub fn play(&self) {
-        self.command(PlayerCommand::Play)
+    pub fn play(&self, transition: Option<DecoderTransition>) {
+        self.command(PlayerCommand::Play(transition))
     }
 
     pub fn pause(&self) {
@@ -565,8 +584,8 @@ impl Player {
         self.command(PlayerCommand::Stop)
     }
 
-    pub fn seek(&self, position_ms: u32) {
-        self.command(PlayerCommand::Seek(position_ms));
+    pub fn seek(&self, position_ms: u32, play: bool, transition: DecoderTransition) {
+        self.command(PlayerCommand::Seek { position_ms, play, transition });
     }
 
     pub fn set_session(&self, session: Session) {
@@ -1746,7 +1765,8 @@ impl PlayerInternal {
         normalisation_factor: f64,
     ) {
         match packet {
-            Some((_, mut packet)) => {
+            Some((mut position, mut packet)) => {
+                position.revision = self.decoder_revision;
                 if !packet.is_empty() {
                     if let AudioPacket::Samples(ref mut data) = packet {
                         // Get the volume for the packet. In the case of hardware volume control
@@ -1841,7 +1861,7 @@ impl PlayerInternal {
                         }
                     }
 
-                    if let Err(e) = self.sink.write(packet, &mut self.converter) {
+                    if let Err(e) = self.sink.write(position, packet, &mut self.converter) {
                         error!("{e}");
                         self.handle_pause();
                     }
@@ -2249,10 +2269,10 @@ impl PlayerInternal {
                         });
                     }
                 }
-                Err(e) => error!("PlayerInternal::handle_command_seek error: {e}"),
+                Err(error) => return Err(error.into()),
             }
         } else {
-            error!("Player::seek called from invalid state: {:?}", self.state);
+            return Err(Error::failed_precondition(format!("cannot seek player state {:?}", self.state)));
         }
 
         // ensure we have a bit of a buffer of downloaded data
@@ -2270,6 +2290,32 @@ impl PlayerInternal {
         Ok(())
     }
 
+    fn commit_transition(&mut self, transition: DecoderTransition) -> bool {
+        if transition.discontinuous {
+            self.ensure_sink_stopped(false);
+        }
+        if !(transition.commit)() {
+            self.handle_pause();
+            return false;
+        }
+        self.decoder_revision = transition.revision;
+        self.decoder_is_current = Some(transition.is_current);
+        true
+    }
+
+    fn fail_decoder_transition(&mut self, track_id: SpotifyUri, error: Error) -> PlayerResult {
+        let play_request_id = match &self.state {
+            PlayerState::Playing { play_request_id, .. }
+            | PlayerState::Paused { play_request_id, .. }
+            | PlayerState::Loading { play_request_id, .. }
+            | PlayerState::EndOfTrack { play_request_id, .. } => *play_request_id,
+            _ => return Err(error),
+        };
+        self.send_event(PlayerEvent::Unavailable { track_id, play_request_id });
+        self.handle_player_stop();
+        Err(error)
+    }
+
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
         debug!("command={cmd:?}");
         match cmd {
@@ -2277,13 +2323,40 @@ impl PlayerInternal {
                 track_id,
                 play,
                 position_ms,
-            } => self.handle_command_load(track_id, None, play, position_ms)?,
+                transition,
+            } => {
+                if self.commit_transition(transition) {
+                    if let Err(error) = self.handle_command_load(track_id.clone(), None, play, position_ms) {
+                        self.fail_decoder_transition(track_id, error)?;
+                    }
+                }
+            }
 
             PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
 
-            PlayerCommand::Seek(position_ms) => self.handle_command_seek(position_ms)?,
+            PlayerCommand::Seek { position_ms, play, transition } => {
+                if self.commit_transition(transition) {
+                    self.handle_pause();
+                    // Failure must not resume old PCM under the target revision.
+                    if let Err(error) = self.handle_command_seek(position_ms) {
+                        let track_id = match &self.state {
+                            PlayerState::Paused { track_id, .. }
+                            | PlayerState::Loading { track_id, .. } => track_id.clone(),
+                            _ => return Err(error),
+                        };
+                        self.fail_decoder_transition(track_id, error)?;
+                    }
+                    if play {
+                        self.handle_play();
+                    }
+                }
+            }
 
-            PlayerCommand::Play => self.handle_play(),
+            PlayerCommand::Play(transition) => {
+                if transition.is_none_or(|transition| self.commit_transition(transition)) {
+                    self.handle_play();
+                }
+            }
 
             PlayerCommand::Pause => self.handle_pause(),
 
@@ -2380,6 +2453,15 @@ impl PlayerInternal {
     }
 
     fn send_event(&mut self, event: PlayerEvent) {
+        // A blocking read/seek/load can complete after its decoder revision
+        // was superseded. Its events have the same ownership as its PCM.
+        let decoder_event = event.get_play_request_id().is_some()
+            || matches!(&event, PlayerEvent::PlayRequestIdChanged { .. }
+                | PlayerEvent::PositionChanged { .. } | PlayerEvent::TrackChanged { .. }
+                | PlayerEvent::Preloading { .. });
+        if decoder_event && self.decoder_is_current.as_ref().is_some_and(|current| !current()) {
+            return;
+        }
         self.event_senders
             .retain(|sender| sender.send(event.clone()).is_ok());
     }
@@ -2482,10 +2564,10 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::Preload { track_id } => {
                 f.debug_tuple("Preload").field(&track_id).finish()
             }
-            PlayerCommand::Play => f.debug_tuple("Play").finish(),
+            PlayerCommand::Play(_) => f.debug_tuple("Play").finish(),
             PlayerCommand::Pause => f.debug_tuple("Pause").finish(),
             PlayerCommand::Stop => f.debug_tuple("Stop").finish(),
-            PlayerCommand::Seek(position) => f.debug_tuple("Seek").field(&position).finish(),
+            PlayerCommand::Seek { position_ms, .. } => f.debug_tuple("Seek").field(position_ms).finish(),
             PlayerCommand::SetSession(_) => f.debug_tuple("SetSession").finish(),
             PlayerCommand::AddEventSender(_) => f.debug_tuple("AddEventSender").finish(),
             PlayerCommand::SetSinkEventCallback(_) => {

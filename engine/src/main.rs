@@ -209,6 +209,7 @@ async fn run(
     let (player_sender, mut player_receiver) = mpsc::unbounded_channel::<PlayerSignal>();
     let (audio_sender, mut audio_receiver) = mpsc::unbounded_channel();
     let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
+    let (cache_sender, mut cache_receiver) = mpsc::unbounded_channel();
     io::spawn_input_reader(input_sender);
 
     configure_audio_fetch();
@@ -226,6 +227,7 @@ async fn run(
         audio::default_sink_opener(),
         audio::default_device_presence(),
     );
+    engine.set_cache_sender(cache_sender);
     #[cfg(any(windows, target_os = "macos"))]
     let _output_watcher = match output_device::watch(output_sender) {
         Ok(watcher) => Some(watcher),
@@ -607,6 +609,9 @@ async fn run(
                         engine.emit_state()?;
                     }
                 }
+            }
+            Some(signal) = cache_receiver.recv() => {
+                if engine.on_cache_signal(signal) { engine.emit_state()?; }
             }
             outcome = waveform_receiver.recv() => {
                 if let Some(outcome) = outcome {

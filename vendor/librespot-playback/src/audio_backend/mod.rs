@@ -1,6 +1,6 @@
 use crate::config::AudioFormat;
 use crate::convert::Converter;
-use crate::decoder::AudioPacket;
+use crate::decoder::{AudioPacket, AudioPacketPosition};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -30,7 +30,7 @@ pub trait Sink {
     fn stop(&mut self) -> SinkResult<()> {
         Ok(())
     }
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()>;
+    fn write(&mut self, position: AudioPacketPosition, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()>;
 }
 
 pub type SinkBuilder = fn(Option<String>, AudioFormat) -> Box<dyn Sink>;
@@ -47,7 +47,7 @@ fn mk_sink<S: Sink + Open + 'static>(device: Option<String>, format: AudioFormat
 macro_rules! sink_as_bytes {
     () => {
         #[inline]
-        fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+        fn write(&mut self, _position: crate::decoder::AudioPacketPosition, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
             use crate::convert::i24;
             use zerocopy::IntoBytes;
             match packet {

@@ -410,6 +410,10 @@ impl PlaybackRouter {
 
     pub fn snapshot(&self) -> Option<PlaybackState> { self.core.snapshot() }
 
+    pub fn apply_cache_marks(&self, reset: bool, removed: &[String], added: &[String]) {
+        self.core.apply_cache_marks(reset, removed, added);
+    }
+
     pub fn report_error(&self, app: &AppHandle, error: &str) { self.core.report_error(&self.host(app), error); }
 
     pub fn suspend(&self, app: &AppHandle, error: &str) { self.core.suspend(&self.host(app), error); }
@@ -468,6 +472,22 @@ impl Core {
             state.position_ms = remote.position();
             state
         })
+    }
+
+    fn apply_cache_marks(&self, reset: bool, removed: &[String], added: &[String]) {
+        if !reset && removed.is_empty() && added.is_empty() { return; }
+        let mut guard = self.remote.lock();
+        let Some(remote) = guard.as_mut() else { return; };
+        let cached = |track: &Track| {
+            added.contains(&track.id) || (!reset && track.cached && !removed.contains(&track.id))
+        };
+        if remote.state.queue.iter().any(|track| track.cached != cached(track)) {
+            for track in Arc::make_mut(&mut remote.state.queue) { track.cached = cached(track); }
+        }
+        // These are one-shot wire lanes, not part of a remote snapshot.
+        // Replaying an older positive lane could revive a later eviction.
+        remote.state.cached_ids = None;
+        remote.state.uncached_ids = None;
     }
 
     fn publish<H: Host>(&self, host: &H) {
@@ -1698,7 +1718,7 @@ impl Host for AppHost<'_> {
         let mut lines = self.client.subscribe_lines();
         match op {
             None => {}
-            Some(EngineOp::Restore { queue, index, position_ms, context, automatic }) => self.client.restore_queue(queue, index, position_ms, context, automatic).await?,
+            Some(EngineOp::Restore { queue, index, position_ms, context, automatic }) => self.client.restore_queue(queue, index, position_ms, context, automatic, false).await?,
             Some(EngineOp::Cursor { index, position_ms }) => self.client.set_queue_cursor(index, position_ms).await?,
             Some(EngineOp::Add(track, context)) => self.client.add_queue(track, context).await?,
             Some(EngineOp::AddBatch(tracks, context)) => self.client.add_queue_batch(tracks, context).await?,
@@ -1763,6 +1783,21 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn track(id: &str) -> Track { Track { id: id.into(), uri: format!("spotify:track:{id}"), name: id.into(), duration_ms: 100_000, ..Track::default() } }
+
+    #[test]
+    fn remote_snapshots_cannot_reintroduce_invalidated_local_download_marks() {
+        let core = Core::default();
+        let row = Track { cached: true, ..track("a") };
+        *core.remote.lock() = Some(Remote::new(PlaybackState { queue: vec![row].into(),
+            cached_ids: Some(vec!["a".into()]), ..Default::default() }, true));
+        core.apply_cache_marks(false, &["a".into()], &[]);
+        assert!(!core.snapshot().unwrap().queue[0].cached);
+        assert!(core.snapshot().unwrap().cached_ids.is_none());
+        core.apply_cache_marks(false, &["a".into()], &["a".into()]);
+        assert!(core.snapshot().unwrap().queue[0].cached);
+        core.apply_cache_marks(true, &[], &[]);
+        assert!(!core.snapshot().unwrap().queue[0].cached);
+    }
 
     fn device() -> Value {
         json!({"id":"phone", "name":"Phone", "type":"Smartphone", "is_active":true, "is_private_session":false, "is_restricted":false, "volume_percent":35, "supports_volume":true})

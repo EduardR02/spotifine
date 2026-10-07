@@ -20,6 +20,7 @@
   import { panel as panelState } from "../lib/panel.svelte.js";
   import { formatTime } from "../lib/time.js";
   import { scrollbar } from "../lib/scrollbar.js";
+  import { createCanvasOwner } from "../lib/canvas.js";
 
   const current = $derived(
     playback.current_index >= 0 ? (playback.queue[playback.current_index] ?? null) : null,
@@ -85,13 +86,6 @@
   });
 
 
-  /** No Canvas for this record: the cover is the picture. */
-  function dropCanvas() {
-    canvasUrl = "";
-    canvasReady = false;
-    preferCover = false;
-    haze.awaiting = false;
-  }
 
   /* Canvas is an opt-in decoder, so it is asked for only while someone can
      see the answer: never with the setting off or reduced motion asked for,
@@ -102,56 +96,32 @@
      `haze.awaiting` holds from the question until the answer is on screen
      (or is "none"), so the haze waits for the Canvas instead of lighting
      the window from the cover for a second and then changing again. */
-  let canvasGeneration = 0;
-  let askedKey = "";
+  const canvasOwner = createCanvasOwner((key) => api.browseCanvas(key), (picture) => {
+    canvasUrl = picture.url;
+    canvasReady = picture.ready;
+    haze.awaiting = picture.waiting;
+    if (picture.resetPreference) preferCover = false;
+    // A confirmed shared loop may already be decoded; no reload is needed.
+    if (picture.accepted && !picture.ready && videoEl?.readyState >= 2
+      && videoEl.getAttribute("src") === picture.url) {
+      canvasOwner.arrive(picture.url);
+    }
+  });
   $effect(() => {
     const key = canvasTrackKey;
     const allowed = Boolean(key) && appSettings.animated_canvas && !reducedMotion;
-    if (!allowed) {
-      canvasGeneration++;
-      askedKey = "";
-      untrack(dropCanvas);
-      return;
-    }
-    if (!pageVisible || key === askedKey) return;
-    askedKey = key;
-    const generation = ++canvasGeneration;
-    untrack(() => {
-      canvasReady = false;
-      preferCover = false;
-    });
-    haze.awaiting = true;
-    api.browseCanvas(key)
-      .then((canvas) => {
-        if (generation !== canvasGeneration) return;
-        if (!canvas?.url) return dropCanvas();
-        if (canvas.url !== canvasUrl) {
-          /* A new source: the element reloads and `canplay` shows it. */
-          canvasUrl = canvas.url;
-          return;
-        }
-        /* The same loop again (the next track is on the same record). */
-        if (videoEl && videoEl.readyState >= 2) arrive();
-      })
-      .catch(() => {
-        if (generation === canvasGeneration) dropCanvas();
-      });
+    const visible = pageVisible;
+    untrack(() => canvasOwner.update(key, allowed, visible));
   });
+  $effect(() => () => canvasOwner.dispose());
 
-  function arrive() {
-    canvasReady = true;
-    haze.awaiting = false;
-  }
-
-  function handleCanvasReady() {
-    /* `canplay` repeats after a stall; only the first one is an arrival. */
-    if (!canvasReady) arrive();
+  function handleCanvasReady(event) {
+    canvasOwner.arrive(event.currentTarget.getAttribute("src"));
   }
 
   function handleCanvasError(event) {
-    /* Swapping the src aborts the previous load; that is not a verdict. */
-    if (event?.target?.error?.code === MediaError.MEDIA_ERR_ABORTED) return;
-    dropCanvas();
+    if (event.currentTarget.error?.code === MediaError.MEDIA_ERR_ABORTED) return;
+    canvasOwner.fail(event.currentTarget.getAttribute("src"));
   }
 
   /** Cover or Canvas: a crossfade, nothing else. */
@@ -380,6 +350,7 @@
     <!-- The picture layer, pinned under the scrolling column. -->
     <div class="np-stage" bind:this={stageEl} aria-hidden="true">
       {#if canvasUrl}
+        {#key canvasUrl}
         <video
           class="np-video"
           class:shown={videoShown}
@@ -395,6 +366,7 @@
           oncanplay={handleCanvasReady}
           onerror={handleCanvasError}
         ></video>
+        {/key}
       {/if}
     </div>
 

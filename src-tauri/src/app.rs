@@ -3,7 +3,7 @@
 //! Playlist and cache files live under the platform's app-owned data directory.
 //! Covers are raw image bytes keyed by `sha1(url)`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -243,6 +243,10 @@ pub struct AppState {
     /// carry this ephemeral generation across launches.
     #[serde(skip)]
     pub library_generation: u64,
+    /// Confirmed track edits fence every detail and membership read, including
+    /// uncached foreground browses that bypass background refresh coalescing.
+    #[serde(skip)]
+    playlist_generations: HashMap<String, u64>,
     /// Fences full Liked Songs walks against confirmed personal-API writes.
     #[serde(skip)]
     pub liked_generation: u64,
@@ -282,12 +286,26 @@ impl AppState {
             library_fetching: false,
             library_refresh_queued: false,
             library_generation: 0,
+            playlist_generations: HashMap::new(),
             liked_generation: 0,
             cache_stats: None,
             memberships: Vec::new(),
             membership_fetching: false,
             membership_refresh_queued: false,
         }
+    }
+
+    pub(crate) fn playlist_generation(&self, id: &str) -> u64 {
+        self.playlist_generations.get(id).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn record_playlist_edit(&mut self, id: &str) {
+        let generation = self.playlist_generations.entry(id.to_owned()).or_default();
+        *generation = generation.wrapping_add(1);
+    }
+
+    pub(crate) fn playlist_read_is_current(&self, id: &str, generation: u64) -> bool {
+        self.playlist_generation(id) == generation
     }
 
     pub(crate) fn record_liked_write(&mut self, uris: &[String], saved: bool) -> bool {
@@ -595,7 +613,11 @@ pub fn load_playlist_list(dir: &Path) -> Option<PlaylistListCache> {
 }
 
 pub fn save_playlist_list(dir: &Path, cache: &PlaylistListCache) {
-    write_json_cache(dir.join("playlist_list.json"), cache);
+    // Playlist metadata is rebuildable; local listening/activity timestamps
+    // are not. Never truncate their only durable copy.
+    if let Err(error) = write_json_atomic_result(dir.join("playlist_list.json"), cache) {
+        eprintln!("Spotifine: could not persist library: {error}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1194,16 @@ fn write_json_atomic_result<T: Serialize>(path: PathBuf, value: &T) -> Result<()
 }
 
 fn write_bytes_atomic_result(path: PathBuf, bytes: &[u8]) -> Result<(), String> {
+    write_bytes_atomic_with(path, bytes, |source, destination| {
+        renderer_engine::atomic::replace_file_atomically(source, destination, true)
+    })
+}
+
+fn write_bytes_atomic_with(
+    path: PathBuf,
+    bytes: &[u8],
+    replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
     use std::io::Write as _;
 
     let temp = path.with_extension("json.tmp");
@@ -1181,7 +1213,7 @@ fn write_bytes_atomic_result(path: PathBuf, bytes: &[u8]) -> Result<(), String> 
         .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
     file.sync_all().map_err(|error| format!("could not flush {}: {error}", temp.display()))?;
     drop(file);
-    renderer_engine::atomic::replace_file_atomically(&temp, &path, true)
+    replace(&temp, &path)
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
 }
 
@@ -1192,6 +1224,30 @@ fn write_bytes_atomic_result(path: PathBuf, bytes: &[u8]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_library_replacement_preserves_local_activity_and_next_write_recovers() {
+        let dir = std::env::temp_dir().join(format!("renderer-library-atomic-{}-{}", std::process::id(), now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut row = playlist("p");
+        row.last_played = Some(123);
+        row.last_activity = Some(456);
+        let cache = PlaylistListCache { version: 1, fetched_at: Some(1), me_id: "me".into(),
+            playlists: vec![row], playlist_tree: Vec::new() };
+        save_playlist_list(&dir, &cache);
+        let path = dir.join("playlist_list.json");
+        let error = write_bytes_atomic_with(path, b"{\"partial", |_, _| {
+            Err(std::io::Error::other("injected replacement failure"))
+        });
+        assert!(error.is_err());
+        let loaded = load_playlist_list(&dir).unwrap();
+        assert_eq!(loaded.playlists[0].last_played, Some(123));
+        assert_eq!(loaded.playlists[0].last_activity, Some(456));
+        let next = PlaylistListCache { fetched_at: Some(2), ..cache };
+        save_playlist_list(&dir, &next);
+        assert_eq!(load_playlist_list(&dir).unwrap().fetched_at, Some(2));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn sparse_rootlist_keeps_display_metadata_without_claiming_old_revision_is_current() {

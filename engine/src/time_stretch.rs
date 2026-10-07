@@ -87,19 +87,19 @@ impl AudioPipeline {
         self.edit.is_none() && self.stretcher.is_none()
     }
 
-    pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) -> Option<u32> {
+    pub fn process(&mut self, source_frame: u64, input: &[f32], output: &mut Vec<f32>) -> Option<u32> {
         output.clear();
         let loop_to = if let Some(edit) = &mut self.edit {
             if let Some(stretcher) = &mut self.stretcher {
                 self.filtered.clear();
-                let loop_to = edit.process(input, &mut self.filtered);
+                let loop_to = edit.process(source_frame, input, &mut self.filtered);
                 stretcher.process(&self.filtered, output);
                 if loop_to.is_some() {
                     stretcher.finish(output);
                 }
                 loop_to
             } else {
-                edit.process(input, output)
+                edit.process(source_frame, input, output)
             }
         } else if let Some(stretcher) = &mut self.stretcher {
             stretcher.process(input, output);
@@ -183,7 +183,11 @@ impl SampleEdit {
         }
     }
 
-    fn process(&mut self, input: &[f32], output: &mut Vec<f32>) -> Option<u32> {
+    fn process(&mut self, source_frame: u64, input: &[f32], output: &mut Vec<f32>) -> Option<u32> {
+        if self.frame != source_frame {
+            self.frame = source_frame;
+            self.cut_index = self.cuts.partition_point(|cut| cut.end <= source_frame);
+        }
         debug_assert!(input.len().is_multiple_of(CHANNELS));
         output.reserve(input.len());
         for source in input.chunks_exact(CHANNELS) {
@@ -1002,6 +1006,7 @@ mod tests {
         while frame < total && loop_to.is_none() {
             let count = packet_frames[packet % packet_frames.len()].min(total - frame);
             loop_to = pipeline.process(
+                ms_to_frame(position_ms) + frame as u64,
                 &input[frame * CHANNELS..(frame + count) * CHANNELS],
                 &mut packet_output,
             );
@@ -1275,7 +1280,7 @@ mod tests {
         });
         let mut output = Vec::new();
         let first = source_ramp(0, ms_to_frame(80) as usize);
-        assert_eq!(pipeline.process(&first, &mut output), Some(20));
+        assert_eq!(pipeline.process(0, &first, &mut output), Some(20));
 
         pipeline.reset_buffers();
         output.clear();
@@ -1283,7 +1288,7 @@ mod tests {
             ms_to_frame(40) as usize,
             (ms_to_frame(80) - ms_to_frame(40)) as usize,
         );
-        assert_eq!(pipeline.process(&resumed, &mut output), Some(20));
+        assert_eq!(pipeline.process(ms_to_frame(40), &resumed, &mut output), Some(20));
     }
 
     #[test]
@@ -1303,13 +1308,13 @@ mod tests {
 
             let mut first = SampleEdit::new(&edit, 0, 1);
             let mut output = Vec::new();
-            assert_eq!(first.process(&input, &mut output), Some(20));
+            assert_eq!(first.process(0, &input, &mut output), Some(20));
 
             for pass in 2..=play_count {
                 let mut repeated = SampleEdit::new(&edit, 20, pass);
                 let repeated_input = source_ramp(loop_start, total_frames - loop_start);
                 output.clear();
-                let marker = repeated.process(&repeated_input, &mut output);
+                let marker = repeated.process(loop_start as u64, &repeated_input, &mut output);
                 if pass < play_count {
                     assert_eq!(marker, Some(20));
                 } else {
@@ -1686,10 +1691,10 @@ mod tests {
         });
         let mut output = Vec::new();
         let before = frames_for_ms(20);
-        assert_eq!(pipeline.process(&source_ramp(0, before), &mut output), None);
+        assert_eq!(pipeline.process(0, &source_ramp(0, before), &mut output), None);
         pipeline.set_speed(4.0, &mut output);
         let after = frames_for_ms(90);
-        assert_eq!(pipeline.process(&source_ramp(before, after), &mut output), Some(10));
+        assert_eq!(pipeline.process(before as u64, &source_ramp(before, after), &mut output), Some(10));
         let edit = pipeline.edit.as_ref().unwrap();
         assert_eq!(edit.frame, ms_to_frame(100));
         assert_eq!(edit.loop_range.unwrap().pass, 2);
@@ -1741,14 +1746,110 @@ mod tests {
         });
         let input = stereo_tone(frames_for_ms(200), 440.0, -0.5);
         let mut output = Vec::new();
-        pipeline.process(&input, &mut output);
+        pipeline.process(0, &input, &mut output);
         let consumed = output.len() / CHANNELS * 4;
         let mut pending = Vec::new();
         pipeline.set_speed(1.0, &mut pending);
         assert_eq!(pending.len() / CHANNELS, input.len() / CHANNELS - consumed);
         assert!(pipeline.is_passthrough());
         let next = source_ramp(input.len() / CHANNELS, 127);
-        pipeline.process(&next, &mut output);
+        pipeline.process((input.len() / CHANNELS) as u64, &next, &mut output);
+        assert_eq!(output, next);
+    }
+
+    #[test]
+    fn synthetic_vorbis_seeks_deliver_exact_pcm_for_cuts_and_repeated_loops() {
+        assert_encoded_seeks(include_bytes!("../../vendor/librespot-playback/src/decoder/fixtures/seek-tone.ogg"));
+    }
+
+    #[test]
+    fn synthetic_mp3_seeks_deliver_exact_pcm_for_cuts_and_repeated_loops() {
+        assert_encoded_seeks(include_bytes!("../../vendor/librespot-playback/src/decoder/fixtures/seek-tone.mp3"));
+    }
+
+    fn assert_encoded_seeks(fixture: &[u8]) {
+        use librespot_playback::decoder::{AudioDecoder, SymphoniaDecoder};
+        use symphonia::core::probe::Hint;
+        let make_decoder = || SymphoniaDecoder::new(
+            std::io::Cursor::new(fixture.to_vec()), Hint::new(),
+        ).unwrap();
+        let mut reference_decoder = make_decoder();
+        reference_decoder.seek(0).unwrap();
+        let mut reference = Vec::new();
+        while let Some((position, packet)) = reference_decoder.next_packet().unwrap() {
+            assert_eq!(position.source_frame, (reference.len() / CHANNELS) as u64);
+            reference.extend(packet.samples().unwrap().iter().map(|sample| *sample as f32));
+        }
+        assert_eq!(reference.len() / CHANNELS, SAMPLE_RATE as usize * 2);
+
+        let mut decoder = make_decoder();
+        for target_ms in [0, 1, 10, 37, 100, 123, 500, 1_000, 1_011, 37, 1] {
+            assert_eq!(decoder.seek(target_ms).unwrap(), target_ms);
+            let target = ms_to_frame(target_ms);
+            let (position, packet) = decoder.next_packet().unwrap().unwrap();
+            assert_eq!(position.source_frame, target, "target={target_ms}");
+            let samples: Vec<f32> = packet.samples().unwrap().iter().map(|sample| *sample as f32).collect();
+            assert!(!samples.is_empty(), "empty decoder priming packets are not PCM");
+            let offset = target as usize * CHANNELS;
+            assert_eq!(samples, reference[offset..offset + samples.len()],
+                "seek preroll must reconstruct the same PCM as continuous decode");
+            let mut pipeline = AudioPipeline::new(&PipelineConfig {
+                edit: Some(TrackEdit {
+                    cuts: vec![TimeRange { start_ms: target_ms, end_ms: target_ms + 1 }],
+                    loop_range: None,
+                }),
+                speed: 1.0, position_ms: target_ms, loop_pass: 1,
+            });
+            let mut output = Vec::new();
+            pipeline.process(position.source_frame, &samples, &mut output);
+            let removed = ((ms_to_frame(target_ms + 1) - target) as usize).min(samples.len() / CHANNELS);
+            assert_eq!(output, samples[removed * CHANNELS..]);
+        }
+
+        for pass in 1..3 {
+            decoder.seek(37).unwrap();
+            let mut pipeline = AudioPipeline::new(&PipelineConfig {
+                edit: Some(TrackEdit {
+                    cuts: Vec::new(),
+                    loop_range: Some(LoopRange { start_ms: 37, end_ms: 100, play_count: 3 }),
+                }),
+                speed: 1.0, position_ms: 37, loop_pass: pass,
+            });
+            let mut rendered = Vec::new();
+            let mut output = Vec::new();
+            loop {
+                let (position, packet) = decoder.next_packet().unwrap().unwrap();
+                let samples: Vec<f32> = packet.samples().unwrap().iter().map(|sample| *sample as f32).collect();
+                let marker = pipeline.process(position.source_frame, &samples, &mut output);
+                rendered.extend_from_slice(&output);
+                if let Some(marker) = marker {
+                    assert_eq!(marker, 37);
+                    break;
+                }
+            }
+            assert_eq!(rendered,
+                reference[ms_to_frame(37) as usize * CHANNELS..ms_to_frame(100) as usize * CHANNELS]);
+        }
+    }
+
+    #[test]
+    fn packet_source_frames_rebase_cuts_instead_of_assuming_requested_milliseconds() {
+        let mut pipeline = AudioPipeline::new(&PipelineConfig {
+            edit: Some(TrackEdit {
+                cuts: vec![TimeRange { start_ms: 100, end_ms: 120 }],
+                loop_range: None,
+            }),
+            speed: 1.0, position_ms: 100, loop_pass: 1,
+        });
+        let actual_start = ms_to_frame(110) + 7;
+        let input = source_ramp(actual_start as usize, 1_323);
+        let mut output = Vec::new();
+        pipeline.process(actual_start, &input, &mut output);
+        let cut_frames = (ms_to_frame(120) - actual_start) as usize;
+        assert_eq!(output, input[cut_frames * CHANNELS..]);
+        pipeline.reset_buffers();
+        let next = source_ramp(ms_to_frame(130) as usize, 127);
+        pipeline.process(ms_to_frame(130), &next, &mut output);
         assert_eq!(output, next);
     }
 }

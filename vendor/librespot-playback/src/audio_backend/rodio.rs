@@ -240,7 +240,7 @@ impl Sink for RodioSink {
         Ok(())
     }
 
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+    fn write(&mut self, _position: crate::decoder::AudioPacketPosition, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         let samples = packet
             .samples()
             .map_err(|e| RodioError::Samples(e.to_string()))?;

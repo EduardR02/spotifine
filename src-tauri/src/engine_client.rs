@@ -92,6 +92,11 @@ pub struct EngineReply {
     pub data: Option<Value>,
 }
 
+struct PendingRequest {
+    sender: oneshot::Sender<EngineReply>,
+    cache_generation: u64,
+}
+
 /// The engine's 2-second scalar position heartbeat. Deliberately not a
 /// [`PlaybackState`]: a heartbeat carries only the playhead scalars the
 /// frontend projects and clamps against, so parsing and forwarding it never
@@ -118,6 +123,8 @@ pub enum StateLine {
     Volume(u8),
     /// Cache additions still publish when a queue/order delta cannot resolve.
     CachedIds(Vec<String>),
+    UncachedIds(Vec<String>),
+    CacheMarksReset,
     Disconnected,
 }
 
@@ -565,6 +572,8 @@ struct DeltaBase {
     upcoming: Vec<usize>,
     /// Positive file marks survive omitted arrays and queue replacement.
     cached_ids: HashSet<String>,
+    /// A supplied row cannot revive a removal; only a new positive delta can.
+    invalidated_ids: HashSet<String>,
     /// The revision whose missing rows the engine was already asked to
     /// re-send, so one shed payload costs at most one request.
     resynced: Option<u64>,
@@ -573,11 +582,19 @@ struct DeltaBase {
 impl DeltaBase {
     /// Decides how `state` gets its queue, and records the base it leaves.
     fn adopt(&mut self, state: &PlaybackState, rows: PayloadRows) -> DeltaAdoption {
+        if let Some(ids) = &state.uncached_ids {
+            for id in ids {
+                self.cached_ids.remove(id);
+                self.invalidated_ids.insert(id.clone());
+            }
+            unmark_rows(&mut self.queue, ids);
+        }
         let sent_queue = matches!(rows, PayloadRows::Sent | PayloadRows::QueueOnly);
         let sent_order = matches!(rows, PayloadRows::Sent | PayloadRows::OrderOnly);
         let mut new_marks = false;
         if let Some(ids) = &state.cached_ids {
             for id in ids {
+                self.invalidated_ids.remove(id);
                 if !self.cached_ids.contains(id) {
                     self.cached_ids.insert(id.clone());
                     new_marks = true;
@@ -597,7 +614,7 @@ impl DeltaBase {
             self.revision = (state.queue_revision != 0).then_some(state.queue_revision);
             self.queue = Arc::clone(&state.queue);
             for track in state.queue.iter() {
-                if track.cached && !self.cached_ids.contains(&track.id) {
+                if track.cached && !self.invalidated_ids.contains(&track.id) && !self.cached_ids.contains(&track.id) {
                     self.cached_ids.insert(track.id.clone());
                 }
             }
@@ -606,9 +623,10 @@ impl DeltaBase {
             self.order_revision = (state.order_revision != 0).then_some(state.order_revision);
             self.upcoming.clone_from(&state.upcoming);
         }
+        let removed_rows = sent_queue && unmark_rows_set(&mut self.queue, &self.invalidated_ids);
         let marked_rows = sent_queue && mark_cached_rows(&mut self.queue, &self.cached_ids);
         self.resynced = None;
-        if sent_queue && sent_order && !marked_rows { DeltaAdoption::AsSent }
+        if sent_queue && sent_order && !marked_rows && !removed_rows { DeltaAdoption::AsSent }
         else { DeltaAdoption::Fill { queue: Arc::clone(&self.queue), upcoming: self.upcoming.clone() } }
     }
 
@@ -644,14 +662,56 @@ pub fn unmark_cached_rows(rows: &mut Arc<[Track]>) {
     }
 }
 
+fn unmark_rows_set(rows: &mut Arc<[Track]>, ids: &HashSet<String>) -> bool {
+    if !rows.iter().any(|track| track.cached && ids.contains(&track.id)) { return false; }
+    for track in Arc::make_mut(rows) {
+        if ids.contains(&track.id) { track.cached = false; }
+    }
+    true
+}
+
+fn unmark_rows(rows: &mut Arc<[Track]>, ids: &[String]) {
+    if !ids.is_empty() {
+        unmark_rows_set(rows, &ids.iter().cloned().collect());
+    }
+}
+
+fn discard_cached_claims(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(cached) = object.get_mut("cached") { *cached = Value::Bool(false); }
+            for field in object.values_mut() { discard_cached_claims(field); }
+        }
+        Value::Array(values) => for value in values { discard_cached_claims(value); },
+        _ => {}
+    }
+}
+
+fn discard_invalidated_claims(value: &mut Value, ids: &HashSet<String>) {
+    match value {
+        Value::Object(object) => {
+            if object.get("id").and_then(Value::as_str).is_some_and(|id| ids.contains(id)) {
+                if let Some(cached) = object.get_mut("cached") { *cached = Value::Bool(false); }
+            }
+            for field in object.values_mut() { discard_invalidated_claims(field, ids); }
+        }
+        Value::Array(values) => for value in values { discard_invalidated_claims(value, ids); },
+        _ => {}
+    }
+}
+
 pub struct EngineClient {
     state_dir: PathBuf,
-    pending: tokio::sync::Mutex<HashMap<String, oneshot::Sender<EngineReply>>>,
+    pending: tokio::sync::Mutex<HashMap<String, PendingRequest>>,
     stdin: Mutex<Option<ChildStdin>>,
     process: Mutex<Option<Child>>,
     state_tx: tokio::sync::broadcast::Sender<StateLine>,
     exit_tx: watch::Sender<bool>,
     last_state: Mutex<Option<PlaybackState>>,
+    /// The newest complete wire state, including restore intermediates.
+    observed_state: Mutex<Option<PlaybackState>>,
+    has_authenticated_state: AtomicBool,
+    cache_generation: AtomicU64,
     /// The rows of the newest payload that carried a queue, for filling the
     /// ones that omit it. Kept apart from `last_state` on purpose: the
     /// durability filter below refuses previews and restore intermediates,
@@ -703,6 +763,9 @@ impl EngineClient {
             state_tx,
             exit_tx,
             last_state: Mutex::new(None),
+            observed_state: Mutex::new(None),
+            has_authenticated_state: AtomicBool::new(false),
+            cache_generation: AtomicU64::new(0),
             delta_base: Mutex::new(DeltaBase::default()),
             preview_active: AtomicBool::new(false),
             restore_pending: Mutex::new(restore_pending),
@@ -730,6 +793,37 @@ impl EngineClient {
 
     /// The reader's canonical snapshot, fresher than the UI's asynchronous copy.
     pub fn current_state(&self) -> Option<PlaybackState> { self.last_state.lock().clone() }
+
+    pub fn cache_generation(&self) -> u64 { self.cache_generation.load(Ordering::Acquire) }
+
+    pub fn reconcile_cached_rows(&self, rows: &mut [Track], generation: u64) {
+        let base = self.delta_base.lock();
+        let stale = generation != self.cache_generation();
+        for row in rows {
+            if stale || base.invalidated_ids.contains(&row.id) { row.cached = false; }
+            if base.cached_ids.contains(&row.id) { row.cached = true; }
+        }
+    }
+
+    /// A response barrier has proved the restore commands finished. Adopt the
+    /// engine's actual result even if end-of-track restart or a concurrent
+    /// command legitimately changed it from the original intent.
+    pub fn complete_pending_restore(&self, generation: u64) -> Option<PlaybackState> {
+        let mut pending = self.restore_pending.lock();
+        if self.restore_generation.load(Ordering::Acquire) != generation
+            || pending.as_ref().is_some_and(|plan| plan.only_if_preview || !plan.sent)
+        { return None; }
+        let Some(state) = self.observed_state.lock().as_ref()
+            .filter(|state| state.auth_state == "ready" && !state.preview).cloned()
+        else { return None; };
+        *pending = None;
+        *self.last_state.lock() = Some(state.clone());
+        self.queue_generation.fetch_add(1, Ordering::AcqRel);
+        self.mark_persistence_dirty();
+        drop(pending);
+        let _ = self.state_tx.send(StateLine::State(state.clone()));
+        Some(state)
+    }
 
     /// Starts the pending startup/crash restore exactly once, after a fresh
     /// engine reports that authentication is ready. Preview leases are kept
@@ -861,7 +955,7 @@ impl EngineClient {
                     Ok(()) => {
                         backoff = RESPAWN_BACKOFF_START;
                         // Clear the exit latch for the fresh process.
-                        let _ = self.exit_tx.send(false);
+                        self.exit_tx.send_replace(false);
                     }
                     Err(error) => {
                         log::error(&format!(
@@ -995,7 +1089,10 @@ impl EngineClient {
         let (sender, receiver) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(request_id.clone(), sender);
+            pending.insert(request_id.clone(), PendingRequest {
+                sender,
+                cache_generation: self.cache_generation(),
+            });
         }
         let line = build_line(&request_id, kind, args);
         if let Err(error) = self.write_line(&line) {
@@ -1013,6 +1110,7 @@ impl EngineClient {
             Err(_) => {
                 let mut pending = self.pending.lock().await;
                 pending.remove(&request_id);
+                drop(pending);
                 if let Some(track_id) = cancellation_track_id {
                     // The caller has stopped waiting, so release the engine's
                     // one global waveform worker as well. This is deliberately
@@ -1231,6 +1329,7 @@ impl EngineClient {
         position_ms: u32,
         context: &str,
         automatic_start: bool,
+        resume_playing: bool,
     ) -> Result<(), String> {
         let result = self
             .request(
@@ -1241,6 +1340,7 @@ impl EngineClient {
                     "position_ms": position_ms,
                     "context": context,
                     "automatic_start": automatic_start,
+                    "resume_playing": resume_playing,
                 }),
             )
             .await
@@ -1369,15 +1469,22 @@ impl EngineClient {
         // EOF can race a successful logout. Keep this lock order identical to
         // on_eof and on_state so a pre-logout real queue can never be
         // installed after logout has invalidated it.
+        self.clear_session_restore();
+        self.clear_persisted_playback_state()
+    }
+
+    fn clear_session_restore(&self) {
         {
             let mut pending = self.restore_pending.lock();
             let mut last_state = self.last_state.lock();
             *pending = None;
             self.restore_generation.fetch_add(1, Ordering::AcqRel);
             *last_state = None;
+            *self.observed_state.lock() = None;
+            self.has_authenticated_state.store(false, Ordering::Release);
         }
         self.preview_active.store(false, Ordering::Release);
-        self.clear_persisted_playback_state()
+        self.clear_cache_marks();
     }
 
     fn clear_persisted_playback_state(&self) -> Result<(), String> {
@@ -1839,16 +1946,24 @@ impl EngineClient {
         }
     }
 
-    /// The explicit successful Settings clear is the only negative cache
-    /// update; empty or omitted cached_ids are never a reset.
+    /// A session boundary or successful explicit clear invalidates every
+    /// retained mark and fences browse work already in flight.
     pub fn clear_cache_marks(&self) {
-        let mut base = self.delta_base.lock();
-        base.cached_ids.clear();
-        unmark_cached_rows(&mut base.queue);
-        if let Some(state) = self.last_state.lock().as_mut() {
-            state.cached_ids = None;
-            unmark_cached_rows(&mut state.queue);
+        self.cache_generation.fetch_add(1, Ordering::AcqRel);
+        {
+            let mut base = self.delta_base.lock();
+            base.cached_ids.clear();
+            base.invalidated_ids.clear();
+            unmark_cached_rows(&mut base.queue);
         }
+        for state in [&self.last_state, &self.observed_state] {
+            if let Some(state) = state.lock().as_mut() {
+                state.cached_ids = None;
+                state.uncached_ids = None;
+                unmark_cached_rows(&mut state.queue);
+            }
+        }
+        let _ = self.state_tx.send(StateLine::CacheMarksReset);
     }
 
     /// O(1) reader-thread notification. The bounded channel coalesces bursts;
@@ -1865,17 +1980,18 @@ impl EngineClient {
         }
     }
 
-    /// The final shutdown flush: the retained live state, falling back to the
-    /// pending durable restore when no live state was ever observed. Clones
-    /// and normalizes the queue — once, at process exit.
+    /// The final shutdown flush keeps an unresolved restore's source ahead of
+    /// a replacement's blank authentication state. Established sessions remain
+    /// restorable through reconnect/error; only explicit session clearing retires them.
     fn playback_snapshot_for_shutdown(&self) -> Option<PlaybackSnapshot> {
         let pending = self.restore_pending.lock();
         let last_state = self.last_state.lock();
-        last_state
-            .as_ref()
-            .filter(|state| state.auth_state == "ready")
-            .map(PlaybackSnapshot::from_playback)
-            .or_else(|| pending.as_ref().map(|plan| plan.snapshot.durable()))
+        pending.as_ref().map(|plan| plan.snapshot.durable()).or_else(|| {
+            last_state.as_ref()
+                .filter(|state| self.has_authenticated_state.load(Ordering::Acquire)
+                    && !matches!(state.auth_state.as_str(), "needs_login" | "logged_out"))
+                .map(PlaybackSnapshot::from_playback)
+        })
     }
 
     /// The writer's deadline arm: borrows the retained state under the lock,
@@ -1939,6 +2055,9 @@ impl EngineClient {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
+        if state.uncached_ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+            self.cache_generation.fetch_add(1, Ordering::AcqRel);
+        }
         // A false state only reconciles a lease after this client has
         // observed the engine in preview mode. An unrelated false state
         // arriving before activation must not clear a freshly claimed lease.
@@ -1958,6 +2077,9 @@ impl EngineClient {
                 &merged
             }
             DeltaAdoption::Unresolvable { revision } => {
+                if let Some(ids) = &state.uncached_ids {
+                    let _ = self.state_tx.send(StateLine::UncachedIds(ids.clone()));
+                }
                 if let Some(ids) = &state.cached_ids {
                     let _ = self.state_tx.send(StateLine::CachedIds(ids.clone()));
                 }
@@ -1983,6 +2105,10 @@ impl EngineClient {
             }
         };
         let mut pending = self.restore_pending.lock();
+        *self.observed_state.lock() = Some(state.clone());
+        if state.auth_state == "ready" && !state.preview {
+            self.has_authenticated_state.store(true, Ordering::Release);
+        }
         if was_preview
             && !state.preview
             && pending.as_ref().is_some_and(|plan| plan.only_if_preview)
@@ -2043,6 +2169,10 @@ impl EngineClient {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
+        if let Some(observed) = self.observed_state.lock().as_mut() {
+            observed.position_ms = heartbeat.position_ms;
+            observed.duration_ms = heartbeat.duration_ms;
+        }
         let changed = if self.preview_active.load(Ordering::Acquire) {
             false
         } else if let Some(last) = self.last_state.lock().as_mut() {
@@ -2071,6 +2201,7 @@ impl EngineClient {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
+        if let Some(observed) = self.observed_state.lock().as_mut() { observed.volume = volume; }
         let changed = match self.last_state.lock().as_mut() {
             Some(last) => {
                 last.volume = volume;
@@ -2090,8 +2221,8 @@ impl EngineClient {
         }
         log::warn("engine process exited (stdout closed)");
         let mut pending = self.pending.blocking_lock();
-        for (_, sender) in pending.drain() {
-            let _ = sender.send(EngineReply {
+        for (_, request) in pending.drain() {
+            let _ = request.sender.send(EngineReply {
                 ok: false,
                 error: Some("the playback engine exited".to_owned()),
                 data: None,
@@ -2101,7 +2232,13 @@ impl EngineClient {
         let mut restore = self.restore_pending.lock();
         self.restore_generation.fetch_add(1, Ordering::AcqRel);
         let last = self.last_state.lock().clone();
-        if let Some(last) = last.filter(|state| state.auth_state == "ready") {
+        if restore.as_ref().is_some_and(|plan| !plan.only_if_preview) {
+            // A replacement may crash while still authenticating: its blank
+            // intermediate must never replace the original restore source.
+            restore.as_mut().unwrap().sent = false;
+        } else if let Some(last) = last.filter(|state| self.has_authenticated_state.load(Ordering::Acquire)
+            && !matches!(state.auth_state.as_str(), "needs_login" | "logged_out"))
+        {
             *restore = Some(RestorePlan {
                 snapshot: RestoreSnapshot::from_playback(&last, last.playing),
                 sent: false,
@@ -2114,16 +2251,29 @@ impl EngineClient {
         } else if let Some(plan) = restore.as_mut() {
             plan.sent = false;
         }
+        drop(restore);
+        *self.observed_state.lock() = None;
+        self.clear_cache_marks();
+        *self.delta_base.lock() = DeltaBase::default();
         let _ = self.state_tx.send(StateLine::Disconnected);
         *self.stdin.lock() = None;
         *self.process.lock() = None;
-        let _ = self.exit_tx.send(true);
+        self.exit_tx.send_replace(true);
     }
 
-    fn deliver(&self, request_id: &str, reply: EngineReply) {
+    fn deliver(&self, request_id: &str, mut reply: EngineReply) {
         let mut pending = self.pending.blocking_lock();
-        if let Some(sender) = pending.remove(request_id) {
-            let _ = sender.send(reply);
+        if let Some(request) = pending.remove(request_id) {
+            if request.cache_generation != self.cache_generation() {
+                if let Some(data) = &mut reply.data { discard_cached_claims(data); }
+            }
+            if let Some(data) = &mut reply.data {
+                let base = self.delta_base.lock();
+                if !base.invalidated_ids.is_empty() {
+                    discard_invalidated_claims(data, &base.invalidated_ids);
+                }
+            }
+            let _ = request.sender.send(reply);
         }
     }
 }
@@ -2590,6 +2740,9 @@ mod tests {
             process: Mutex::new(None),
             state_tx,
             exit_tx,
+            observed_state: Mutex::new(Some(state.clone())),
+            has_authenticated_state: AtomicBool::new(state.auth_state == "ready"),
+            cache_generation: AtomicU64::new(0),
             last_state: Mutex::new(Some(state)),
             delta_base: Mutex::new(delta_base),
             preview_active: AtomicBool::new(false),
@@ -2603,6 +2756,133 @@ mod tests {
             shutting_down: AtomicBool::new(false),
             shutdown_lock: Mutex::new(()),
         })
+    }
+
+    fn boundary_state() -> PlaybackState {
+        PlaybackState { auth_state: "ready".into(), playing: true, current_index: Some(0),
+            position_ms: 180_000, duration_ms: 180_000, queue_revision: 7, order_revision: 7,
+            queue: vec![Track { id: "a".into(), uri: "spotify:track:a".into(), duration_ms: 180_000,
+                cached: true, ..Default::default() }].into(), ..Default::default() }
+    }
+
+    #[test]
+    fn successful_restore_barrier_accepts_end_restart_and_concurrent_transport_changes() {
+        for concurrent_pause in [false, true] {
+            let original = boundary_state();
+            let client = client_with_last_state(original.clone());
+            client.on_eof();
+            let generation = client.restore_generation.load(Ordering::Acquire);
+            client.begin_pending_retry(generation).unwrap();
+            let mut actual = original;
+            actual.position_ms = 0;
+            actual.playing = !concurrent_pause;
+            actual.queue_revision = 8;
+            actual.order_revision = 8;
+            client.on_state(&actual, PayloadRows::Sent);
+            assert!(client.restore_is_pending());
+            assert!(client.complete_pending_restore(generation).is_some());
+            assert!(!client.restore_is_pending());
+            assert_eq!(client.current_state().unwrap().position_ms, 0);
+            assert_eq!(client.current_state().unwrap().playing, !concurrent_pause);
+        }
+    }
+
+    #[test]
+    fn reconnect_and_error_crashes_keep_queue_but_explicit_logout_cannot_resurrect_it() {
+        for auth in ["authenticating", "error"] {
+            let original = boundary_state();
+            let client = client_with_last_state(original.clone());
+            let mut unavailable = original;
+            unavailable.auth_state = auth.into();
+            client.on_state(&unavailable, PayloadRows::Sent);
+            assert_eq!(client.playback_snapshot_for_shutdown().unwrap().queue[0].id, "a");
+            client.on_eof();
+            let pending = client.restore_pending.lock().clone().unwrap();
+            assert_eq!(pending.snapshot.queue[0].id, "a");
+            assert!(pending.snapshot.resume_playing);
+            client.clear_session_restore();
+            client.on_eof();
+            assert!(!client.restore_is_pending());
+            assert!(client.playback_snapshot_for_shutdown().is_none());
+            assert!(client.current_state().is_none());
+        }
+    }
+
+    #[test]
+    fn replacement_authentication_crash_keeps_original_plan_and_watch_latch_resets_without_receivers() {
+        let client = client_with_last_state(boundary_state());
+        client.on_eof();
+        let mut blank = PlaybackState::default();
+        blank.auth_state = "authenticating".into();
+        client.on_state(&blank, PayloadRows::Sent);
+        client.on_eof();
+        assert_eq!(client.restore_pending.lock().as_ref().unwrap().snapshot.queue[0].id, "a");
+        assert!(*client.exit_tx.subscribe().borrow());
+        client.exit_tx.send_replace(false);
+        let receiver = client.exit_tx.subscribe();
+        assert!(!*receiver.borrow());
+    }
+
+    #[test]
+    fn cache_removal_reset_and_stale_browse_claims_cannot_revive_old_downloads() {
+        let client = client_with_last_state(boundary_state());
+        let generation = client.cache_generation();
+        let mut removal = boundary_state();
+        removal.uncached_ids = Some(vec!["a".into()]);
+        client.on_state(&removal, PayloadRows::Sent);
+        assert!(!client.current_state().unwrap().queue[0].cached);
+        let mut stale_rows = vec![Track { id: "a".into(), cached: true, ..Default::default() }];
+        client.reconcile_cached_rows(&mut stale_rows, generation);
+        assert!(!stale_rows[0].cached);
+        removal.uncached_ids = None;
+        removal.cached_ids = Some(vec!["a".into()]);
+        client.on_state(&removal, PayloadRows::Sent);
+        assert!(client.current_state().unwrap().queue[0].cached);
+        client.on_eof();
+        let mut fresh = boundary_state();
+        Arc::make_mut(&mut fresh.queue)[0].cached = false;
+        client.on_state(&fresh, PayloadRows::Sent);
+        assert!(!client.delta_base.lock().queue[0].cached);
+        client.reconcile_cached_rows(&mut stale_rows, generation);
+        assert!(!stale_rows[0].cached);
+        let mut payload = json!({"tracks": [{"cached": true}], "cached": true});
+        discard_cached_claims(&mut payload);
+        assert_eq!(payload["tracks"][0]["cached"], false);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fake_engine_pipe_fences_browse_marks_invalidated_before_reply() {
+        use std::os::windows::process::CommandExt;
+        let client = client_with_last_state(boundary_state());
+        let mut lines = client.subscribe_lines();
+        // One isolated line-JSON subprocess, with no state directory, account,
+        // network, audio device or owner's app involved.
+        let script = r#"
+$ErrorActionPreference = 'Stop'
+$request = [Console]::ReadLine() | ConvertFrom-Json
+[Console]::WriteLine('{"type":"state","auth_state":"ready","queue_revision":7,"order_revision":7,"uncached_ids":["a"]}')
+[Console]::WriteLine((@{type='browse_playlist'; request_id=$request.request_id; ok=$true; data=@{tracks=@(@{id='a'; cached=$true})}} | ConvertTo-Json -Depth 5 -Compress))
+"#;
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+            // PowerShell's Console API needs initialized redirected handles;
+            // hide its window without detaching it from those handles.
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn().unwrap();
+        *client.stdin.lock() = child.stdin.take();
+        spawn_reader(child.stdout.take().unwrap(), &client);
+        let reply = client.request("browse_playlist", json!({"id": "temporary"})).await.unwrap();
+        assert_eq!(reply.data.unwrap()["tracks"][0]["cached"], false);
+        let first = lines.recv().await.unwrap();
+        assert!(matches!(first, StateLine::State(state) if state.uncached_ids == Some(vec!["a".into()])
+            && !state.queue[0].cached));
+        assert!(child.wait().unwrap().success());
+        loop {
+            if matches!(lines.recv().await.unwrap(), StateLine::CacheMarksReset) { break; }
+        }
+        assert!(!client.current_state().unwrap().queue[0].cached);
     }
 
     fn persisted(snapshot: PlaybackSnapshot, queue_generation: u64) -> PersistedSnapshot {
@@ -2971,6 +3251,7 @@ mod tests {
             StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
             StateLine::Volume(_) => panic!("nor the volume lane"),
             StateLine::CachedIds(_) => panic!("the full state carries its cache marks"),
+            StateLine::UncachedIds(_) | StateLine::CacheMarksReset => panic!("not a cache invalidation"),
             StateLine::Disconnected => panic!("the reader stays connected"),
         }
 
@@ -3061,6 +3342,7 @@ mod tests {
             StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
             StateLine::Volume(_) => panic!("nor the volume lane"),
             StateLine::CachedIds(_) => panic!("the full state carries its cache marks"),
+            StateLine::UncachedIds(_) | StateLine::CacheMarksReset => panic!("not a cache invalidation"),
             StateLine::Disconnected => panic!("the reader stays connected"),
         }
     }
@@ -3116,6 +3398,7 @@ mod tests {
             StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
             StateLine::Volume(_) => panic!("nor the volume lane"),
             StateLine::CachedIds(_) => panic!("the full state carries its cache marks"),
+            StateLine::UncachedIds(_) | StateLine::CacheMarksReset => panic!("not a cache invalidation"),
             StateLine::Disconnected => panic!("the reader stays connected"),
         }
         assert_eq!(
@@ -3494,6 +3777,7 @@ mod tests {
             StateLine::State(_) => panic!("heartbeat must not arrive as a full state"),
             StateLine::Volume(_) => panic!("nor as a volume step"),
             StateLine::CachedIds(_) => panic!("nor as cache marks"),
+            StateLine::UncachedIds(_) | StateLine::CacheMarksReset => panic!("not a cache invalidation"),
             StateLine::Disconnected => panic!("heartbeat path must stay connected"),
         }
     }
@@ -3538,6 +3822,7 @@ mod tests {
             StateLine::State(_) => panic!("a volume step must not arrive as a full state"),
             StateLine::Position(_) => panic!("nor as a position heartbeat"),
             StateLine::CachedIds(_) => panic!("nor as cache marks"),
+            StateLine::UncachedIds(_) | StateLine::CacheMarksReset => panic!("not a cache invalidation"),
             StateLine::Disconnected => panic!("the volume path must stay connected"),
         }
     }
@@ -3997,6 +4282,7 @@ mod tests {
             StateLine::Position(_) => panic!("the initial line is a full state, not a heartbeat"),
             StateLine::Volume(_) => panic!("nor a volume step"),
             StateLine::CachedIds(_) => panic!("nor cache marks"),
+            StateLine::UncachedIds(_) | StateLine::CacheMarksReset => panic!("not a cache invalidation"),
             StateLine::Disconnected => panic!("engine disconnected before its initial state"),
         };
         assert!(!first.auth_state.is_empty());
@@ -4016,6 +4302,7 @@ mod tests {
             StateLine::Position(_) => panic!("status re-emits a full state"),
             StateLine::Volume(_) => panic!("status re-emits a full state, not a volume step"),
             StateLine::CachedIds(_) => panic!("nor cache marks"),
+            StateLine::UncachedIds(_) | StateLine::CacheMarksReset => panic!("not a cache invalidation"),
             StateLine::Disconnected => panic!("engine disconnected before the status state"),
         };
         assert_eq!(after_status.auth_state, first.auth_state);

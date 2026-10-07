@@ -92,6 +92,13 @@ remembered; double-click the edge to reset it. As the playlist narrows, album
 and then date-added disappear, while title, artist and duration stay visible.
 The panel leaves at least 400px for the main pane and never grows wider than
 the Canvas can fill at the window's height and display resolution.
+A drag interrupted by closing the panel or shrinking the window cancels without
+changing your saved width. Space activates a focused button; on a noninteractive
+surface it toggles playback.
+
+Right-click the player bar to show or hide its speed controls, mute button,
+cover artwork, title and artist, or library checkmark/heart. These choices are
+remembered. Hiding a control does not change playback speed, volume or likes.
 
 ### Likes, follows and devices
 
@@ -160,6 +167,44 @@ on Windows or `~/Library/Application Support/Spotifine` on macOS. The
 developer-app authorization is kept in the system's credential store. Neither
 sign-in gives this project your Spotify password.
 
+### Profiling on Windows
+
+With the app running, measure its own process tree without administrator access:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File dev/profile-app.ps1 -Seconds 60
+```
+
+The helper integrates CPU time and CPU cycles across the interval and samples
+working set, private commit and I/O for the shell, audio engine and its WebView2
+subprocesses. It excludes other apps' WebView2 processes. `CpuMsPerSecond` makes
+small sustained work visible even when Task Manager rounds usage to zero;
+`CpuPercentMachine` is normalized across all logical processors.
+
+Capture playing, paused, blurred and minimized states separately. Keep window
+size, panel width, cover/Canvas mode and interaction workload consistent; passive
+captures while using the app normally are not comparable benchmarks. Window
+physical bounds, DPI and minimized/foreground state are recorded at the start
+and end, not continuously. Add `-Json` for machine-readable results, or
+`-ProcessId` when more than one app copy is running. The tree is captured at the start, so
+rerun after an engine restart or a new WebView subprocess. Summed working sets
+count shared pages more than once; private commit is not resident RAM, and I/O
+includes pipes/network rather than only disk. These counters do not measure power.
+
+For sampled call stacks and thread wakeups, use Windows Performance Recorder
+from an elevated terminal, then inspect the trace in
+[Windows Performance Analyzer](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/windows-performance-analyzer):
+
+```powershell
+wpr -start CPU
+# Exercise one workload for about a minute.
+wpr -stop "$env:TEMP\Spotifine-cpu.etl"
+```
+
+WPR uses a bounded in-memory recording here. Keep traces private: they contain
+system-wide process/activity data. Native function-level analysis also needs
+matching symbols for the executable being measured.
+
 ## How it works
 
 It has to be cheap to run while sitting open all day, so a few things follow
@@ -174,11 +219,21 @@ and handles everything to do with sound. The Tauri shell in `src-tauri/`
 supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.
 Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
+Recovery settles against the replacement engine's actual state before publishing
+playback, including a crash during reconnection. Playlist edits fence older
+pending reads, local library activity is written atomically, and download marks
+are invalidated when audio is evicted or the engine session changes.
 
 The audio path has its own resampler. Spotify decodes at 44.1 kHz and most
 Windows devices run at 48 kHz, and librespot's stock conversion comes out about
 half a percent slow and slightly flat. This one converts exactly, and tests pin
 both the timing and the quality.
+Load and seek configuration is committed by the decoder thread; each PCM packet
+carries its owning revision and exact source frame. Codec preroll and trimming
+keep cuts and loops aligned after a seek. A discontinuous jump replaces the
+native output stream to discard audio already submitted to the device, while
+ordinary pause/resume and natural gapless boundaries retain their buffers.
+An empty output callback zero-fills the rest of its block after one ring probe.
 
 Tauri and a web frontend are an odd pick for this. I used them because the UI
 needed the most iteration and HTML and CSS were much faster to work in.

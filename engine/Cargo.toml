@@ -14,6 +14,7 @@ base64 = "0.22"
 cpal = "0.16"
 futures-util = { version = "0.3", default-features = false }
 http = "1"
+parking_lot = "0.12"
 protobuf = "3.7"
 protobuf-json-mapping = "3.7"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }

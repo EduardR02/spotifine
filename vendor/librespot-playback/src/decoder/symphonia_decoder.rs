@@ -2,7 +2,7 @@ use std::{io, time::Duration};
 
 use symphonia::core::{
     audio::SampleBuffer,
-    codecs::{Decoder, DecoderOptions},
+    codecs::{Decoder, DecoderOptions, CODEC_TYPE_MP3, CODEC_TYPE_VORBIS},
     errors::Error,
     formats::{FormatOptions, SeekMode, SeekTo},
     io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions},
@@ -12,12 +12,14 @@ use symphonia::core::{
 
 use super::{AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, DecoderResult};
 
-use crate::{NUM_CHANNELS, PAGES_PER_MS, SAMPLE_RATE, player::NormalisationData, symphonia_util};
+use crate::{NUM_CHANNELS, SAMPLE_RATE, player::NormalisationData, symphonia_util};
 
 pub struct SymphoniaDecoder {
     probe_result: ProbeResult,
     decoder: Box<dyn Decoder>,
     sample_buffer: Option<SampleBuffer<f64>>,
+    seek_frame: Option<u64>,
+    pending: Option<(AudioPacketPosition, AudioPacket)>,
 }
 
 #[derive(Default)]
@@ -89,6 +91,8 @@ impl SymphoniaDecoder {
             // We set the sample buffer when decoding the first full packet,
             // whose duration is also the ideal sample buffer size.
             sample_buffer: None,
+            seek_frame: None,
+            pending: None,
         })
     }
 
@@ -176,48 +180,52 @@ impl SymphoniaDecoder {
         Some(metadata)
     }
 
-    #[inline]
-    fn ts_to_ms(&self, ts: u64) -> u32 {
-        match self.decoder.codec_params().time_base {
-            Some(time_base) => {
-                let time = Duration::from(time_base.calc_time(ts));
-                time.as_millis() as u32
-            }
-            // Fallback in the unexpected case that the format has no base time set.
-            None => (ts as f64 * PAGES_PER_MS) as u32,
-        }
+    fn ts_to_frame(&self, ts: u64) -> u64 {
+        self.decoder.codec_params().time_base.map_or(ts, |base| {
+            (u128::from(ts) * u128::from(base.numer) * u128::from(SAMPLE_RATE)
+                / u128::from(base.denom)) as u64
+        })
     }
 }
 
 impl AudioDecoder for SymphoniaDecoder {
     fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
-        // "Saturate" the position_ms to the duration of the track if it exceeds it.
-        let mut target = Duration::from_millis(position_ms.into());
-        let codec_params = self.decoder.codec_params();
-        if let (Some(time_base), Some(n_frames)) = (codec_params.time_base, codec_params.n_frames) {
-            let duration = Duration::from(time_base.calc_time(n_frames));
-            if target > duration {
-                target = duration;
-            }
-        }
-
-        // `track_id: None` implies the default track ID (of the container, not of Spotify).
-        let seeked_to_ts = self.probe_result.format.seek(
+        let requested = (u64::from(position_ms) * u64::from(SAMPLE_RATE) + 500) / 1_000;
+        let params = self.decoder.codec_params();
+        let target = params.n_frames.map_or(requested, |frames| requested.min(self.ts_to_frame(frames)));
+        // Rebuild decoder history before trimming to the exact target frame.
+        let preroll = if params.codec == CODEC_TYPE_VORBIS {
+            // Vorbis overlap needs a preceding maximum-size block.
+            params.extra_data.as_deref().and_then(|header| header.get(28))
+                .map_or(0, |sizes| 1u64 << (sizes >> 4))
+        } else if params.codec == CODEC_TYPE_MP3 {
+            // At the supported 44.1 kHz, MPEG-1 Layer III can reference a
+            // 511-byte bit reservoir across eight minimum-bitrate frames.
+            // Two more frames rebuild the overlap and synthesis history.
+            10 * 1_152
+        } else {
+            0
+        };
+        let start = target.saturating_sub(preroll);
+        self.probe_result.format.seek(
             SeekMode::Accurate,
             SeekTo::Time {
-                time: target.into(),
+                time: Duration::from_secs_f64(start as f64 / f64::from(SAMPLE_RATE)).into(),
                 track_id: None,
             },
         )?;
-
-        // Seeking is a `FormatReader` operation, so the decoder cannot reliably
-        // know when a seek took place. Reset it to avoid audio glitches.
         self.decoder.reset();
-
-        Ok(self.ts_to_ms(seeked_to_ts.actual_ts))
+        self.pending = None;
+        self.seek_frame = Some(target);
+        self.pending = self.next_packet()?;
+        let actual = self.pending.as_ref().map_or(target, |(position, _)| position.source_frame);
+        Ok(((actual * 1_000 + u64::from(SAMPLE_RATE) / 2) / u64::from(SAMPLE_RATE)) as u32)
     }
 
     fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+        if let Some(packet) = self.pending.take() {
+            return Ok(Some(packet));
+        }
         let mut skipped = false;
 
         loop {
@@ -235,11 +243,8 @@ impl AudioDecoder for SymphoniaDecoder {
                 }
             };
 
-            let position_ms = self.ts_to_ms(packet.ts());
-            let packet_position = AudioPacketPosition {
-                position_ms,
-                skipped,
-            };
+            let source_frame = self.ts_to_frame(packet.ts());
+            let position_ms = (source_frame * 1_000 / u64::from(SAMPLE_RATE)) as u32;
 
             match self.decoder.decode(&packet) {
                 Ok(decoded) => {
@@ -253,8 +258,25 @@ impl AudioDecoder for SymphoniaDecoder {
                     };
 
                     sample_buffer.copy_interleaved_ref(decoded);
-                    let samples = AudioPacket::Samples(sample_buffer.samples().to_vec());
-
+                    let samples = sample_buffer.samples();
+                    let frames = samples.len() / NUM_CHANNELS as usize;
+                    if frames == 0 {
+                        continue;
+                    }
+                    let trim = self.seek_frame.map_or(0, |target|
+                        target.saturating_sub(source_frame).min(frames as u64) as usize);
+                    if trim == frames {
+                        continue;
+                    }
+                    self.seek_frame = None;
+                    let source_frame = source_frame + trim as u64;
+                    let packet_position = AudioPacketPosition {
+                        position_ms: (source_frame * 1_000 / u64::from(SAMPLE_RATE)) as u32,
+                        source_frame,
+                        revision: 0,
+                        skipped,
+                    };
+                    let samples = AudioPacket::Samples(samples[trim * NUM_CHANNELS as usize..].to_vec());
                     return Ok(Some((packet_position, samples)));
                 }
                 Err(Error::DecodeError(_)) => {

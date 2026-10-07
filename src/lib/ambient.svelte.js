@@ -131,9 +131,9 @@ export const haze = $state({
 let onShift = null;
 
 /** For the drag: the panel's left edge in window CSS px while it is being
-    dragged, then null once it is let go (THE FROST, 5). */
-export function shiftHaze(edge) {
-  onShift?.(edge);
+    dragged, then null once it is let go. Cancel restores the original pictures. */
+export function shiftHaze(edge, cancel = false) {
+  onShift?.(edge, cancel);
 }
 
 /** For the layer: receive shiftHaze's edges. Returns the unsubscribe. */
