@@ -58,7 +58,6 @@ pub type PlayerResult = Result<(), Error>;
 /// thread after any old read/write completes; a superseded command is skipped.
 pub struct DecoderTransition {
     pub revision: u64,
-    pub discontinuous: bool,
     pub commit: Box<dyn FnOnce() -> bool + Send>,
     pub is_current: Box<dyn Fn() -> bool + Send>,
 }
@@ -2290,10 +2289,10 @@ impl PlayerInternal {
         Ok(())
     }
 
+    /// Commits without stopping the sink. A load while playing keeps the
+    /// device running, so what it still holds plays out at once; stopped and
+    /// restarted, that remnant of the old track would sound after the load.
     fn commit_transition(&mut self, transition: DecoderTransition) -> bool {
-        if transition.discontinuous {
-            self.ensure_sink_stopped(false);
-        }
         if !(transition.commit)() {
             self.handle_pause();
             return false;

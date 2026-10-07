@@ -1017,7 +1017,7 @@ impl Engine {
             // decoder-paused offset is the next real packet's origin. Normal
             // user pauses retain a consumer clock and never rebuild here.
             self.configure_current_audio_at_loop_pass(self.state.position_ms, self.loop_pass);
-            return Some(crate::audio::decoder_transition(self.audio_revision, true));
+            return Some(crate::audio::decoder_transition(self.audio_revision));
         }
         None
     }
@@ -3195,7 +3195,7 @@ impl Engine {
         // this revision between separately queued pause/seek/play commands.
         let was_playing = self.state.playing;
         self.player()?.seek(position, was_playing,
-            crate::audio::decoder_transition(self.audio_revision, true));
+            crate::audio::decoder_transition(self.audio_revision));
         self.update_position(position);
         self.clear_error();
         Ok(true)
@@ -3692,7 +3692,7 @@ impl Engine {
         if let Some(player) = player {
             self.prepare_cache_reload(&uri);
             player.load(uri, start_playing, position_ms,
-                crate::audio::decoder_transition(self.audio_revision, !natural_boundary));
+                crate::audio::decoder_transition(self.audio_revision));
         }
         self.mark_cached_tracks(outgoing);
         Ok(())

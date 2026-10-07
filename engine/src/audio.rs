@@ -218,10 +218,9 @@ fn set_customization(
 }
 
 /// Binds the staged revision to a command handled on the decoder thread.
-pub fn decoder_transition(revision: u64, discontinuous: bool) -> DecoderTransition {
+pub fn decoder_transition(revision: u64) -> DecoderTransition {
     DecoderTransition {
         revision,
-        discontinuous,
         commit: Box::new(move || {
             let customization = CUSTOMIZATION.lock().expect("audio customization should not be poisoned");
             if CUSTOMIZATION_REVISION.load(Ordering::Acquire) != revision {
@@ -1700,13 +1699,13 @@ mod tests {
 
     fn configured(edit: Option<TrackEdit>, speed: f32, position_ms: u32, pass: u32) -> u64 {
         let revision = configure_customization_at_loop_pass(edit, speed, position_ms, pass);
-        (decoder_transition(revision, true).commit)();
+        (decoder_transition(revision).commit)();
         revision
     }
 
     fn configured_natural(edit: Option<TrackEdit>, speed: f32, position_ms: u32) -> u64 {
         let revision = configure_customization_after_natural_boundary(edit, speed, position_ms);
-        (decoder_transition(revision, false).commit)();
+        (decoder_transition(revision).commit)();
         revision
     }
 
@@ -1775,7 +1774,7 @@ mod tests {
         let target = configure_customization_at_loop_pass(Some(TrackEdit {
             cuts: vec![TimeRange { start_ms: 100, end_ms: 120 }], loop_range: None,
         }), 1.0, 100, 1);
-        let transition = decoder_transition(target, true);
+        let transition = decoder_transition(target);
         release.send(()).unwrap();
         transition_tx.send(transition).unwrap();
         let sink = worker.join().unwrap();
@@ -1788,13 +1787,13 @@ mod tests {
     fn superseded_transitions_cannot_commit_and_the_latest_transition_can() {
         let _guard = customization_guard();
         let old = configure_customization_at_loop_pass(None, 1.0, 100, 1);
-        let old_transition = decoder_transition(old, true);
+        let old_transition = decoder_transition(old);
         assert!(!(old_transition.is_current)());
         let latest = configure_customization_at_loop_pass(None, 2.0, 200, 1);
         assert!(!(old_transition.commit)());
         assert!(!(old_transition.is_current)());
         assert!(customization_pending(latest));
-        let latest_transition = decoder_transition(latest, true);
+        let latest_transition = decoder_transition(latest);
         assert!(!(latest_transition.is_current)());
         assert!((latest_transition.commit)());
         assert!((latest_transition.is_current)());
@@ -1802,7 +1801,7 @@ mod tests {
         assert!(!customization_pending(latest));
         let replacement = configure_customization_at_loop_pass(None, 1.0, 300, 1);
         assert!(!(latest_transition.is_current)());
-        assert!((decoder_transition(replacement, true).commit)());
+        assert!((decoder_transition(replacement).commit)());
         assert!(!customization_pending(replacement));
     }
 
