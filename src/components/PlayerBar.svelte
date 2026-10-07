@@ -10,6 +10,7 @@
     setNowPlayingOpen,
     nowSaved,
     lookupSavedIn,
+    invalidateSavedIn,
   } from "../lib/state.svelte.js";
   import { session } from "../lib/state.svelte.js";
   import { personalConnected, watchPersonal, setLiked } from "../lib/personal.svelte.js";
@@ -338,6 +339,10 @@
   const currentUri = $derived(current?.uri ?? null);
 
   $effect(() => {
+    if (!controls.library) {
+      untrack(invalidateSavedIn);
+      return;
+    }
     const uri = currentUri;
     const account = session.username;
     untrack(() => {
@@ -349,6 +354,7 @@
   /* Every change to the index — a like here or elsewhere, a playlist edit —
      re-reads the mark, so it never waits for the next track change. */
   $effect(() => {
+    if (!controls.library) return;
     const event = listen("memberships_changed", () => lookupSavedIn(currentUri));
     return () => event.then((off) => off()).catch(() => {});
   });

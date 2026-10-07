@@ -42,6 +42,14 @@
   let newName = $state("");
   let field = $state(null);
   let libList = $state(null);
+  let railBody = $state(null);
+  let rowProbe = $state(null);
+  let folderProbe = $state(null);
+  let createProbe = $state(null);
+  const railHeights = $state({ row: 0, folder: 0, create: 0 });
+  let railFirst = $state(0);
+  let railLast = $state(20);
+  let focusedKey = $state("");
   let fadeTop = $state(false);
   let fadeBottom = $state(false);
   let filtering = $state(false);
@@ -304,6 +312,89 @@
     );
   });
 
+  const railEntries = $derived.by(() => {
+    if (mode === "artists") return filteredArtists.map((artist) => ({ key: `artist:${artist.id}`, artist }));
+    if (mode === "podcasts") return filteredShows.map((show) => ({ key: `show:${show.id}`, show }));
+    const entries = filteredLibrary.map((entry) => ({
+      ...entry, key: entry.kind === "folder" ? `folder:${entry.id}` : `playlist:${entry.playlist.id}`,
+    }));
+    if (showLiked) {
+      const liked = { kind: "liked", key: "liked" };
+      if (isPinned("liked")) entries.unshift(liked);
+      else entries.push(liked);
+    }
+    return entries;
+  });
+  const railIndex = $derived(new Map(railEntries.map((entry, index) => [entry.key, index])));
+  const railOffsets = $derived.by(() => {
+    const offsets = [0];
+    for (const entry of railEntries) {
+      const height = entry.kind === "folder" ? railHeights.folder : railHeights.row;
+      const editor = entry.kind === "folder" && creating?.parent === entry.id && !entry.collapsed;
+      offsets.push(offsets[offsets.length - 1] + height + (editor ? railHeights.create : 0));
+    }
+    return offsets;
+  });
+  const renderedRail = $derived.by(() => {
+    const indices = new Set();
+    for (let i = railFirst; i < Math.min(railLast, railEntries.length); i++) indices.add(i);
+    const keep = (key, neighbors = false) => {
+      const index = railIndex.get(key);
+      if (index == null) return;
+      indices.add(index);
+      if (neighbors && index > 0) indices.add(index - 1);
+      if (neighbors && index + 1 < railEntries.length) indices.add(index + 1);
+    };
+    keep(focusedKey, true);
+    keep(railMenu?.playlist.id === "liked" ? "liked" : `playlist:${railMenu?.playlist.id ?? ""}`);
+    keep(`folder:${folderMenu?.entry.id ?? ""}`);
+    keep(`folder:${renaming ?? ""}`, true);
+    keep(`folder:${creating?.parent ?? ""}`, true);
+    keep(railDrag.item ? `${railDrag.item.kind}:${railDrag.item.id}` : "");
+    return [...indices].sort((a, b) => a - b).map((index) => ({ entry: railEntries[index], index }));
+  });
+
+  function measureRail() {
+    if (!libList || !railBody || !railHeights.row) return;
+    const above = libList.scrollTop;
+    const below = above + libList.clientHeight;
+    const at = (offset) => {
+      let low = 0, high = railEntries.length;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (railOffsets[mid + 1] <= offset) low = mid + 1;
+        else high = mid;
+      }
+      return low;
+    };
+    railFirst = Math.max(0, at(above) - 6);
+    railLast = Math.min(railEntries.length, at(below) + 7);
+  }
+
+  function retainRailFocus(event) {
+    const row = event.target.closest("[data-rail-key]");
+    if (row) focusedKey = row.dataset.railKey;
+  }
+
+  function releaseRailFocus(event) {
+    if (!railBody?.contains(event.relatedTarget)) focusedKey = "";
+  }
+
+  $effect(() => {
+    if (!rowProbe || !folderProbe || !createProbe) return;
+    const measure = () => {
+      railHeights.row = rowProbe.getBoundingClientRect().height;
+      railHeights.folder = folderProbe.getBoundingClientRect().height;
+      railHeights.create = createProbe.getBoundingClientRect().height;
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(rowProbe);
+    observer.observe(folderProbe);
+    observer.observe(createProbe);
+    return () => observer.disconnect();
+  });
+
   /* The collection is fetched the first time it is actually asked for, never
      at startup: the whole argument for this switch is that Following costs
      nothing while you are not looking at it.
@@ -341,6 +432,7 @@
       const maxScroll = Math.max(0, list.scrollHeight - list.clientHeight);
       fadeTop = list.scrollTop > 1;
       fadeBottom = list.scrollTop < maxScroll - 1;
+      measureRail();
     };
     scheduleFades = () => {
       if (!frame) frame = requestAnimationFrame(updateFades);
@@ -360,9 +452,7 @@
   $effect(() => {
     const query = filterQuery;
     const current = mode;
-    if (current === "artists") filteredArtists.length;
-    else if (current === "podcasts") filteredShows.length;
-    else filteredLibrary.length;
+    railOffsets;
     const list = libList;
     if (!list) return;
     /* A new result set begins at the top; updating the current result set
@@ -371,6 +461,7 @@
     scrolledQuery = query;
     scrolledMode = current;
     scheduleFades();
+    untrack(measureRail);
   });
 
   $effect(() => {
@@ -600,11 +691,22 @@
 
     {#if creating && !creating.parent}{@render createField(0)}{/if}
 
-    <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} class:droppable={trackDrag.active} class:drop-root={dropRoot} bind:this={libList} use:scrollbar oncontextmenu={openListMenu}>
+    <div class="lib-list" role="group" aria-label="Your library collection" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} class:droppable={trackDrag.active} class:drop-root={dropRoot} bind:this={libList} use:scrollbar oncontextmenu={openListMenu}>
+      <div class="rail-probes" aria-hidden="true">
+        <span class="lib-row" bind:this={rowProbe}></span>
+        <span class="lib-folder" bind:this={folderProbe}></span>
+        <div class="lib-create" bind:this={createProbe}><span class="field sm"><input tabindex="-1" /></span></div>
+      </div>
+      <div class="rail-body" bind:this={railBody}
+        style:height={railHeights.row ? `${railOffsets[railOffsets.length - 1]}px` : null}
+        onfocusin={retainRailFocus} onfocusout={releaseRailFocus}>
       {#if mode === "artists"}
         <!-- Portraits, in circles, because a face is most of how an artist is
              recognised and the rail already draws every artist that way. -->
-        {#each filteredArtists as artist (artist.id)}
+        {#each renderedRail as row (row.entry.key)}
+          {@const artist = row.entry.artist}
+          <div class="rail-item" data-rail-key={row.entry.key}
+            style:position={railHeights.row ? "absolute" : null} style:top={`${railOffsets[row.index]}px`}>
           <button
             class="lib-row"
             class:active={route.name === "artist" && route.id === artist.id}
@@ -613,7 +715,9 @@
             <Cover src={artist.cover_url} id={artist.id} name={artist.name} size={32} circle />
             <span class="lib-name">{artist.name}</span>
           </button>
+          </div>
         {/each}
+        <div style:padding-top={`${railOffsets[railOffsets.length - 1]}px`}>
         {#if followed.loading && !followed.artists.length}
           <!-- The same loading frame the playlists get, at the same row
                geometry with a round tile, so the list does not jump. -->
@@ -633,10 +737,14 @@
         {:else if followed.loaded && !followed.artists.length}
           <p class="lib-filter-empty">You are not following any artists yet</p>
         {/if}
+        </div>
       {:else if mode === "podcasts"}
         <!-- Square art and two lines — the show and who makes it — because a
              podcast is recognised by its cover and its publisher together. -->
-        {#each filteredShows as show (show.id)}
+        {#each renderedRail as row (row.entry.key)}
+          {@const show = row.entry.show}
+          <div class="rail-item" data-rail-key={row.entry.key}
+            style:position={railHeights.row ? "absolute" : null} style:top={`${railOffsets[row.index]}px`}>
           <button
             class="lib-row lib-show"
             class:active={route.name === "show" && route.id === show.id}
@@ -648,7 +756,9 @@
               <span class="lib-sub">{show.publisher || "Podcast"}</span>
             </span>
           </button>
+          </div>
         {/each}
+        <div style:padding-top={`${railOffsets[railOffsets.length - 1]}px`}>
         {#if podcasts.loading && !podcasts.shows.length}
           {#each Array.from({ length: 6 }) as _, i (i)}
             <div class="lib-row" aria-hidden="true">
@@ -666,10 +776,15 @@
         {:else if podcasts.loaded && !podcasts.shows.length}
           <p class="lib-filter-empty">No saved podcasts yet</p>
         {/if}
+        </div>
       {:else}
-        {#if showLiked && isPinned("liked")}{@render likedRow()}{/if}
-        {#each filteredLibrary as entry (entry.kind === "folder" ? `folder:${entry.id}` : `playlist:${entry.playlist.id}`)}
-          {#if entry.kind === "folder"}
+        {#each renderedRail as row (row.entry.key)}
+          {@const entry = row.entry}
+          <div class="rail-item" data-rail-key={entry.key}
+            style:position={railHeights.row ? "absolute" : null} style:top={`${railOffsets[row.index]}px`}>
+          {#if entry.kind === "liked"}
+            {@render likedRow()}
+          {:else if entry.kind === "folder"}
             {#if renaming === entry.id}
               <form
                 class="lib-folder-rename"
@@ -722,8 +837,9 @@
               onmenu={openRailMenu}
               onpress={(event, playlist) => pressRow(event, { kind: "playlist", id: playlist.id })} />
           {/if}
+          </div>
         {/each}
-        {#if showLiked && !isPinned("liked")}{@render likedRow()}{/if}
+        <div style:padding-top={`${railOffsets[railOffsets.length - 1]}px`}>
         {#if !libraryState.loaded && !library.length}
           <!-- The rail's own loading frame. Rows at the real height with the
                real tile and name geometry, so the list does not jump when the
@@ -743,7 +859,9 @@
         {:else if libraryState.loaded && !library.length}
           <p class="lib-filter-empty">No playlists in your library yet</p>
         {/if}
+        </div>
       {/if}
+      </div>
     </div>
   </div>
 
@@ -835,6 +953,9 @@
 {/if}
 
 <style>
+  .rail-body { position: relative; overflow-anchor: none; }
+  .rail-item { left: 0; right: 0; }
+  .rail-probes { position: absolute; visibility: hidden; pointer-events: none; width: 1px; overflow: hidden; }
   .lib-row.liked-row { grid-template-columns: 32px minmax(0, 1fr) auto; }
   .lib-head-btn { width: 24px; height: 24px; }
   /* Three collections do not fit the narrow rail beside two buttons. The

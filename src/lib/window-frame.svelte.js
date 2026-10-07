@@ -14,17 +14,29 @@ const agent = typeof navigator === "undefined" ? "" : navigator.userAgent;
 export const os = /Macintosh/.test(agent) ? "mac" : /Windows/.test(agent) ? "windows" : "other";
 export const drawsWindowControls = os === "windows";
 
-export const frame = $state({ maximized: false });
+export const frame = $state({ maximized: false, minimized: false });
 
 let watching = false;
 
-/** Maximized or not, from the shell's change events (lib.rs,
-    report_maximized): nothing runs while the window is left alone. */
+/** Native frame state, independent of WebView document visibility/focus.
+    The shell emits it on window changes; no polling while at rest. */
 export function watchFrame() {
   if (watching || !drawsWindowControls) return;
   watching = true;
-  listen("window-maximized", (event) => (frame.maximized = event.payload === true)).catch(() => {});
-  getCurrentWindow().isMaximized().then((value) => (frame.maximized = value)).catch(() => {});
+  let revision = 0;
+  listen("window-state", (event) => {
+    revision++;
+    frame.maximized = event.payload?.maximized === true;
+    frame.minimized = event.payload?.minimized === true;
+  }).then(() => {
+    const ticket = revision;
+    const window = getCurrentWindow();
+    return Promise.all([window.isMaximized(), window.isMinimized()]).then(([maximized, minimized]) => {
+      if (revision !== ticket) return;
+      frame.maximized = maximized;
+      frame.minimized = minimized;
+    });
+  }).catch(() => {});
 }
 
 export const minimizeWindow = () => getCurrentWindow().minimize().catch(() => {});

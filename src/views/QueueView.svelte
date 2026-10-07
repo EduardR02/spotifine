@@ -6,6 +6,7 @@
   import { formatTime, formatTotal } from "../lib/time.js";
   import { observeStuck } from "../lib/sticky.js";
   import { rowWindow } from "../lib/virtual.js";
+  import { vuMeter } from "../lib/vu-meter.js";
   const queue = $derived(playback.queue);
 
   /* Two index spaces live in this file. `qi` is a queue index — the only thing
@@ -263,7 +264,9 @@
             >
               <span class="c-idx">
                 <span class="n">{k + 1}</span>
-                <span class="eq"><i></i><i></i><i></i><i></i></span>
+                {#if k === 0}
+                  <span class="eq" use:vuMeter><i></i><i></i><i></i><i></i></span>
+                {/if}
                 <button
                   class="go"
                   title={track.unavailable ? (track.unavailable_reason || "Unavailable") : "Play from here"}

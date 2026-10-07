@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::app::{
-    carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir,
-    insert_created_playlist, is_followed_playlist, load_app_settings, load_playlist_list, now_secs,
+    carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir,
+    insert_created_playlist, is_followed_playlist, load_app_settings, now_secs,
     order_by_last_activity, playlist_detail_from_cache, playlist_qualifies, remove_membership,
     update_app_settings, save_membership, save_playlist_list, save_tracks_cache,
     touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, tracks_cache_bytes,
     upsert_membership, upsert_playlist, upsert_tracks_cache, write_tracks_cache_bytes, AppSettings,
     AppState, MembershipEntry, PlaylistListCache, PlaylistTracksEntry, RefreshCause,
-    CACHE_STATS_TTL_SECS, LIBRARY_LENGTH, LIKED_MEMBERSHIP_ID,
+    CACHE_STATS_TTL_SECS, LIBRARY_PAGE_SIZE, LIKED_MEMBERSHIP_ID,
 };
 use crate::engine_client::{unmark_cached_rows, EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
 use crate::log;
@@ -30,7 +30,6 @@ use parking_lot::Mutex;
 use renderer_engine::protocol::LibraryItem;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 
 /// Creates the same updater resource as the plugin's check command, with the
 /// engine's durable shutdown included in Windows' pre-process-exit hook.
@@ -307,8 +306,9 @@ pub async fn set_playlist_track_excluded(
     track_id: String,
     excluded: bool,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     client.set_playlist_track_excluded(&playlist_id, &track_id, excluded).await?;
-    record_playlist_edit(&app, &playlist_id);
+    record_playlist_edit(&app, &playlist_id, account_generation)?;
     spawn_refresh_playlist(app.clone(), playlist_id, RefreshCause::Edit);
     // The exclusion is saved. A Spotify device that could not take the new
     // order is the router's to report and retry; it is not a failed save.
@@ -331,6 +331,13 @@ pub async fn search(
     Ok(SearchResult::from(browse))
 }
 
+fn cached_playlist_detail(state: &AppState, id: &str) -> Option<((u64, u64), PlaylistDetail)> {
+    if !is_followed_playlist(&state.playlists, id) { return None; }
+    let entry = state.tracks_cache.iter().find(|entry| entry.id == id)?.clone();
+    Some(((state.library_generation, state.playlist_generation(id)),
+        playlist_detail_from_cache(state, entry)))
+}
+
 /// Opens a followed playlist from the disk cache instantly and refreshes it in
 /// the background; otherwise fetches from the engine. Public playlist entries
 /// deliberately carry tracks only in the bounded cache, not library metadata,
@@ -342,22 +349,14 @@ pub async fn browse_playlist(
     client: State<'_, Arc<EngineClient>>,
     id: String,
 ) -> Result<PlaylistDetail, String> {
-    let cached = {
-        let guard = state.lock();
-        let generation = guard.library_generation;
-        is_followed_playlist(&guard.playlists, &id)
-            .then(|| {
-                guard
-                    .tracks_cache
-                    .iter()
-                    .find(|entry| entry.id == id)
-                    .cloned()
-            })
-            .flatten()
-            .map(|entry| (generation, playlist_detail_from_cache(&guard, entry)))
-    };
-    if let Some((generation, detail)) = cached {
-        if !library_generation_is_current(&state.lock(), generation) {
+    let cached = cached_playlist_detail(&state.lock(), &id);
+    if let Some(((generation, playlist_generation), detail)) = cached {
+        let current = {
+            let guard = state.lock();
+            library_generation_is_current(&guard, generation)
+                && guard.playlist_read_is_current(&id, playlist_generation)
+        };
+        if !current {
             let exists = state
                 .lock()
                 .playlists
@@ -373,7 +372,12 @@ pub async fn browse_playlist(
         return Ok(detail);
     }
     let mut result = fetch_playlist(&app, &state, &client, &id).await?;
-    if result.applied {
+    let current = {
+        let guard = state.lock();
+        result.applied && library_generation_is_current(&guard, result.generation)
+            && guard.playlist_read_is_current(&id, result.playlist_generation)
+    };
+    if current {
         client.reconcile_cached_rows(&mut result.detail.tracks, result.cache_generation);
         Ok(result.detail)
     } else {
@@ -546,7 +550,7 @@ pub async fn hydrate_library_covers(
             playlists: guard.playlists.clone(),
             playlist_tree: guard.playlist_tree.clone(),
         });
-        (guard.data_dir.clone(), cache, summaries)
+        (guard.library_dir(), cache, summaries)
     };
     if let Some(cache) = cache {
         save_playlist_list(&dir, &cache);
@@ -650,38 +654,11 @@ pub async fn create_playlist(
     client: State<'_, Arc<EngineClient>>,
     name: String,
 ) -> Result<Playlist, String> {
+    let account_generation = library_account_generation(&app);
     let reference = client.create_playlist(&name).await?;
-    let playlist = {
-        let state = app.state::<Mutex<AppState>>();
-        let persistence = state.lock().playlist_persistence.clone();
-        let _serialize = persistence.lock();
-        let (dir, cache, playlist) = {
-            let mut guard = state.lock();
-            // A rootlist request already in flight was answered before this
-            // playlist existed; installing that answer would drop the row we
-            // are about to add. Same fence a delete raises, for the same
-            // reason — `spawn_refresh_library` then re-runs the fetch.
-            guard.library_generation = guard.library_generation.wrapping_add(1);
-            let playlist = insert_created_playlist(
-                &mut guard.playlists,
-                Playlist::from(&reference),
-                now_secs(),
-            );
-            (
-                guard.data_dir.clone(),
-                PlaylistListCache {
-                    version: 1,
-                    fetched_at: guard.playlists_fetched_at,
-                    me_id: guard.me_id.clone(),
-                    playlists: guard.playlists.clone(),
-                    playlist_tree: guard.playlist_tree.clone(),
-                },
-                playlist,
-            )
-        };
-        save_playlist_list(&dir, &cache);
-        playlist
-    };
+    let playlist = commit_library_edit(&app, account_generation, |guard| {
+        insert_created_playlist(&mut guard.playlists, Playlist::from(&reference), now_secs())
+    })?;
     spawn_refresh_library(app);
     Ok(playlist)
 }
@@ -693,7 +670,11 @@ pub async fn rename_playlist(
     id: String,
     name: String,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     client.rename_playlist(&id, &name).await?;
+    commit_library_edit(&app, account_generation, |guard| {
+        guard.record_playlist_rename(&id, &name);
+    })?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -707,11 +688,12 @@ pub async fn delete_playlist(
     client: State<'_, Arc<EngineClient>>,
     id: String,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     client.delete_playlist(&id).await?;
-    forget_library_playlists(&app, |tree| {
+    forget_library_playlists(&app, account_generation, |tree| {
         remove_tree_playlist(tree, &id);
         vec![id.clone()]
-    });
+    })?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -723,13 +705,16 @@ pub async fn delete_playlist(
 /// start.
 fn forget_library_playlists(
     app: &AppHandle,
+    account_generation: u64,
     edit_tree: impl FnOnce(&mut Vec<LibraryNodeDetail>) -> Vec<String>,
-) {
+) -> Result<(), String> {
     let state = app.state::<Mutex<AppState>>();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
     let (dir, list_cache, tracks_cache, membership) = {
         let mut guard = state.lock();
+        guard.check_account_generation(account_generation)?;
+        guard.finish_library_import()?;
         guard.library_generation = guard.library_generation.wrapping_add(1);
         let ids = edit_tree(&mut guard.playlist_tree);
         let gone: HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -746,7 +731,7 @@ fn forget_library_playlists(
         }
         let membership = removed.then(|| guard.memberships.clone());
         (
-            guard.data_dir.clone(),
+            guard.library_dir(),
             library_list_cache(&guard),
             tracks_changed.then(|| guard.tracks_cache.clone()),
             membership,
@@ -759,6 +744,7 @@ fn forget_library_playlists(
     if let Some(entries) = membership {
         save_membership(&dir, &entries);
     }
+    Ok(())
 }
 
 fn library_list_cache(state: &AppState) -> PlaylistListCache {
@@ -771,29 +757,48 @@ fn library_list_cache(state: &AppState) -> PlaylistListCache {
     }
 }
 
-fn record_playlist_edit(app: &AppHandle, id: &str) {
+fn record_playlist_edit(app: &AppHandle, id: &str, account_generation: u64) -> Result<(), String> {
     let state = app.state::<Mutex<AppState>>();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
-    state.lock().record_playlist_edit(id);
+    let (dir, bytes) = {
+        let mut guard = state.lock();
+        guard.check_account_generation(account_generation)?;
+        let changed = guard.record_playlist_edit(id);
+        (guard.library_dir(), changed.then(|| tracks_cache_bytes(&guard.tracks_cache)).flatten())
+    };
+    if let Some(bytes) = bytes {
+        tokio::task::block_in_place(|| write_tracks_cache_bytes(&dir, &bytes));
+    }
+    Ok(())
+}
+
+fn library_account_generation(app: &AppHandle) -> u64 {
+    app.state::<Mutex<AppState>>().lock().account_generation
 }
 
 /// Writes a landed library edit into the shell's copy and to disk at once,
 /// fenced like a delete: a rootlist read that was already in flight predates
 /// the edit and must not install over it. The refresh that follows brings
 /// the account's own answer.
-fn commit_library_edit<R>(app: &AppHandle, edit: impl FnOnce(&mut AppState) -> R) -> R {
+fn commit_library_edit<R>(
+    app: &AppHandle,
+    account_generation: u64,
+    edit: impl FnOnce(&mut AppState) -> R,
+) -> Result<R, String> {
     let state = app.state::<Mutex<AppState>>();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
     let (dir, cache, result) = {
         let mut guard = state.lock();
+        guard.check_account_generation(account_generation)?;
+        guard.finish_library_import()?;
         guard.library_generation = guard.library_generation.wrapping_add(1);
         let result = edit(&mut guard);
-        (guard.data_dir.clone(), library_list_cache(&guard), result)
+        (guard.library_dir(), library_list_cache(&guard), result)
     };
     save_playlist_list(&dir, &cache);
-    result
+    Ok(result)
 }
 
 /// Puts someone else's playlist back in your library, at the top, and
@@ -806,10 +811,11 @@ pub async fn follow_playlist(
     client: State<'_, Arc<EngineClient>>,
     playlist: Playlist,
 ) -> Result<Playlist, String> {
+    let account_generation = library_account_generation(&app);
     client.follow_playlist(&playlist.id).await?;
-    let row = commit_library_edit(&app, |guard| {
+    let row = commit_library_edit(&app, account_generation, |guard| {
         insert_created_playlist(&mut guard.playlists, playlist, now_secs())
-    });
+    })?;
     spawn_refresh_library(app);
     Ok(row)
 }
@@ -823,6 +829,7 @@ pub async fn create_folder(
     name: String,
     parent: Option<String>,
 ) -> Result<LibraryNodeDetail, String> {
+    let account_generation = library_account_generation(&app);
     let name = name.trim().to_owned();
     let id = client.create_folder(&name, parent.as_deref()).await?;
     let folder = LibraryNodeDetail::Folder {
@@ -831,9 +838,9 @@ pub async fn create_folder(
         children: Vec::new(),
         last_activity: Some(now_secs()),
     };
-    commit_library_edit(&app, |guard| {
+    commit_library_edit(&app, account_generation, |guard| {
         LibraryNodeDetail::insert_first(&mut guard.playlist_tree, parent.as_deref(), folder.clone());
-    });
+    })?;
     spawn_refresh_library(app);
     Ok(folder)
 }
@@ -845,15 +852,16 @@ pub async fn rename_folder(
     id: String,
     name: String,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     let name = name.trim().to_owned();
     client.rename_folder(&id, &name).await?;
-    commit_library_edit(&app, |guard| {
+    commit_library_edit(&app, account_generation, |guard| {
         if let Some(LibraryNodeDetail::Folder { name: current, .. }) =
             LibraryNodeDetail::folder_mut(&mut guard.playlist_tree, &id)
         {
             *current = name;
         }
-    });
+    })?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -866,14 +874,15 @@ pub async fn delete_folder(
     client: State<'_, Arc<EngineClient>>,
     id: String,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     client.delete_folder(&id).await?;
-    forget_library_playlists(&app, |tree| {
+    forget_library_playlists(&app, account_generation, |tree| {
         let mut inside = Vec::new();
         if let Some(folder) = LibraryNodeDetail::take(tree, &LibraryItem::Folder { id }) {
             folder.playlist_ids(&mut inside);
         }
         inside
-    });
+    })?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -887,10 +896,11 @@ pub async fn move_library_item(
     item: LibraryItem,
     folder: Option<String>,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     client.move_library_item(&item, folder.as_deref()).await?;
-    commit_library_edit(&app, |guard| {
+    commit_library_edit(&app, account_generation, |guard| {
         LibraryNodeDetail::move_to(&mut guard.playlist_tree, &item, folder.as_deref());
-    });
+    })?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -902,8 +912,9 @@ pub async fn add_playlist_tracks(
     id: String,
     uris: Vec<String>,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     client.add_playlist_tracks(&id, &uris).await?;
-    record_playlist_edit(&app, &id);
+    record_playlist_edit(&app, &id, account_generation)?;
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
@@ -916,8 +927,9 @@ pub async fn remove_playlist_tracks(
     uris: Vec<String>,
     expected_snapshot_id: Option<String>,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     client.remove_playlist_tracks(&id, &uris, expected_snapshot_id.as_deref()).await?;
-    record_playlist_edit(&app, &id);
+    record_playlist_edit(&app, &id, account_generation)?;
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
@@ -930,8 +942,9 @@ pub async fn reorder_playlist_tracks(
     from: usize,
     to: usize,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     client.reorder_playlist_tracks(&id, from, to).await?;
-    record_playlist_edit(&app, &id);
+    record_playlist_edit(&app, &id, account_generation)?;
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
@@ -967,7 +980,9 @@ pub async fn logout(
 ) -> Result<(), String> {
     app.state::<Arc<PlaybackRouter>>().disconnect(&app).await;
     personal.disconnect(&app).await?;
-    client.logout().await
+    client.logout().await?;
+    select_library_account(&app, "");
+    Ok(())
 }
 
 #[tauri::command]
@@ -1017,6 +1032,7 @@ pub async fn personal_api_set_saved(
     uris: Vec<String>,
     saved: bool,
 ) -> Result<(), String> {
+    let account_generation = library_account_generation(&app);
     personal.set_saved(&app, uris.clone(), saved).await?;
     // The write landed. The membership index answers "is this in Liked
     // Songs" everywhere, so it takes the change now rather than at the next
@@ -1026,8 +1042,9 @@ pub async fn personal_api_set_saved(
     let _serialize = persistence.lock();
     let written = {
         let mut guard = state.lock();
+        guard.check_account_generation(account_generation)?;
         guard.record_liked_write(&uris, saved)
-            .then(|| (guard.data_dir.clone(), guard.memberships.clone()))
+            .then(|| (guard.library_dir(), guard.memberships.clone()))
     };
     if let Some((dir, entries)) = written {
         save_membership(&dir, &entries);
@@ -1062,13 +1079,20 @@ pub async fn select_output(
 #[tauri::command]
 pub async fn get_state(state: State<'_, Mutex<AppState>>, router: State<'_, Arc<PlaybackRouter>>) -> Result<AppStateSnapshot, String> {
     let guard = state.lock();
+    // A cache selected during held playback restoration must not be paired
+    // with the previous account's still-published transport identity.
+    let library_visible = !guard.me_id.is_empty()
+        && guard.playback.username == guard.me_id
+        && !matches!(guard.playback.auth_state.as_str(), "logged_out" | "needs_login");
     Ok(AppStateSnapshot {
-        playback: router.snapshot().unwrap_or_else(|| guard.playback.clone()),
-        playlists: guard.playlists.clone(),
-        playlist_tree: guard.playlist_tree.clone(),
+        playback: router.snapshot().filter(|remote| remote.username == guard.playback.username
+            && !matches!(guard.playback.auth_state.as_str(), "logged_out" | "needs_login"))
+            .unwrap_or_else(|| guard.playback.clone()),
+        playlists: if library_visible { guard.playlists.clone() } else { Vec::new() },
+        playlist_tree: if library_visible { guard.playlist_tree.clone() } else { Vec::new() },
         settings: load_app_settings(),
-        library_fresh: guard.library_fresh,
-        me_id: guard.me_id.clone(),
+        library_fresh: library_visible && guard.library_fresh,
+        me_id: if library_visible { guard.me_id.clone() } else { String::new() },
     })
 }
 
@@ -1092,7 +1116,7 @@ pub async fn touch_playlist(state: State<'_, Mutex<AppState>>, id: String) -> Re
             return Ok(());
         }
         (
-            guard.data_dir.clone(),
+            guard.library_dir(),
             PlaylistListCache {
                 version: 1,
                 fetched_at: guard.playlists_fetched_at,
@@ -1124,7 +1148,7 @@ pub async fn touch_playlist_activity(
             return Ok(());
         }
         (
-            guard.data_dir.clone(),
+            guard.library_dir(),
             PlaylistListCache {
                 version: 1,
                 fetched_at: guard.playlists_fetched_at,
@@ -1177,20 +1201,13 @@ pub fn get_track_playlists(
 /// Ensures the OS registration reflects `enabled`, returning the prior
 /// registration state so a later disk-write failure can be rolled back.
 fn set_autostart_registration(app: &AppHandle, enabled: bool) -> Result<bool, String> {
-    let manager = app.autolaunch();
-    let was_enabled = manager
-        .is_enabled()
+    let was_enabled = crate::autostart::is_enabled(app)
         .map_err(|error| format!("could not read launch-at-login registration: {error}"))?;
     if was_enabled == enabled {
         return Ok(was_enabled);
     }
 
-    let result = if enabled {
-        manager.enable()
-    } else {
-        manager.disable()
-    };
-    result.map_err(|error| {
+    crate::autostart::set_enabled(app, enabled).map_err(|error| {
         let action = if enabled { "enable" } else { "disable" };
         format!("could not {action} launch at login: {error}")
     })?;
@@ -1198,13 +1215,7 @@ fn set_autostart_registration(app: &AppHandle, enabled: bool) -> Result<bool, St
 }
 
 fn restore_autostart_registration(app: &AppHandle, enabled: bool) -> Result<(), String> {
-    let manager = app.autolaunch();
-    let result = if enabled {
-        manager.enable()
-    } else {
-        manager.disable()
-    };
-    result.map_err(|error| {
+    crate::autostart::set_enabled(app, enabled).map_err(|error| {
         let action = if enabled {
             "restore enabled"
         } else {
@@ -1302,30 +1313,19 @@ pub async fn clear_cache(
     state: State<'_, Mutex<AppState>>,
     client: State<'_, Arc<EngineClient>>,
 ) -> Result<CacheStats, String> {
-    let (root, keep): (std::path::PathBuf, &'static [&'static str]) = match kind.as_str() {
+    match kind.as_str() {
         "audio" => {
-            // A logged-out/not-yet-ready engine has no active audio handles;
-            // failure to empty that already-empty queue is harmless.
-            let _ = client.play_queue(&[], 0, 0, "", false).await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            (engine_state_dir().join("audio"), &["cache-version"])
+            // Playback retirement, producer fencing and disk deletion complete
+            // inside the serialized native command before it acknowledges.
+            client.clear_audio_cache().await?;
         }
-        "covers" => (data_dir().join("covers"), &[]),
+        "covers" => {
+            let root = data_dir().join("covers");
+            tauri::async_runtime::spawn_blocking(move || clear_cache_directory(&root, &[]))
+                .await
+                .map_err(|error| format!("could not clear the covers cache: {error}"))??;
+        }
         _ => return Err("cache kind must be 'audio' or 'covers'".to_owned()),
-    };
-    tauri::async_runtime::spawn_blocking(move || clear_cache_directory(&root, keep))
-        .await
-        .map_err(|error| format!("could not clear the {kind} cache: {error}"))??;
-    if kind == "audio" {
-        client.clear_cache_marks();
-        let mut guard = state.lock();
-        guard.playback.cached_ids = None;
-        unmark_cached_rows(&mut guard.playback.queue);
-        for entry in &mut guard.tracks_cache {
-            for track in &mut entry.tracks {
-                track.cached = false;
-            }
-        }
     }
 
     let stats = tauri::async_runtime::spawn_blocking(compute_cache_stats)
@@ -1527,11 +1527,10 @@ pub async fn consume_states(app: AppHandle) {
     // Owned handle so spawned tasks do not borrow the AppHandle.
     let client = app.state::<Arc<EngineClient>>().inner().clone();
     let mut lines = client.subscribe_lines();
+    if let Err(error) = client.status().await {
+        log::warn(&format!("could not request initial engine state: {error}"));
+    }
 
-    // Hydrate the sidebar and detail routes from disk before the engine is
-    // ready (the frontend may also pull it via get_state). This is cached
-    // data, not a fresh rootlist: Home waits for the authenticated fetch.
-    load_library_from_disk(&app);
 
     let mut previous_identity: Option<(String, String)> = None;
     let mut last_error = String::new();
@@ -1626,7 +1625,10 @@ pub async fn consume_states(app: AppHandle) {
                 restore_error = None;
                 let disconnected = {
                     let managed = app.state::<Mutex<AppState>>();
+                    let persistence = managed.lock().playlist_persistence.clone();
+                    let _serialize = persistence.lock();
                     let mut guard = managed.lock();
+                    guard.fence_library_reads();
                     guard.playback.playing = false;
                     guard.playback.auth_state = "disconnected".to_owned();
                     guard.playback.error = "playback engine disconnected".to_owned();
@@ -1634,7 +1636,7 @@ pub async fn consume_states(app: AppHandle) {
                 };
                 let router = app.state::<Arc<PlaybackRouter>>();
                 if router.is_remote() {
-                    router.suspend(&app, &disconnected.error);
+                    router.engine_disconnected(&app, &disconnected.error);
                 } else {
                     let _ = app.emit("state", PlaybackEvent::new(&disconnected, false, false));
                     media_keys::update_disconnected();
@@ -1701,16 +1703,17 @@ pub async fn consume_states(app: AppHandle) {
         // that blank state plus every intermediate setter state. EngineClient
         // clears the plan on a matching frame or the successful wire barrier.
         if state.auth_state == "ready" && !state.username.is_empty() {
+            select_library_account(&app, &state.username);
+        } else if matches!(state.auth_state.as_str(), "logged_out" | "needs_login") {
+            select_library_account(&app, "");
+        }
+        if state.auth_state != "ready"
+            && app.state::<Mutex<AppState>>().lock().playback.auth_state == "ready"
+        {
             let managed = app.state::<Mutex<AppState>>();
-            let mut guard = managed.lock();
-            if guard.me_id != state.username {
-                guard.me_id = state.username.clone();
-                guard.library_fresh = false;
-                guard.library_generation = guard.library_generation.wrapping_add(1);
-                guard.memberships.clear();
-                drop(guard);
-                let _ = app.emit("memberships_changed", json!({"saved_tracks": true}));
-            }
+            let persistence = managed.lock().playlist_persistence.clone();
+            let _serialize = persistence.lock();
+            managed.lock().fence_library_reads();
         }
         if state.auth_state != "ready" {
             library_refresh_during_restore = false;
@@ -1756,7 +1759,8 @@ pub async fn consume_states(app: AppHandle) {
 
         let (became_ready, session_changed, auth_changed) = match &previous_identity {
             Some((auth_state, username)) => (
-                state.auth_state == "ready" && auth_state.as_str() != "ready",
+                state.auth_state == "ready"
+                    && (auth_state.as_str() != "ready" || state.username != username.as_str()),
                 state.auth_state != auth_state.as_str() || state.username != username.as_str(),
                 state.auth_state != auth_state.as_str(),
             ),
@@ -1781,9 +1785,6 @@ pub async fn consume_states(app: AppHandle) {
             let guard = app.state::<Mutex<AppState>>();
             let mut guard = guard.lock();
             guard.playback = state.clone();
-            if !state.username.is_empty() {
-                guard.me_id = state.username.clone();
-            }
         }
         if session_changed && (state.auth_state == "ready" || state.auth_state == "logged_out") {
             let router = app.state::<Arc<PlaybackRouter>>();
@@ -1793,6 +1794,9 @@ pub async fn consume_states(app: AppHandle) {
             app.state::<Arc<PersonalApi>>()
                 .account_changed(&app, if state.auth_state == "ready" { &state.username } else { "" })
                 .await;
+        }
+        if state.auth_state == "ready" {
+            app.state::<Arc<PlaybackRouter>>().engine_recovered(&app, &state).await;
         }
 
 
@@ -1824,6 +1828,7 @@ pub async fn consume_states(app: AppHandle) {
                 }),
             );
         }
+        publish_library_account(&app);
         if became_ready {
             if let Some(started) = restore_started_at.take() {
                 log::info(&format!(
@@ -1855,33 +1860,33 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) -> 
     Ok(())
 }
 
-/// Hydrates `AppState` from the on-disk library snapshot and emits it as
-/// `library_cached`; the authenticated engine refresh supersedes it.
-fn load_library_from_disk(app: &AppHandle) {
-    let dir = data_dir();
-    let mut playlists = load_playlist_list(&dir);
-    if let Some(cache) = playlists.as_mut() {
-        // Old ephemeral caches may have been written in another order. The
-        // sidebar and library always consume activity order, even before the
-        // first authenticated refresh arrives.
-        order_by_last_activity(&mut cache.playlists);
-    }
-    {
-        let guard = app.state::<Mutex<AppState>>();
-        let mut guard = guard.lock();
-        if let Some(cache) = &playlists {
-            guard.playlists = cache.playlists.clone();
-            guard.playlist_tree = cache.playlist_tree.clone();
-            guard.playlists_fetched_at = cache.fetched_at;
-            guard.library_fresh = false;
-            if !cache.me_id.is_empty() {
-                guard.me_id = cache.me_id.clone();
-            }
-        }
-    }
-    if let Some(cache) = playlists {
-        let _ = app.emit("library_cached", json!({"playlists": cache.playlists, "playlist_tree": cache.playlist_tree}));
-    }
+/// Switches only after an authenticated identity is known. Disk data from a
+/// different account is never exposed during startup or a failed login.
+fn select_library_account(app: &AppHandle, account: &str) {
+    let managed = app.state::<Mutex<AppState>>();
+    if managed.lock().me_id == account { return; }
+    let persistence = managed.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    managed.lock().select_library_account(account);
+}
+
+/// Restore may fetch the library before its first ready state is publishable.
+/// Deliver that account's latest cache only after the UI has seen its identity.
+fn publish_library_account(app: &AppHandle) {
+    let managed = app.state::<Mutex<AppState>>();
+    if managed.lock().library_identity_published { return; }
+    let persistence = managed.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    let payload = {
+        let mut guard = managed.lock();
+        if guard.library_identity_published { return; }
+        guard.library_identity_published = true;
+        (guard.library_fresh,
+            json!({"playlists": guard.playlists, "playlist_tree": guard.playlist_tree}))
+    };
+    let event = if payload.0 { "library" } else { "library_cached" };
+    let _ = app.emit(event, payload.1);
+    let _ = app.emit("memberships_changed", json!({"saved_tracks": true}));
 }
 
 /// One coalesced background library refresh. The engine owns classified read
@@ -1924,7 +1929,9 @@ async fn refresh_library(
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
     if !library_generation_is_current(&state.lock(), result.generation) { return Ok(()); }
-    let _ = app.emit("library", json!({"playlists": result.playlists, "playlist_tree": result.playlist_tree}));
+    if state.lock().library_identity_published {
+        let _ = app.emit("library", json!({"playlists": result.playlists, "playlist_tree": result.playlist_tree}));
+    }
     spawn_membership_reconcile(app.clone());
     Ok(())
 }
@@ -1984,7 +1991,7 @@ async fn reconcile_memberships(app: &AppHandle, state: &Mutex<AppState>, client:
     let _serialize = persistence.lock();
     let (dir, entries) = {
         let guard = state.lock();
-        (guard.data_dir.clone(), guard.memberships.clone())
+        (guard.library_dir(), guard.memberships.clone())
     };
     save_membership(&dir, &entries);
     let _ = app.emit("memberships_changed", json!({"saved_tracks": liked}));
@@ -2018,10 +2025,18 @@ async fn refresh_memberships(state: &Mutex<AppState>, client: &EngineClient, pla
     };
 
     for id in &work {
-        let playlist_generation = state.lock().playlist_generation(id);
-        if !library_generation_is_current(&state.lock(), generation) {
-            return;
-        }
+        let playlist_generation = {
+            let guard = state.lock();
+            if !library_generation_is_current(&guard, generation) { return; }
+            if guard.playlists.iter().find(|playlist| playlist.id == *id).is_some_and(|playlist| {
+                !playlist.snapshot_id.is_empty() && guard.memberships.iter().any(|entry| {
+                    entry.id == *id && entry.revision == playlist.snapshot_id
+                })
+            }) {
+                continue;
+            }
+            guard.playlist_generation(id)
+        };
         match client.browse_playlist_membership(id).await {
             Ok(membership) => {
                 let mut guard = state.lock();
@@ -2185,7 +2200,7 @@ async fn fetch_library(
 ) -> Result<LibraryFetchResult, String> {
     let mut generation = state.lock().library_generation;
     let mut playlists = Vec::new();
-    let mut playlist_tree = LibraryNodeDetail::split(client.browse_playlist_tree(LIBRARY_LENGTH).await?, &mut playlists);
+    let mut playlist_tree = LibraryNodeDetail::split(client.browse_playlist_tree(LIBRARY_PAGE_SIZE).await?, &mut playlists);
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
@@ -2199,6 +2214,7 @@ async fn fetch_library(
                 applied: false,
             });
         }
+        guard.finish_library_import()?;
         // A detail refresh may have enriched the current row while the
         // rootlist request was in flight. Carry and install in the same
         // serialized completion so sparse metadata cannot overwrite it.
@@ -2216,7 +2232,7 @@ async fn fetch_library(
         guard.playlists_fetched_at = Some(fetched_at);
         guard.library_fresh = true;
         (
-            guard.data_dir.clone(),
+            guard.library_dir(),
             changed.then(|| PlaylistListCache {
                 version: 1,
                 fetched_at: Some(fetched_at),
@@ -2253,15 +2269,15 @@ fn adopt_playlist_detail(
         tracks: detail.tracks.clone(),
         excluded_track_ids: detail.excluded_track_ids.clone(),
     });
-    let followed = is_followed_playlist(&state.playlists, id);
-    if followed { upsert_playlist(&mut state.playlists, detail.playlist.clone()); }
+    let library_changed = is_followed_playlist(&state.playlists, id)
+        && upsert_playlist(&mut state.playlists, detail.playlist.clone());
     let membership = playlist_qualifies(&detail.playlist, &state.me_id)
         && upsert_membership(&mut state.memberships, MembershipEntry {
             id: detail.playlist.id.clone(),
             revision: detail.playlist.snapshot_id.clone(),
             uris: detail.tracks.iter().map(|track| track.uri.clone()).collect(),
         });
-    Some((tracks_changed, followed, membership))
+    Some((tracks_changed, library_changed, membership))
 }
 /// Engine round-trip for one playlist; always updates the bounded tracks
 /// cache, and — for a playlist the user created — the membership index the
@@ -2284,6 +2300,7 @@ async fn fetch_playlist(
     let _serialize = persistence.lock();
     let (dir, list_cache, tracks_bytes, membership) = {
         let mut guard = state.lock();
+        guard.finish_library_import()?;
         client.reconcile_cached_rows(&mut detail.tracks, cache_generation);
         let Some((tracks_changed, should_persist_library, membership_changed)) =
             adopt_playlist_detail(&mut guard, id, generation, playlist_generation, &detail, fetched_at)
@@ -2306,7 +2323,7 @@ async fn fetch_playlist(
             .then(|| tracks_cache_bytes(&guard.tracks_cache))
             .flatten();
         (
-            guard.data_dir.clone(),
+            guard.library_dir(),
             should_persist_library.then(|| PlaylistListCache {
                 version: 1,
                 fetched_at: guard.playlists_fetched_at,
@@ -2349,6 +2366,81 @@ async fn fetch_playlist(
 mod tests {
     use super::*;
     use crate::types::PlaybackState;
+
+    fn playlist_payload(name: &str, revision: &str, ids: &[&str]) -> PlaylistDetail {
+        PlaylistDetail {
+            playlist: Playlist { id: "p".into(), name: name.into(), owner_id: "owner".into(),
+                snapshot_id: revision.into(), ..Default::default() },
+            tracks: ids.iter().map(|id| Track { id: (*id).into(), uri: format!("spotify:track:{id}"), ..Default::default() }).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn landed_track_edit_refuses_cached_old_queue_until_new_detail_arrives() {
+        let mut state = AppState::new(std::path::PathBuf::new());
+        state.me_id = "owner".into();
+        state.playlists.push(playlist_payload("Playlist", "before", &[]).playlist);
+        let generation = state.library_generation;
+        assert!(adopt_playlist_detail(&mut state, "p", generation, 0,
+            &playlist_payload("Playlist", "before", &["a", "b"]), 1).is_some());
+        assert_eq!(cached_playlist_detail(&state, "p").unwrap().1.tracks.len(), 2);
+        state.record_playlist_edit("p");
+        assert!(cached_playlist_detail(&state, "p").is_none(), "card play must not queue removed rows");
+        assert!(adopt_playlist_detail(&mut state, "p", generation, 0,
+            &playlist_payload("Playlist", "before", &["a", "b"]), 2).is_none());
+        let edited = state.playlist_generation("p");
+        assert!(adopt_playlist_detail(&mut state, "p", generation, edited,
+            &playlist_payload("Playlist", "after", &["a"]), 3).is_some());
+        let cached = cached_playlist_detail(&state, "p").unwrap().1;
+        assert_eq!(cached.playlist.snapshot_id, "after");
+        assert_eq!(cached.tracks.iter().map(|track| track.id.as_str()).collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[test]
+    fn rename_is_visible_immediately_and_older_detail_cannot_undo_it() {
+        let mut state = AppState::new(std::path::PathBuf::new());
+        state.me_id = "owner".into();
+        state.playlists.push(playlist_payload("Old name", "r", &[]).playlist);
+        let generation = state.library_generation;
+        adopt_playlist_detail(&mut state, "p", generation, 0,
+            &playlist_payload("Old name", "r", &["a"]), 1).unwrap();
+        state.record_playlist_rename("p", " New name ");
+        let cached = cached_playlist_detail(&state, "p").unwrap().1;
+        assert_eq!(cached.playlist.name, "New name");
+        assert_eq!(cached.tracks[0].id, "a", "rename does not invalidate unchanged tracks");
+        assert!(adopt_playlist_detail(&mut state, "p", generation, 0,
+            &playlist_payload("Old name", "r", &["a"]), 2).is_none());
+        assert_eq!(state.playlists[0].name, "New name");
+    }
+
+    #[test]
+    fn auth_departure_rejects_old_payload_but_keeps_same_account_offline_detail() {
+        let mut state = AppState::new(std::path::PathBuf::new());
+        state.me_id = "owner".into();
+        state.playlists.push(playlist_payload("Offline", "r", &[]).playlist);
+        let generation = state.library_generation;
+        adopt_playlist_detail(&mut state, "p", generation, 0,
+            &playlist_payload("Offline", "r", &["a"]), 1).unwrap();
+        state.fence_library_reads();
+        assert_eq!(cached_playlist_detail(&state, "p").unwrap().1.tracks[0].id, "a");
+        assert!(adopt_playlist_detail(&mut state, "p", generation, 0,
+            &playlist_payload("Stale", "old", &["b"]), 2).is_none());
+        state.select_library_account("");
+        assert!(cached_playlist_detail(&state, "p").is_none());
+    }
+
+    #[test]
+    fn identical_playlist_detail_does_not_request_any_cache_rewrite() {
+        let mut state = AppState::new(std::path::PathBuf::new());
+        state.me_id = "owner".into();
+        state.playlists.push(playlist_payload("Playlist", "r", &[]).playlist);
+        let generation = state.library_generation;
+        let detail = playlist_payload("Playlist", "r", &["a"]);
+        adopt_playlist_detail(&mut state, "p", generation, 0, &detail, 1).unwrap();
+        assert_eq!(adopt_playlist_detail(&mut state, "p", generation, 0, &detail, 2), Some((false, false, false)));
+        assert_eq!(cached_playlist_detail(&state, "p").unwrap().1.tracks[0].id, "a");
+    }
 
     #[test]
     fn restore_publication_skips_buffered_intermediates_but_accepts_settled_concurrent_pause() {

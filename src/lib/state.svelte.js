@@ -196,7 +196,7 @@ export const ui = $state({
   paneWidth: 0,
   /* Whether the app window has focus. Owned by App.svelte, published here
      because two unrelated surfaces gate decorative work on it: the VU meter's
-     `anim-paused` class and the Canvas video's decoder. */
+     shared meter clock and the Canvas video's decoder. */
   windowFocused: true,
   /* An action the FRONTEND started and that failed, for the one banner in
      App.svelte. Separate from `playback.error` on purpose, in both
@@ -398,6 +398,9 @@ async function startLazyQueue(tracks, source, cursor, index = 0) {
   if (generation !== lazyQueue.generation) return;
   lazyQueue.source = cursor == null ? null : source;
   lazyQueue.cursor = cursor;
+  // The queue event may have arrived before play_queue resolved, while the
+  // App's low-water effect still saw no source. Installing it is a trigger too.
+  backfillLazyQueue(false).catch(() => {});
 }
 
 
@@ -406,6 +409,7 @@ function catalogueTracks(releases) {
 }
 
 export function loadCataloguePage(id, releaseTypes = ["albums", "singles"], offset = 0, limit = 4) {
+  const epoch = searchSessionEpoch;
   const key = `${id}:${releaseTypes.join(",")}:${offset}:${limit}`;
   const cached = cataloguePageCache.get(key);
   if (cached) {
@@ -418,13 +422,16 @@ export function loadCataloguePage(id, releaseTypes = ["albums", "singles"], offs
   if (cataloguePagePending.has(key)) return cataloguePagePending.get(key);
   const request = api.browseArtistCatalogue(id, releaseTypes, offset, limit)
     .then((page) => {
+      if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
       cataloguePageCache.set(key, page);
       while (cataloguePageCache.size > CATALOGUE_PAGE_CACHE_MAX) {
         cataloguePageCache.delete(cataloguePageCache.keys().next().value);
       }
       return page;
     })
-    .finally(() => cataloguePagePending.delete(key));
+    .finally(() => {
+      if (cataloguePagePending.get(key) === request) cataloguePagePending.delete(key);
+    });
   cataloguePagePending.set(key, request);
   return request;
 }
@@ -683,10 +690,20 @@ function markPayload(value, pending) {
   }
 }
 
+function sessionInvoke(command, args) {
+  const epoch = searchSessionEpoch;
+  return invoke(command, args).then((value) => {
+    if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
+    return value;
+  });
+}
+
 function cacheMarkedRead(command, args) {
+  const generation = dataReadGeneration;
   const pending = { version: cacheMarksVersion, reset: false, marks: new Map() };
   pendingCacheReads.add(pending);
-  return invoke(command, args).then((value) => {
+  return sessionInvoke(command, args).then((value) => {
+    if (generation !== dataReadGeneration) throw new Error("Spotify disconnected while reading.");
     if (pending.version !== cacheMarksVersion) markPayload(value, pending);
     return value;
   }).finally(() => pendingCacheReads.delete(pending));
@@ -864,14 +881,15 @@ let browseSeq = 0;
  * left from painting over the page you are on.
  */
 export function loadDetail(name = route.name, id = route.id) {
+  const seq = ++browseSeq;
+  const epoch = searchSessionEpoch;
   if (!id) return;
   // The artist page and its auxiliary/discography views share one payload;
   // arriving at any of them with it already loaded must not refetch.
   if (ARTIST_ROUTES.has(name) && detail.artist?.id === id) return;
-  const seq = ++browseSeq;
   detail.error = "";
   const settle = (key) => (payload) => {
-    if (seq !== browseSeq) return;
+    if (seq !== browseSeq || epoch !== searchSessionEpoch) return;
     // A cached open starts its engine refresh before this command response is
     // delivered. If that fresher event won the race, never replace it with the
     // stale disk snapshot that arrived later.
@@ -879,7 +897,7 @@ export function loadDetail(name = route.name, id = route.id) {
     detail[key] = payload ?? null;
   };
   const fail = (reason) => {
-    if (seq === browseSeq) detail.error = String(reason || "Nothing came back from the engine.");
+    if (seq === browseSeq && epoch === searchSessionEpoch) detail.error = String(reason || "Nothing came back from the engine.");
   };
   if (name === "playlist") api.browsePlaylist(id).then(settle("playlist")).catch(fail);
   else if (name === "radio") api.browseRadio(id).then(settle("radio")).catch(fail);
@@ -961,6 +979,12 @@ export const search = $state({ query: "", results: null, submitted: false, busy:
 export const nowSaved = $state({ refs: [] });
 let savedSeq = 0;
 
+/** Hide the saved mark and fence replies already in flight, without an IPC. */
+export function invalidateSavedIn() {
+  savedSeq += 1;
+  nowSaved.refs = [];
+}
+
 export async function lookupSavedIn(uri) {
   const seq = ++savedSeq;
   if (!uri?.startsWith("spotify:track:")) {
@@ -1001,6 +1025,7 @@ let creditsSeq = 0;
  */
 export const trackCredits = $state({ id: null, loading: false, data: null, error: null });
 const creditsCache = new Map();
+const creditsPending = new Map();
 const CREDITS_CACHE_MAX = 128;
 
 function keepCredits(id, data) {
@@ -1012,9 +1037,25 @@ function keepCredits(id, data) {
 }
 let panelCreditsSeq = 0;
 
+function readTrackCredits(id) {
+  const existing = creditsPending.get(id);
+  if (existing) return existing;
+  const epoch = searchSessionEpoch;
+  const request = api.browseTrackCredits(id).then((data) => {
+    if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
+    keepCredits(id, data ?? null);
+    return data ?? null;
+  }).finally(() => {
+    if (creditsPending.get(id) === request) creditsPending.delete(id);
+  });
+  creditsPending.set(id, request);
+  return request;
+}
+
 export function loadTrackCredits(track) {
   const id = track?.id?.trim?.() ?? "";
   if (!id) {
+    panelCreditsSeq += 1;
     trackCredits.id = null;
     trackCredits.loading = false;
     trackCredits.data = null;
@@ -1034,11 +1075,9 @@ export function loadTrackCredits(track) {
   }
   trackCredits.data = null;
   trackCredits.loading = true;
-  api
-    .browseTrackCredits(id)
+  readTrackCredits(id)
     .then((data) => {
       if (seq !== panelCreditsSeq) return;
-      keepCredits(id, data ?? null);
       trackCredits.data = data ?? null;
       trackCredits.loading = false;
     })
@@ -1067,6 +1106,7 @@ const SEARCH_FAILURE_MESSAGE = "Search could not load. Try again.";
 let searchTimer = null;
 let searchSeq = 0;
 let searchSessionEpoch = 0;
+let dataReadGeneration = 0;
 let currentSearch = null;
 let deferredSearch = null;
 const searchRequests = new Map();
@@ -1128,10 +1168,21 @@ function observeSearchSession(payload) {
     : hasUsername
       ? !rawUsername && !!observedSearchSession.username
       : observedSearchSession.loggedOut;
-  const username = loggedOut ? "" : rawUsername;
+  // Temporary disconnect snapshots can omit identity; remember it until a
+  // real logout so reconnecting as another account is still a transition.
+  const username = loggedOut ? "" : rawUsername || observedSearchSession.username;
   const previous = observedSearchSession;
 
   if (previous.known) {
+    if (previous.authState === "ready" && hasAuthState && authState !== "ready") {
+      dataReadGeneration += 1;
+      browseSeq += 1;
+      likedFirstPagePending = null;
+      cataloguePagePending.clear();
+      for (const [key, entry] of playlistRecommendationsCache) {
+        if (entry.promise) playlistRecommendationsCache.delete(key);
+      }
+    }
     const actualLogout =
       loggedOut &&
       !previous.loggedOut &&
@@ -1154,16 +1205,39 @@ function observeSearchSession(payload) {
       followed.loaded = false;
       followed.loading = false;
       followed.error = "";
-      savedSeq += 1;
-      nowSaved.refs = [];
-      // The previous account's recency must not leak into the next session's
-      // Home: shelves stay hidden until the new account's own `library` event.
+      invalidateSavedIn();
+      clearLazyQueue();
+      cataloguePageCache.clear();
+      cataloguePagePending.clear();
+      clearPlaylistRecommendationsCache();
+      creditsCache.clear();
+      creditsPending.clear();
+      panelCreditsSeq += 1;
+      Object.assign(trackCredits, { id: null, loading: false, data: null, error: null });
+      closeCredits();
+      browseSeq += 1;
+      Object.assign(detail, { playlist: null, radio: null, album: null, artist: null, error: "" });
+      library.length = 0;
+      libraryState.loaded = false;
       libraryState.fresh = false;
       libraryState.tree = [];
+      treeEditTail = null;
+      history.entries = [{ name: "library", id: null, param: null }];
+      history.cursor = 0;
+      applyEntry(history.entries[0]);
     }
   }
 
   observedSearchSession = { known: true, authState, username, loggedOut };
+  if (authState === "ready" && previous.authState !== "ready" && route.id) {
+    const key = ARTIST_ROUTES.has(route.name) ? "artist" : route.name;
+    if (key in detail && !detail[key]) {
+      const epoch = searchSessionEpoch;
+      queueMicrotask(() => {
+        if (epoch === searchSessionEpoch && playback.auth_state === "ready") loadDetail();
+      });
+    }
+  }
   return loggedOut;
 }
 
@@ -1487,11 +1561,9 @@ export function openCredits(track) {
     credits.loading = false;
     return;
   }
-  api
-    .browseTrackCredits(id)
+  readTrackCredits(id)
     .then((data) => {
       if (seq !== creditsSeq) return;
-      keepCredits(id, data ?? null);
       credits.data = data ?? null;
       credits.loading = false;
     })
@@ -2056,14 +2128,30 @@ function editFailed(what, error) {
   ui.error = `${what} ${error instanceof Error ? error.message : String(error ?? "")}`.trim();
 }
 
+// Compute each optimistic edit only after the previous one has settled, so
+// rollback snapshots never contain another uncommitted edit.
+let treeEditTail = null;
+function serializeTreeEdit(edit) {
+  const epoch = searchSessionEpoch;
+  const run = () => epoch === searchSessionEpoch ? edit() : false;
+  const operation = treeEditTail ? treeEditTail.then(run, run) : Promise.resolve(run());
+  const pending = operation.finally(() => {
+    if (treeEditTail === pending) treeEditTail = null;
+  });
+  treeEditTail = pending;
+  return pending;
+}
+
 async function editTree(next, write, failure) {
+  const epoch = searchSessionEpoch;
   const previous = libraryState.tree;
   libraryState.tree = next;
   const shown = libraryState.tree;
   try {
     await write();
-    return true;
+    return epoch === searchSessionEpoch;
   } catch (error) {
+    if (epoch !== searchSessionEpoch) return false;
     if (libraryState.tree === shown) libraryState.tree = previous;
     editFailed(failure, error);
     return false;
@@ -2078,7 +2166,9 @@ function libraryItemName(item) {
 
 /** A new folder, first in the library or first in `parent`. Throws. */
 export async function createLibraryFolder(name, parent = null) {
+  const epoch = searchSessionEpoch;
   const folder = await api.createFolder(name.trim(), parent);
+  if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
   if (!findFolder(libraryState.tree, folder.id)) {
     libraryState.tree = insertFirst(libraryState.tree, parent, folder);
   }
@@ -2086,19 +2176,23 @@ export async function createLibraryFolder(name, parent = null) {
 }
 
 export function renameLibraryFolder(id, name) {
-  const folder = findFolder(libraryState.tree, id);
-  const trimmed = name.trim();
-  if (!folder || !trimmed || trimmed === folder.name) return Promise.resolve(false);
-  return editTree(
-    renameFolder(libraryState.tree, id, trimmed),
-    () => api.renameFolder(id, trimmed),
-    `Could not rename "${folder.name}".`,
-  );
+  return serializeTreeEdit(() => {
+    const folder = findFolder(libraryState.tree, id);
+    const trimmed = name.trim();
+    if (!folder || !trimmed || trimmed === folder.name) return false;
+    return editTree(
+      renameFolder(libraryState.tree, id, trimmed),
+      () => api.renameFolder(id, trimmed),
+      `Could not rename "${folder.name}".`,
+    );
+  });
 }
 
 /** The folder and everything in it, gone from the library. Throws. */
 export async function deleteLibraryFolder(id) {
+  const epoch = searchSessionEpoch;
   await api.deleteFolder(id);
+  if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
   const { tree, playlistIds } = removeFolder(libraryState.tree, id);
   libraryState.tree = tree;
   const gone = new Set(playlistIds);
@@ -2113,16 +2207,23 @@ export async function deleteLibraryFolder(id) {
  * already there or cannot go there.
  */
 export function moveLibraryItem(item, folder = null) {
-  const next = moveItem(libraryState.tree, item, folder);
-  if (!next) return Promise.resolve(false);
-  return editTree(next, () => api.moveLibraryItem(item, folder), `Could not move "${libraryItemName(item)}".`);
+  return serializeTreeEdit(() => {
+    const next = moveItem(libraryState.tree, item, folder);
+    if (!next) return false;
+    return editTree(next, () => api.moveLibraryItem(item, folder), `Could not move "${libraryItemName(item)}".`);
+  });
 }
 
 /**
  * Someone else's playlist out of your library, at once and without asking —
  * Spotify does not ask either, and the playlist's page offers it back.
  */
-export async function removeFromLibrary(id) {
+export function removeFromLibrary(id) {
+  return serializeTreeEdit(() => removeLibraryPlaylist(id));
+}
+
+async function removeLibraryPlaylist(id) {
+  const epoch = searchSessionEpoch;
   const index = library.findIndex((row) => row?.id === id);
   if (index < 0) return false;
   const row = library[index];
@@ -2132,8 +2233,9 @@ export async function removeFromLibrary(id) {
   const shown = libraryState.tree;
   try {
     await api.deletePlaylist(id);
-    return true;
+    return epoch === searchSessionEpoch;
   } catch (error) {
+    if (epoch !== searchSessionEpoch) return false;
     if (!library.some((entry) => entry?.id === id)) library.splice(Math.min(index, library.length), 0, row);
     if (libraryState.tree === shown) libraryState.tree = previous;
     editFailed(`Could not remove "${row.name}" from your library.`, error);
@@ -2144,11 +2246,15 @@ export async function removeFromLibrary(id) {
 /** Puts a playlist back in your library, first, from the row its page holds
     (the page's detail without its tracks: only the library row crosses). */
 export async function addToLibrary(playlist) {
+  const epoch = searchSessionEpoch;
   const { tracks: _tracks, excluded_track_ids: _excluded, ...row } = playlist ?? {};
   try {
-    insertPlaylist(await api.followPlaylist(row));
+    const summary = await api.followPlaylist(row);
+    if (epoch !== searchSessionEpoch) return false;
+    insertPlaylist(summary);
     return true;
   } catch (error) {
+    if (epoch !== searchSessionEpoch) return false;
     editFailed(`Could not add "${playlist?.name ?? "this playlist"}" to your library.`, error);
     return false;
   }
@@ -2552,8 +2658,8 @@ export const api = {
   touchPlaylist: (id) => invoke("touch_playlist", { id }),
   touchPlaylistActivity: (id) => invoke("touch_playlist_activity", { id }),
   /** Containers of the user that hold `uri` — the saved mark's data. */
-  getTrackPlaylists: (uri) => invoke("get_track_playlists", { uri }),
-  browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
+  getTrackPlaylists: (uri) => sessionInvoke("get_track_playlists", { uri }),
+  browseTrackCredits: (id) => sessionInvoke("browse_track_credits", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
   /** Explicit Settings-only cache wipe; returns fresh audio/covers stats. */
   clearCache: (kind) => invoke("clear_cache", { kind }),
@@ -2577,7 +2683,7 @@ export const api = {
   }),
   browseShow: (id) => cacheMarkedRead("browse_show", { id }),
   browseEpisode: (id) => cacheMarkedRead("browse_episode", { id }),
-  browseProfile: (username) => invoke("browse_profile", { username }),
+  browseProfile: (username) => sessionInvoke("browse_profile", { username }),
   /**
    * The collection is walked by cursor; only the first page is deduplicated and
    * kept for a moment (see [`browseLikedFirstPage`]). Later pages belong to the
@@ -2593,23 +2699,23 @@ export const api = {
   browseArtist: (id) => cacheMarkedRead("browse_artist", { id }),
   browseArtistSongwriter: (id, name) =>
     cacheMarkedRead("browse_artist_songwriter", { id, name }),
-  browseFollowedArtists: () => invoke("browse_followed_artists"),
-  browseSavedShows: () => invoke("browse_saved_shows"),
-  createPlaylist: (name) => invoke("create_playlist", { name }),
-  renamePlaylist: (id, name) => invoke("rename_playlist", { id, name }),
+  browseFollowedArtists: () => sessionInvoke("browse_followed_artists"),
+  browseSavedShows: () => sessionInvoke("browse_saved_shows"),
+  createPlaylist: (name) => sessionInvoke("create_playlist", { name }),
+  renamePlaylist: (id, name) => sessionInvoke("rename_playlist", { id, name }),
   /* One rootlist REM: deleting a playlist you made and removing someone
      else's from your library are the same edit. */
-  deletePlaylist: (id) => invoke("delete_playlist", { id }),
-  followPlaylist: (playlist) => invoke("follow_playlist", { playlist }),
-  createFolder: (name, parent = null) => invoke("create_folder", { name, parent }),
-  renameFolder: (id, name) => invoke("rename_folder", { id, name }),
-  deleteFolder: (id) => invoke("delete_folder", { id }),
-  moveLibraryItem: (item, folder = null) => invoke("move_library_item", { item, folder }),
-  addPlaylistTracks: (id, uris) => invoke("add_playlist_tracks", { id, uris }),
+  deletePlaylist: (id) => sessionInvoke("delete_playlist", { id }),
+  followPlaylist: (playlist) => sessionInvoke("follow_playlist", { playlist }),
+  createFolder: (name, parent = null) => sessionInvoke("create_folder", { name, parent }),
+  renameFolder: (id, name) => sessionInvoke("rename_folder", { id, name }),
+  deleteFolder: (id) => sessionInvoke("delete_folder", { id }),
+  moveLibraryItem: (item, folder = null) => sessionInvoke("move_library_item", { item, folder }),
+  addPlaylistTracks: (id, uris) => sessionInvoke("add_playlist_tracks", { id, uris }),
   removePlaylistTracks: (id, uris, expectedSnapshotId = null) =>
-    invoke("remove_playlist_tracks", { id, uris, expectedSnapshotId }),
+    sessionInvoke("remove_playlist_tracks", { id, uris, expectedSnapshotId }),
   reorderPlaylistTracks: (id, from, to) =>
-    invoke("reorder_playlist_tracks", { id, from, to }),
+    sessionInvoke("reorder_playlist_tracks", { id, from, to }),
   login: () => invoke("login"),
   logout: () => invoke("logout"),
   getState: () => cacheMarkedRead("get_state"),
@@ -2662,6 +2768,7 @@ function clearPlaylistRecommendationsCache() {
 export function loadPlaylistRecommendations(id, revision = "", { force = false } = {}) {
   const playlistId = String(id ?? "").trim();
   if (!playlistId) return Promise.resolve([]);
+  const epoch = searchSessionEpoch;
 
   const snapshot = String(revision ?? "");
   const key = playlistRecommendationsKey(playlistId, snapshot);
@@ -2689,6 +2796,7 @@ export function loadPlaylistRecommendations(id, revision = "", { force = false }
 
   const request = Promise.resolve(response)
     .then((payload) => {
+      if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
       const tracks = Array.isArray(payload?.tracks) ? payload.tracks : [];
       const current = playlistRecommendationsCache.get(key);
       if (current?.promise === request) {

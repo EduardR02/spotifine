@@ -302,6 +302,7 @@ impl WaveformService {
                 cancellation,
                 worker,
                 responses,
+                librespot_audio::cache_epoch(),
             ),
         ));
     }
@@ -355,6 +356,7 @@ async fn run_job(
     cancellation: Arc<AtomicBool>,
     worker: Arc<Semaphore>,
     responses: Arc<Mutex<ResponseCache>>,
+    cache_epoch: u64,
 ) -> Result<TrackWaveform, String> {
     check_cancelled(&cancellation)?;
     let _permit = worker
@@ -403,7 +405,7 @@ async fn run_job(
     }
 
     check_cancelled(&cancellation)?;
-    let encrypted = AudioFile::open(&session, file_id, bytes_per_second, &item.track_id)
+    let encrypted = AudioFile::open(&session, file_id, bytes_per_second, &item.track_id, cache_epoch)
         .await
         .map_err(|error| format!("could not open track audio: {error}"))?;
     check_cancelled(&cancellation)?;

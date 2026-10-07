@@ -17,19 +17,28 @@ let request = null;
 let watchedSession = null;
 let listening = null;
 
+function sessionInvoke(command, args) {
+  const epoch = sessionEpoch();
+  return invoke(command, args).then((value) => {
+    if (epoch !== sessionEpoch()) throw new Error("The Spotify session changed.");
+    return value;
+  });
+}
+
 export function refreshPersonal() {
   const key = `${sessionEpoch()}\u0000${session.username ?? ""}\u0000${playback.auth_state ?? ""}`;
   if (request?.key === key) return request.promise;
   const pending = { key, promise: null };
+  const epoch = sessionEpoch();
   personal.loading = true;
-  pending.promise = invoke("personal_api_status").then((status) => {
-    if (request === pending) {
+  pending.promise = sessionInvoke("personal_api_status").then((status) => {
+    if (request === pending && epoch === sessionEpoch()) {
       personal.status = status;
       personal.error = status?.error || "";
     }
     return status;
   }).catch((error) => {
-    if (request === pending) personal.error = String(error);
+    if (request === pending && epoch === sessionEpoch()) personal.error = String(error);
     throw error;
   }).finally(() => {
     if (request === pending) {
@@ -65,18 +74,26 @@ export function personalConnected() {
 }
 
 export async function configurePersonal(clientId) {
-  personal.status = await invoke("personal_api_configure", { clientId: clientId.trim() });
+  const epoch = sessionEpoch();
+  const status = await sessionInvoke("personal_api_configure", { clientId: clientId.trim() });
+  if (epoch !== sessionEpoch()) throw new Error("The Spotify session changed.");
+  personal.status = status;
   personal.error = "";
 }
 
 export async function authorizePersonal(enableDevices = false) {
-  const { url } = await invoke("personal_api_authorize", { enableDevices });
+  const epoch = sessionEpoch();
+  const { url } = await sessionInvoke("personal_api_authorize", { enableDevices });
+  if (epoch !== sessionEpoch()) throw new Error("The Spotify session changed.");
   await openUrl(url);
   await refreshPersonal();
 }
 
 export async function disconnectPersonal() {
-  personal.status = await invoke("personal_api_disconnect");
+  const epoch = sessionEpoch();
+  const status = await sessionInvoke("personal_api_disconnect");
+  if (epoch !== sessionEpoch()) throw new Error("The Spotify session changed.");
+  personal.status = status;
   personal.error = "";
 }
 
@@ -104,28 +121,32 @@ export function personalDevicesActive() {
  * is re-read at once rather than waiting on the event.
  */
 export async function setLiked(uris, liked) {
-  await invoke("personal_api_set_saved", { uris, saved: liked });
+  const epoch = sessionEpoch();
+  await sessionInvoke("personal_api_set_saved", { uris, saved: liked });
+  if (epoch !== sessionEpoch()) throw new Error("The Spotify session changed.");
   if (uris.includes(playback.current_uri)) lookupSavedIn(playback.current_uri);
 }
 
 /** Follow or unfollow an artist. The followed list is the answer everywhere
     (the rail, the artist's Follow pill), so a landed write updates it in place. */
 export async function setFollowingArtist(artist, following) {
-  await invoke("personal_api_set_saved", { uris: [`spotify:artist:${artist.id}`], saved: following });
+  const epoch = sessionEpoch();
+  await sessionInvoke("personal_api_set_saved", { uris: [`spotify:artist:${artist.id}`], saved: following });
+  if (epoch !== sessionEpoch()) throw new Error("The Spotify session changed.");
   artistFollowChanged(artist, following);
 }
 
 /** Whether you follow a user: asked once, when their profile opens. */
 export async function followsUser(username) {
-  const [value] = await invoke("personal_api_contains", { uris: [`spotify:user:${username}`] });
+  const [value] = await sessionInvoke("personal_api_contains", { uris: [`spotify:user:${username}`] });
   if (typeof value !== "boolean") throw new Error("Spotify returned no follow state");
   return value;
 }
 
 export async function setFollowingUser(username, following) {
-  await invoke("personal_api_set_saved", { uris: [`spotify:user:${username}`], saved: following });
+  await sessionInvoke("personal_api_set_saved", { uris: [`spotify:user:${username}`], saved: following });
 }
 
 export const personalApi = {
-  devices: () => invoke("personal_api_devices"),
+  devices: () => sessionInvoke("personal_api_devices"),
 };

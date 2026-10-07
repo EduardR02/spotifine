@@ -23,6 +23,7 @@
   import { observeStuck } from "../lib/sticky.js";
   import { rowWindow } from "../lib/virtual.js";
   import { scrollbar } from "../lib/scrollbar.js";
+  import { vuMeter } from "../lib/vu-meter.js";
   import { pressTrack, justDragged, registerReorderZone, trackDrag } from "../lib/dnd.svelte.js";
 
   let {
@@ -50,6 +51,8 @@
     allowAddToPlaylist = true,
     /** Render every row and install no shared-pane windowing machinery. */
     disableWindowing = false,
+    /** Re-measure when sibling content moves this table without changing its tracks. */
+    layoutKey = null,
     sortKey = null,
     sortDirection = "asc",
     onSort = null,
@@ -566,27 +569,33 @@
     const track = menu.track;
     if (!skipsTracked || !track?.id || !playlistId || menu.skipPending) return;
     const id = String(track.id);
+    const generation = menu.generation;
+    const sourcePlaylist = playlistId;
+    const sourceExcluded = excludedTrackIds;
+    const index = menu.index;
     const exclude = !skippedIds.has(id);
     const setPresent = (present) => {
-      const at = excludedTrackIds.findIndex((value) => String(value) === id);
+      const at = sourceExcluded.findIndex((value) => String(value) === id);
       if (present ? at === -1 : at !== -1) {
-        if (present) excludedTrackIds.push(id);
-        else excludedTrackIds.splice(at, 1);
+        if (present) sourceExcluded.push(id);
+        else sourceExcluded.splice(at, 1);
       }
     };
     menu.skipPending = true;
     menu.skipError = "";
     setPresent(exclude);
     try {
-      await api.setPlaylistTrackExcluded(playlistId, id, exclude);
+      await api.setPlaylistTrackExcluded(sourcePlaylist, id, exclude);
     } catch (reason) {
       setPresent(!exclude);
-      menu.skipError = String(reason || "Could not update this playlist.");
+      if (menuTargetCurrent(generation, sourcePlaylist, track, index)) {
+        menu.skipError = String(reason || "Could not update this playlist.");
+      }
       return;
     } finally {
-      menu.skipPending = false;
+      if (menuTargetCurrent(generation, sourcePlaylist, track, index)) menu.skipPending = false;
     }
-    closeMenus();
+    if (menuTargetCurrent(generation, sourcePlaylist, track, index)) closeMenus();
   }
 
   function openPicker(e) {
@@ -631,7 +640,10 @@
   /* The confirmation outlives the menu by design, so the timer has to die with
      the list: a navigation inside its window would otherwise leave it writing
      to a component that is gone. */
-  $effect(() => () => clearTimeout(copyResetTimer));
+  $effect(() => () => {
+    menu.generation += 1;
+    clearTimeout(copyResetTimer);
+  });
   /* The menu STAYS OPEN on copy, because the confirmation is on the item
      itself and dismissing it would take the only feedback with it. A copy that
      landed closes it shortly after, through the close every other dismissal
@@ -640,10 +652,16 @@
      control the confirmation exists to prevent, and the item is also the
      retry. */
   async function copyTrackLink() {
-    if (!menuLink) return;
-    menu.copyState = (await writeClipboard(menuLink)) ? "copied" : "failed";
+    const link = menuLink;
+    if (!link) return;
+    const generation = menu.generation;
+    const ok = await writeClipboard(link);
+    if (!menu.open || menu.generation !== generation) return;
+    menu.copyState = ok ? "copied" : "failed";
     clearTimeout(copyResetTimer);
-    if (menu.copyState === "copied") copyResetTimer = setTimeout(() => closeMenus(true), 900);
+    if (ok) copyResetTimer = setTimeout(() => {
+      if (menu.generation === generation) closeMenus(true);
+    }, 900);
   }
 
   /**
@@ -694,12 +712,11 @@
   }
 
   /* ---------------- Windowed rendering ----------------
-     Long page-level lists keep a fixed-height body and translate a keyed
-     visible window through it. Absolute-index keys retain every overlapping
-     row (including its Cover subtree) when the window advances, so a one-row
-     slide only removes and adds the two boundary rows. The scroller is an
-     ancestor (.scroll in App.svelte), not this component, so the offset has
-     to be read from it rather than from a local scrollTop. */
+     Long page-level lists keep a fixed-height body and keyed rows positioned
+     at their absolute indexes. Overlapping rows retain their Cover subtree
+     when the window slides. A focused row stays mounted outside the window,
+     so a scroll never discards the keyboard's anchor. The shared pane owns
+     the scroll offset, not this component. */
   const ROW_H = 48; // must track --row-h
   /* Sliding the window one row at a time measured better than batching it into
      blocks of 8 (92 vs 86 fps, worst frame 18ms vs 27ms): the batched version
@@ -723,7 +740,24 @@
   let seenPlaylistId = null;
   let seenLength = -1;
 
-  const visible = $derived(disableWindowing ? tracks : tracks.slice(firstRow, lastRow));
+  let focusedRow = $state(-1);
+  const renderedIndices = $derived.by(() => {
+    const indices = [];
+    if (focusedRow >= 0 && focusedRow < firstRow && focusedRow < tracks.length) indices.push(focusedRow);
+    for (let i = firstRow; i < lastRow; i++) indices.push(i);
+    if (focusedRow >= lastRow && focusedRow < tracks.length) indices.push(focusedRow);
+    return indices;
+  });
+  const visible = $derived(disableWindowing ? tracks : renderedIndices.map((i) => tracks[i]));
+
+  function retainRowFocus(event) {
+    const row = event.target.closest(".tl-row");
+    if (row) focusedRow = Number(row.dataset.i);
+  }
+
+  function releaseRowFocus(event) {
+    if (!bodyEl?.contains(event.relatedTarget)) focusedRow = -1;
+  }
 
   $effect(() => watchPersonal());
 
@@ -794,6 +828,7 @@
     const list = tracks;
     list.length;
     playlistId;
+    layoutKey;
     if (!bodyEl) return;
     const scroller = bodyEl.closest(".scroll");
     if (!scroller) {
@@ -838,9 +873,9 @@
 
 </script>
 
-{#snippet trackRows(items, start)}
-  {#each items as track, k (start + k)}
-    {@const i = start + k}
+{#snippet trackRows(items, start, indices = null)}
+  {#each items as track, k (indices ? indices[k] : start + k)}
+    {@const i = indices ? indices[k] : start + k}
     <div
       class="tl-row"
       class:current={i === currentRow}
@@ -849,6 +884,10 @@
       class:drag-source={rowIsSource(i)}
       data-i={i}
       style:transform={rowDragTransform(i)}
+      style:position={indices ? "absolute" : null}
+      style:top={indices ? `${i * ROW_H}px` : null}
+      style:left={indices ? "0" : null}
+      style:right={indices ? "0" : null}
       role="button"
       aria-disabled={track.unavailable ? "true" : undefined}
       title={track.unavailable ? (track.unavailable_reason || "Unavailable") : undefined}
@@ -857,7 +896,9 @@
     >
       <span class="c-idx">
         <span class="n">{i + 1}</span>
-        <span class="eq"><i></i><i></i><i></i><i></i></span>
+        {#if i === currentRow}
+          <span class="eq" use:vuMeter><i></i><i></i><i></i><i></i></span>
+        {/if}
         <button
           class="go"
           title={track.unavailable ? (track.unavailable_reason || "Unavailable") : "Play"}
@@ -1047,12 +1088,13 @@
       style="overflow-anchor: none; position: relative"
       style:height="{tracks.length * ROW_H}px"
       onpointerdown={onBodyPointerDown}
+      onfocusin={retainRowFocus}
+      onfocusout={releaseRowFocus}
     >
       <div
         style="position: absolute; inset: 0 0 auto"
-        style:transform="translateY({firstRow * ROW_H}px)"
       >
-        {@render trackRows(visible, firstRow)}
+        {@render trackRows(visible, 0, renderedIndices)}
       </div>
       {#if insertion !== null}<div class="tl-insert" style:top="{insertion}px"></div>{/if}
     </div>

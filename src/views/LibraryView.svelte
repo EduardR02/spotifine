@@ -16,6 +16,7 @@
   import LikedMark from "../components/LikedMark.svelte";
   import Icon from "../components/Icon.svelte";
   import { playlistSubtitle } from "../lib/artist.js";
+  import { rowWindow } from "../lib/virtual.js";
   const greeting = $derived.by(() => {
     const h = new Date().getHours();
     if (h < 5) return "Good night";
@@ -102,6 +103,94 @@
   const remainingLibrary = $derived(
     uniqueLibrary.filter((playlist) => !shownIds.has(playlist.id)),
   );
+
+  let pageEl = $state(null);
+  let libraryGrid = $state(null);
+  const gridGeometry = $state({ columns: 1, width: 0, height: 0, gap: 0 });
+  let firstCard = $state(0);
+  let lastCard = $state(14);
+  let focusedCard = $state("");
+  const libraryCards = $derived([{ id: "liked" }, ...remainingLibrary]);
+  const cardIndex = $derived(new Map(libraryCards.map((card, index) => [card.id, index])));
+  const gridRows = $derived(Math.ceil(libraryCards.length / gridGeometry.columns));
+  const gridPitch = $derived(gridGeometry.height + gridGeometry.gap);
+  const renderedCards = $derived.by(() => {
+    const indices = new Set();
+    for (let i = firstCard; i < Math.min(lastCard, libraryCards.length); i++) indices.add(i);
+    const focused = cardIndex.get(focusedCard);
+    if (focused != null) {
+      indices.add(focused);
+      if (focused > 0) indices.add(focused - 1);
+      if (focused + 1 < libraryCards.length) indices.add(focused + 1);
+    }
+    return [...indices].sort((a, b) => a - b).map((index) => ({ card: libraryCards[index], index }));
+  });
+
+  function measureCardWindow() {
+    const scroller = libraryGrid?.closest(".scroll");
+    if (!scroller || !gridGeometry.height) return;
+    const { first, last } = rowWindow(libraryGrid, scroller, gridPitch, 2, gridRows);
+    firstCard = first * gridGeometry.columns;
+    lastCard = Math.min(libraryCards.length, last * gridGeometry.columns);
+  }
+
+  function retainCardFocus(event) {
+    const cell = event.target.closest("[data-library-card]");
+    if (cell) focusedCard = cell.dataset.libraryCard;
+  }
+
+  function releaseCardFocus(event) {
+    if (!libraryGrid?.contains(event.relatedTarget)) focusedCard = "";
+  }
+
+  $effect(() => {
+    const grid = libraryGrid;
+    const page = pageEl;
+    if (!grid || !page) return;
+    const scroller = grid.closest(".scroll");
+    if (!scroller) return;
+    let sample = null;
+    let frame = 0;
+    const observer = new ResizeObserver(() => measureGeometry());
+    function measureGeometry() {
+      const style = getComputedStyle(grid);
+      const widths = style.gridTemplateColumns.split(" ").map(Number.parseFloat).filter(Number.isFinite);
+      const card = grid.querySelector(".library-cell > .card");
+      if (!widths.length || !card) return;
+      if (sample !== card) {
+        if (sample) observer.unobserve(sample);
+        sample = card;
+        observer.observe(sample);
+      }
+      gridGeometry.columns = widths.length;
+      gridGeometry.width = widths[0];
+      gridGeometry.gap = Number.parseFloat(style.rowGap) || 0;
+      gridGeometry.height = card.getBoundingClientRect().height;
+      measureCardWindow();
+    }
+    const schedule = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        measureCardWindow();
+      });
+    };
+    observer.observe(grid);
+    observer.observe(page);
+    scroller.addEventListener("scroll", schedule, { passive: true });
+    untrack(measureGeometry);
+    return () => {
+      observer.disconnect();
+      scroller.removeEventListener("scroll", schedule);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  });
+  $effect(() => {
+    libraryCards;
+    recentShelf;
+    madeForYou;
+    if (libraryGrid) untrack(measureCardWindow);
+  });
 
   const tonePlaylist = $derived(
     libraryState.fresh ? (recentShelf[0] ?? uniqueLibrary[0] ?? null) : null,
@@ -194,6 +283,7 @@
      colour would compete with the artwork it is supposed to introduce. -->
 <section
   class="view page wash soft"
+  bind:this={pageEl}
   style:--tone-wash={tone.wash}
   style:--tone-wash-deep={tone.washDeep}
   style:--tone-glow={tone.glow}
@@ -281,10 +371,18 @@
       class:home-first={!recentShelf.length && !madeForYou.length}
     >
       <div class="section-head"><h2 class="section-title">Your library</h2></div>
-      <div class="grid">
-        {@render likedCard(true)}
-        {#each remainingLibrary as pl (pl.id)}
-          {@render playlistCard(pl)}
+      <div class="grid library-window" bind:this={libraryGrid}
+        style:height={gridGeometry.height ? `${Math.max(0, gridRows * gridPitch - gridGeometry.gap)}px` : null}
+        onfocusin={retainCardFocus} onfocusout={releaseCardFocus}>
+        {#each renderedCards as entry (entry.card.id)}
+          <div class="library-cell" data-library-card={entry.card.id}
+            style:position={gridGeometry.height ? "absolute" : null}
+            style:width={gridGeometry.height ? `${gridGeometry.width}px` : null}
+            style:left={`${(entry.index % gridGeometry.columns) * (gridGeometry.width + gridGeometry.gap)}px`}
+            style:top={`${Math.floor(entry.index / gridGeometry.columns) * gridPitch}px`}>
+            {#if entry.card.id === "liked"}{@render likedCard(true)}
+            {:else}{@render playlistCard(entry.card)}{/if}
+          </div>
         {/each}
       </div>
     </div>
@@ -307,6 +405,8 @@
 </section>
 
 <style>
+  .library-window { position: relative; overflow-anchor: none; }
+  .library-cell { min-width: 0; }
   /*
    * Shelves reuse the exact card object and cover interactions from `.grid`.
    * The column count follows the pane width, so Made for you always stays

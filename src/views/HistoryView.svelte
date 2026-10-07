@@ -8,6 +8,7 @@
   import { formatTime } from "../lib/time.js";
   import { observeStuck } from "../lib/sticky.js";
   import { rowWindow } from "../lib/virtual.js";
+  import { localDayRelation } from "../lib/history-date.js";
 
   /* Must track --row-h, the same way TrackList's and QueueView's constants do.
      History used to be the one list in the app at 56px, which is a difference
@@ -54,6 +55,12 @@
   /* Bumped whenever the filter or the order changes. A page that answers to an
      older generation describes a list that is no longer on screen. */
   let generation = 0;
+  let committedQuery = "";
+  let committedSort = $state("recent");
+  $effect(() => () => {
+    generation += 1;
+    inflight.clear();
+  });
 
   let query = $state("");
   let sort = $state("recent");
@@ -97,10 +104,8 @@
 
   /** The day a run of plays belongs to, written the way a diary writes it. */
   function dayLabel(timestamp) {
-    const day = startOfDay(timestamp);
-    const today = startOfDay(Date.now());
-    if (day === today) return "Today";
-    if (day === today - 86_400_000) return "Yesterday";
+    const relation = localDayRelation(timestamp);
+    if (relation) return relation;
     const date = new Date(timestamp);
     if (date.getFullYear() === new Date().getFullYear()) return dayFormatter.format(date);
     return yearDayFormatter.format(date);
@@ -175,7 +180,7 @@
   /* Only a chronological order puts a day's plays next to each other, so only
      a chronological order can be grouped by day. Sorted by name, a date is a
      property of the row and is written out on every one of them. */
-  const grouped = $derived(sort === "recent" || sort === "oldest");
+  const grouped = $derived(committedSort === "recent" || committedSort === "oldest");
   const filtering = $derived(query.trim().length > 0);
   /* Loading counts as having a list: the skeleton rows stand under the same
      column head, so the head is never inserted or removed mid-load. */
@@ -281,17 +286,21 @@
     if (inflight.has(index) || pages[index]) return;
     inflight.add(index);
     try {
-      const page = await api.getHistory(index * PAGE, PAGE, query.trim(), sort);
+      const page = await api.getHistory(index * PAGE, PAGE, committedQuery, committedSort);
       if (mine !== generation) return;
-      // A play qualified while the reader was scrolling, so every offset this
-      // view holds is one row out. Keep the page that just arrived and drop
-      // the rest rather than showing a list that is quietly misaligned.
-      if (loaded && page.recorded !== recorded) pages = {};
+      // Offsets from different archive snapshots cannot share one page set.
+      const changed = loaded && page.recorded !== recorded;
+      if (changed) {
+        generation += 1;
+        inflight.clear();
+        pages = {};
+      }
       total = page.total;
       recorded = page.recorded;
       pages[index] = page.entries;
       loaded = true;
       error = "";
+      if (changed) loadWindow();
     } catch (reason) {
       if (mine !== generation) return;
       error = String(reason || "Could not load listening history.");
@@ -317,6 +326,8 @@
   function reload() {
     generation += 1;
     inflight.clear();
+    committedQuery = query.trim();
+    committedSort = sort;
     pages = {};
     total = 0;
     loaded = false;
@@ -337,6 +348,8 @@
     const order = sort;
     if (!started) {
       started = true;
+      committedQuery = query.trim();
+      committedSort = order;
       untrack(loadWindow);
       return;
     }

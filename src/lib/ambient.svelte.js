@@ -52,8 +52,9 @@
                      it is known to have none, and at most 1.5 s after the
                      change otherwise. While it is true the haze holds the
                      previous record's light instead of lighting from the
-                     cover and then changing again for the Canvas, so a
-                     change of record is one crossfade.
+                     cover and then changing again for the Canvas, and the
+                     panel holds the previous record's picture, so a change
+                     of record is one crossfade of each, together.
 
    haze.lightTop     written here. Read by the panel's type.
    haze.lightBottom  How bright the ground under the panel's type is, as

@@ -53,6 +53,8 @@ impl Drop for ActiveFetch<'_> {
 
 const CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+const COVER_CACHE_MAGIC: &[u8; 8] = b"SPTCOV02";
+const COVER_CACHE_HEADER: usize = 16;
 
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -84,21 +86,52 @@ fn source_url(uri: &tauri::http::Uri) -> Result<String, String> {
 }
 
 fn cached_image(path: &Path) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(path).ok()?;
-    if sniff_content_type(&bytes).is_some() {
-        Some(bytes)
-    } else {
-        let _ = std::fs::remove_file(path);
-        None
-    }
+    use std::io::Read as _;
+    let read = || -> Option<Vec<u8>> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut header = [0_u8; COVER_CACHE_HEADER];
+        file.read_exact(&mut header).ok()?;
+        if &header[..8] != COVER_CACHE_MAGIC { return None; }
+        let length = u64::from_le_bytes(header[8..].try_into().ok()?);
+        if file.metadata().ok()?.len() != length.checked_add(COVER_CACHE_HEADER as u64)? {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(length).ok()?);
+        file.read_to_end(&mut bytes).ok()?;
+        (bytes.len() as u64 == length && sniff_content_type(&bytes).is_some()).then_some(bytes)
+    };
+    let bytes = read();
+    if bytes.is_none() { let _ = std::fs::remove_file(path); }
+    bytes
 }
 
 fn write_cover(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_cover_with(path, bytes, |source, destination| {
+        renderer_engine::atomic::replace_file_atomically(source, destination, false)
+    })
+}
+
+fn write_cover_with(
+    path: &Path,
+    bytes: &[u8],
+    replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    use std::io::Write as _;
     let parent = path.parent().expect("cover cache path has a parent");
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    // All reads and writes of this key hold ActiveFetch's per-key lock. A
-    // truncated file after a crash is rebuildable, not durable user state.
-    std::fs::write(path, bytes).map_err(|error| format!("could not cache cover: {error}"))
+    // Only complete, decoded downloads are published. The envelope rejects
+    // old raw entries and incomplete bodies without decoding every cache hit.
+    let temp = path.with_extension("tmp");
+    let result = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(COVER_CACHE_MAGIC)?;
+        file.write_all(&(bytes.len() as u64).to_le_bytes())?;
+        file.write_all(bytes)?;
+        drop(file);
+        replace(&temp, path)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temp); }
+    result.map_err(|error| format!("could not cache cover: {error}"))
 }
 
 async fn image_bytes(directory: &Path, source: &str, key: &str) -> Result<Vec<u8>, String> {
@@ -120,13 +153,18 @@ async fn image_bytes(directory: &Path, source: &str, key: &str) -> Result<Vec<u8
         .error_for_status()
         .map_err(|error| error.to_string())?;
     let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-    if sniff_content_type(&bytes).is_none() {
-        return Err("cover source returned a non-image body".to_owned());
-    }
-    // Hand ownership back out of the blocking write, rather than cloning the
-    // downloaded picture just to keep a response copy.
+    // Decode once off the async worker, before trusting the downloaded body.
+    // Cache hits need only their complete validated envelope, not pixels again.
     tauri::async_runtime::spawn_blocking(move || {
-        write_cover(&path, &bytes)?;
+        if sniff_content_type(&bytes).is_none() {
+            return Err("cover source returned a non-image body".to_owned());
+        }
+        image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format().map_err(|_| "cover source returned an invalid image".to_owned())?
+            .decode().map_err(|_| "cover source returned an incomplete or invalid image".to_owned())?;
+        if let Err(error) = write_cover(&path, &bytes) {
+            eprintln!("Spotifine: {error}");
+        }
         Ok(bytes.to_vec())
     })
     .await
@@ -199,6 +237,17 @@ fn sniff_content_type(bytes: &[u8]) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    fn test_png_color(color: [u8; 4]) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(1, 1, image::Rgba(color)))
+            .write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    fn test_png() -> Vec<u8> {
+        test_png_color([255, 0, 0, 255])
+    }
+
     #[test]
     fn source_urls_round_trip_queries_and_encoded_characters() {
         let source = "https://example.com/art/a+b.jpg?size=640&name=a%20b";
@@ -234,11 +283,91 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
             socket.read(&mut request).await.unwrap();
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nGIF89a").await.unwrap();
+            let bytes = test_png();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
+            socket.write_all(&bytes).await.unwrap();
         });
-        assert_eq!(image_bytes(&directory, &source, &key).await.unwrap(), b"GIF89a");
+        assert_eq!(image_bytes(&directory, &source, &key).await.unwrap(), test_png());
         server.await.unwrap();
-        assert_eq!(image_bytes(&directory, &source, &key).await.unwrap(), b"GIF89a");
+        assert_eq!(image_bytes(&directory, &source, &key).await.unwrap(), test_png());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_supported_cache_body_is_rejected_and_failed_publish_keeps_good_image() {
+        let directory = std::env::temp_dir().join(format!("renderer-cover-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("key");
+        let png = test_png();
+        write_cover(&path, &png).unwrap();
+        assert_eq!(cached_image(&path).unwrap(), png);
+        let result = write_cover_with(&path, &test_png_color([0, 0, 255, 255]), |_, _| {
+            Err(std::io::Error::other("injected replacement failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(cached_image(&path).unwrap(), png);
+        let mut interrupted = std::fs::read(&path).unwrap();
+        interrupted.truncate(COVER_CACHE_HEADER + 8);
+        std::fs::write(&path, interrupted).unwrap();
+        assert!(cached_image(&path).is_none());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    async fn one_image_server(bytes: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = format!("http://{}/image", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
+            socket.write_all(&bytes).await.unwrap();
+        });
+        (source, server)
+    }
+
+    #[tokio::test]
+    async fn valid_download_is_served_when_cache_directory_is_unwritable() {
+        let png = test_png();
+        let (source, server) = one_image_server(png.clone()).await;
+        let key = cache_key(&source);
+        let directory = std::env::temp_dir().join(format!("renderer-cover-write-failure-{}-{key}", std::process::id()));
+        std::fs::write(&directory, b"not a directory").unwrap();
+        let downloaded = image_bytes(&directory, &source, &key).await.unwrap();
+        let response = image_response(downloaded, &key, None);
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body().as_ref(), png);
+        server.await.unwrap();
+        std::fs::remove_file(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn header_only_download_is_not_served_or_persisted() {
+        let (source, server) = one_image_server(vec![0xFF, 0xD8, 0xFF]).await;
+        let key = cache_key(&source);
+        let directory = std::env::temp_dir().join(format!("renderer-cover-truncated-{}-{key}", std::process::id()));
+        let error = image_bytes(&directory, &source, &key).await.unwrap_err();
+        assert!(error.contains("invalid image"));
+        assert!(!directory.join(&key).exists());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_validated_cache_refetches_complete_pixels_and_then_works_offline() {
+        let png = test_png();
+        let (source, server) = one_image_server(png.clone()).await;
+        let key = cache_key(&source);
+        let directory = std::env::temp_dir().join(format!("renderer-cover-refetch-{}-{key}", std::process::id()));
+        let path = directory.join(&key);
+        write_cover(&path, &png).unwrap();
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged.truncate(COVER_CACHE_HEADER + 8);
+        std::fs::write(&path, damaged).unwrap();
+        assert_eq!(image_bytes(&directory, &source, &key).await.unwrap(), png);
+        server.await.unwrap();
+        assert_eq!(image_bytes(&directory, &source, &key).await.unwrap(), png);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

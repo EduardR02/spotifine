@@ -255,7 +255,7 @@
             showArt={false}
             showHead={false}
             showPlays
-            disableWindowing
+            layoutKey={ordered}
             queueContext={`artist:${route.id ?? ""}`}
           />
         </div>

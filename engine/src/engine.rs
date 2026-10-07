@@ -31,6 +31,18 @@ pub struct CacheSignal {
     generation: u64,
     lease: Arc<Mutex<bool>>,
 }
+
+fn remove_leased_cache_files(cache: &Cache, files: &[librespot_core::FileId], lease: &Mutex<bool>) {
+    let active = lease.lock();
+    if !*active { return; }
+    for file_id in files {
+        if let Err(error) = cache.remove_file(*file_id) {
+            if cache.file_path(*file_id).is_some_and(|path| std::fs::exists(path).unwrap_or(false)) {
+                eprintln!("could not evict cached audio file {file_id}: {error}");
+            }
+        }
+    }
+}
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
 /// restart window (OnPrevious in app.cpp) so both sides agree.
@@ -222,6 +234,8 @@ pub struct Engine {
     emitted_cached_marks: usize,
     uncached_marks: Vec<String>,
     invalidated_cache_ids: HashSet<String>,
+    positive_cache_ids: HashSet<String>,
+    selected_cache_files: HashMap<String, librespot_core::FileId>,
     cache_evictions: HashMap<String, Arc<Mutex<bool>>>,
     cache_sender: Option<mpsc::UnboundedSender<CacheSignal>>,
     /// The track the latest load was for. Its audio is on disk by the time it
@@ -581,6 +595,8 @@ impl Engine {
             emitted_cached_marks: 0,
             uncached_marks: Vec::new(),
             invalidated_cache_ids: HashSet::new(),
+            positive_cache_ids: HashSet::new(),
+            selected_cache_files: HashMap::new(),
             cache_evictions: HashMap::new(),
             cache_sender: None,
             loaded_track_id: None,
@@ -805,6 +821,10 @@ impl Engine {
         self.emitted_rows_revision = Some(queue_revision);
         self.emitted_order_revision = Some(order_revision);
         if sending_rows {
+            self.positive_cache_ids.extend(self.cached_marks.iter().cloned());
+            self.positive_cache_ids.extend(self.state.queue.iter()
+                .filter(|track| track.cached && track.uri.starts_with("spotify:track:"))
+                .map(|track| track.id.clone()));
             // The rows just sent carry every mark this list held.
             self.cached_marks.clear();
         }
@@ -1107,6 +1127,8 @@ impl Engine {
             return;
         }
         for id in crate::browse::cached_track_ids(&candidates, Some(&self.cache)) {
+            self.positive_cache_ids.insert(id.clone());
+            self.uncached_marks.retain(|held| held != &id);
             for track in &mut self.state.queue {
                 if track.id == id && track.uri.starts_with("spotify:track:") {
                     track.cached = true;
@@ -1993,6 +2015,9 @@ impl Engine {
         command: Command,
         auth_sender: &mpsc::UnboundedSender<AuthSignal>,
     ) -> Result<bool, String> {
+        if matches!(&command, Command::ClearAudioCache) {
+            return self.clear_audio_cache().await;
+        }
         if matches!(&command, Command::Status) {
             if self.state.auth_state == AuthState::Error {
                 self.start_authentication(auth_sender.clone());
@@ -2053,6 +2078,7 @@ impl Engine {
         }
         match command {
             Command::Status
+            | Command::ClearAudioCache
             | Command::GetHistory { .. }
             | Command::ClearHistory
             | Command::Shutdown
@@ -2200,8 +2226,139 @@ impl Engine {
         self.cache_sender = Some(sender);
     }
 
+    async fn clear_audio_cache(&mut self) -> Result<bool, String> {
+        librespot_audio::advance_cache_epoch();
+        self.cancel_cache_evictions();
+        self.finalize_listening(false);
+        crate::audio::pause_output();
+        self.invalidate_audio_signals();
+        self.play_request_id = None;
+        self.state.playing = false;
+        self.current_needs_load = self.state.current_index.is_some();
+        self.current_load_produced_audio = false;
+        self.retry_current_at = None;
+        self.preload_armed = false;
+        if let Some(player) = &self.player {
+            if let Err(error) = player.stop_and_wait().await {
+                let error = format!("could not stop audio before clearing cache: {error}");
+                self.state.error = Some(error.clone());
+                self.emit_state()?;
+                return Err(error);
+            }
+        }
+        let cache = self.cache.clone();
+        let cleared = tokio::task::spawn_blocking(move || librespot_audio::clear_cached_audio(&cache))
+            .await.map_err(|error| format!("audio cache clear worker failed: {error}"))
+            .and_then(|result| result.map_err(|error| format!("could not clear audio cache: {error}")));
+        if let Err(error) = cleared {
+            self.revalidate_cache_marks();
+            self.state.error = Some(error.clone());
+            self.emit_state()?;
+            return Err(error);
+        }
+        self.leave_preview_mode();
+        self.state.queue.clear();
+        self.state.current_index = None;
+        self.state.position_ms = 0;
+        self.state.duration_ms = 0;
+        self.rows_changed();
+        self.history.clear();
+        self.shuffle_pool.clear();
+        self.cached_marks.clear();
+        self.emitted_cached_marks = 0;
+        self.uncached_marks.clear();
+        self.positive_cache_ids.clear();
+        self.selected_cache_files.clear();
+        self.invalidated_cache_ids.clear();
+        self.loaded_track_id = None;
+        self.current_needs_load = false;
+        self.current_load_produced_audio = false;
+        self.loading_failed = false;
+        self.retry_current_at = None;
+        self.preload_armed = false;
+        self.drain_stop_at = None;
+        Ok(true)
+    }
+
+    /// Cache commits can land after the start/track-change probes. Publish
+    /// their badge delta without touching playback or republishing queue rows.
+    pub fn on_audio_cache_event(&mut self, event: librespot_audio::AudioCacheEvent) -> bool {
+        let (track_uri, file_id, downloaded, removed, epoch) = match event {
+            librespot_audio::AudioCacheEvent::Stored { track_uri, file_id, downloaded, epoch } =>
+                (track_uri, file_id, downloaded, false, epoch),
+            librespot_audio::AudioCacheEvent::Removed { track_uri, file_id, epoch } =>
+                (track_uri, file_id, false, true, epoch),
+            librespot_audio::AudioCacheEvent::Revalidate { epoch } => {
+                return epoch == librespot_audio::cache_epoch() && self.revalidate_cache_marks();
+            }
+        };
+        if epoch != librespot_audio::cache_epoch() || !matches!(track_uri, SpotifyUri::Track { .. }) {
+            return false;
+        }
+        let Ok(id) = track_uri.to_id() else { return false; };
+        if !removed { self.selected_cache_files.insert(id.clone(), file_id); }
+        crate::browse::remember_cached_file(&id, file_id);
+        // A completed save can prune other files. A decoder rejection removes
+        // one file directly. Revalidate retained positives at those boundaries.
+        let removals = (downloaded || removed) && self.revalidate_cache_marks();
+        if removed || self.invalidated_cache_ids.contains(&id)
+            || !self.cache.file_path(file_id)
+                .is_some_and(|path| std::fs::exists(path).unwrap_or(false))
+        {
+            return removals;
+        }
+        self.positive_cache_ids.insert(id.clone());
+        let held_mark = self.cached_marks.contains(&id);
+        let mut known = held_mark;
+        let mut changed = downloaded || removals;
+        for track in &mut self.state.queue {
+            if track.id == id && track.uri.starts_with("spotify:track:") {
+                known |= track.cached;
+                changed |= !track.cached;
+                track.cached = true;
+            }
+        }
+        self.uncached_marks.retain(|held| {
+            if held == &id {
+                changed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if known && !changed {
+            return false;
+        }
+        if !held_mark {
+            self.cached_marks.push(id);
+        } else {
+            // A completed download is new evidence even when our old positive
+            // survived a frontend cache clear. Re-send it without duplicate ids.
+            self.emitted_cached_marks = 0;
+        }
+        true
+    }
+
+    fn revalidate_cache_marks(&mut self) -> bool {
+        self.positive_cache_ids.extend(self.cached_marks.iter().cloned());
+        self.positive_cache_ids.extend(self.state.queue.iter()
+            .filter(|track| track.cached && track.uri.starts_with("spotify:track:"))
+            .map(|track| track.id.clone()));
+        let ids: Vec<String> = self.positive_cache_ids.iter().cloned().collect();
+        let missing = crate::browse::missing_cached_track_ids(&ids, &self.cache);
+        for id in &missing {
+            self.remove_cache_mark(id);
+        }
+        !missing.is_empty()
+    }
+
     fn invalidate_cache_mark(&mut self, id: &str) {
         self.invalidated_cache_ids.insert(id.to_owned());
+        self.remove_cache_mark(id);
+    }
+
+    fn remove_cache_mark(&mut self, id: &str) {
+        self.positive_cache_ids.remove(id);
         self.cached_marks.retain(|held| held != id);
         self.emitted_cached_marks = 0;
         for track in &mut self.state.queue {
@@ -2235,7 +2392,16 @@ impl Engine {
         // Failed removals remain untrusted too: a fresh, audible load must
         // vouch for the cache before an old file can regain its badge.
         self.invalidate_cache_mark(&signal.id);
+        self.revalidate_cache_marks();
         true
+    }
+
+    fn cache_eviction_files(&self, id: &str) -> Vec<librespot_core::FileId> {
+        let mut files = crate::browse::cached_file_ids(id);
+        if let Some(file_id) = self.selected_cache_files.get(id) {
+            if !files.contains(file_id) { files.push(*file_id); }
+        }
+        files
     }
 
     fn evict_track_audio_cache(&mut self, track_uri: SpotifyUri) {
@@ -2249,20 +2415,17 @@ impl Engine {
             *previous.lock() = false;
         }
         let generation = self.generation;
+        let mut files = self.cache_eviction_files(&id);
         tokio::spawn(async move {
             if let Ok(track) = librespot_metadata::Track::get(&session, &track_uri).await {
-                // A session replacement or new load cancels the lease before
-                // it can create a new download this old job would remove.
-                if !session.is_invalid() {
-                    let active = lease.lock();
-                    if *active {
-                        for file_id in track.files.values() {
-                            if let Err(error) = cache.remove_file(*file_id) {
-                                eprintln!("could not evict cached audio file {file_id}: {error}");
-                            }
-                        }
-                    }
+                for file_id in track.files.values() {
+                    if !files.contains(file_id) { files.push(*file_id); }
                 }
+            }
+            // Even when metadata fails, playback's actual selected file is
+            // known. The lease still cancels deletion before a newer load.
+            if !session.is_invalid() {
+                remove_leased_cache_files(&cache, &files, &lease);
             }
             let _ = sender.send(CacheSignal { id, generation, lease });
         });
@@ -3691,8 +3854,8 @@ impl Engine {
             .filter(|outgoing| self.loaded_track_id.as_ref() != Some(outgoing));
         if let Some(player) = player {
             self.prepare_cache_reload(&uri);
-            player.load(uri, start_playing, position_ms,
-                crate::audio::decoder_transition(self.audio_revision));
+            self.play_request_id = Some(player.load(uri, start_playing, position_ms,
+                crate::audio::decoder_transition(self.audio_revision)));
         }
         self.mark_cached_tracks(outgoing);
         Ok(())
@@ -4193,11 +4356,8 @@ impl Engine {
     }
     fn on_player_event(&mut self, event: PlayerEvent) -> bool {
         match event {
-            PlayerEvent::PlayRequestIdChanged { play_request_id } => {
-                self.play_request_id = Some(play_request_id);
-                false
-            }
-            PlayerEvent::TrackChanged { audio_item } => {
+            PlayerEvent::PlayRequestIdChanged { .. } => false,
+            PlayerEvent::TrackChanged { audio_item, play_request_id } if self.play_request_id == Some(play_request_id) => {
                 let Some(index) = self.state.current_index else { return false; };
                 if audio_item.uri != self.state.queue[index].uri {
                     return false;
@@ -4968,6 +5128,370 @@ mod tests {
         )
     }
 
+    struct AudioCacheFixture {
+        directory: PathBuf,
+        cache: librespot_core::cache::Cache,
+        id: String,
+        file_id: librespot_core::FileId,
+    }
+
+    impl AudioCacheFixture {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "renderer-engine-audio-cache-{}-{}-{ordinal}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            ));
+            let cache = librespot_core::cache::Cache::new(
+                None::<PathBuf>, None::<PathBuf>, Some(directory.clone()), None,
+            ).expect("isolated audio cache");
+            Self {
+                directory,
+                cache,
+                id: format!("2event{ordinal:016}"),
+                file_id: librespot_core::FileId::from_raw(&[0x91; 20]),
+            }
+        }
+
+        fn track(&self) -> TrackRef {
+            TrackRef {
+                id: self.id.clone(),
+                uri: format!("spotify:track:{}", self.id),
+                duration_ms: 100_000,
+                ..TrackRef::default()
+            }
+        }
+
+        fn engine(&self) -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
+            let (mut engine, buffer) = test_engine_with_cache(
+                PathBuf::new(), self.cache.clone(), device_present(), device_always_present(),
+            );
+            engine.restore_queue(
+                vec![self.track()], 0, 0, String::new(), 0, false, false, false,
+            ).expect("restore without playback or browse");
+            (engine, buffer)
+        }
+
+        fn write_file(&self) {
+            let path = self.cache.file_path(self.file_id).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"complete audio cache fixture").unwrap();
+        }
+
+        fn event(&self, downloaded: bool) -> librespot_audio::AudioCacheEvent {
+            librespot_audio::AudioCacheEvent::Stored {
+                track_uri: SpotifyUri::from_uri(&self.track().uri).unwrap(),
+                file_id: self.file_id,
+                downloaded,
+                epoch: librespot_audio::cache_epoch(),
+            }
+        }
+    }
+
+    impl Drop for AudioCacheFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn assert_cache_delta(buffer: &Arc<std::sync::Mutex<Vec<u8>>>, id: &str) {
+        let messages = captured_messages(buffer);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["cached_ids"], serde_json::json!([id]));
+        assert!(messages[0].get("uncached_ids").is_none());
+        assert!(messages[0].get("queue").is_none(), "badges never resend rows");
+        assert!(messages[0].get("upcoming").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacement_loads_ignore_buffered_failures_for_the_same_uri() {
+        for revisit in [false, true] {
+            let (mut engine, _) = engine_with_player();
+            engine.state = two_track_state();
+            engine.load_current(true).unwrap();
+            let old = engine.play_request_id.unwrap();
+            if revisit {
+                engine.state.current_index = Some(1);
+                engine.load_current(true).unwrap();
+                engine.state.current_index = Some(0);
+            }
+            engine.load_current(true).unwrap();
+            let replacement = engine.play_request_id.unwrap();
+            assert_ne!(old, replacement);
+            for event in [
+                PlayerEvent::PlayRequestIdChanged { play_request_id: old },
+                PlayerEvent::Unavailable { play_request_id: old, track_id: track_uri() },
+                PlayerEvent::EndOfTrack { play_request_id: old, track_id: track_uri() },
+                PlayerEvent::Stopped { play_request_id: old, track_id: track_uri() },
+            ] {
+                assert!(!engine.on_player_event(event));
+                assert_eq!(engine.play_request_id, Some(replacement));
+                assert!(engine.state.playing);
+                assert!(!engine.loading_failed);
+                assert!(engine.retry_current_at.is_none());
+                assert!(engine.invalidated_cache_ids.is_empty());
+            }
+            engine.shutdown();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acknowledged_cache_clear_rejects_queued_preclear_hits_and_needs_no_session() {
+        let fixture = AudioCacheFixture::new();
+        fixture.write_file();
+        let (mut engine, _) = fixture.engine();
+        let old_event = fixture.event(true);
+        engine.on_audio_cache_event(fixture.event(false));
+        assert!(engine.clear_audio_cache().await.unwrap());
+        assert!(engine.state.queue.is_empty());
+        assert!(!engine.state.playing);
+        assert!(engine.positive_cache_ids.is_empty());
+        assert!(!fixture.cache.file_path(fixture.file_id).unwrap().exists(), "acknowledgment follows actual deletion");
+        assert!(!engine.on_audio_cache_event(old_event));
+        assert!(engine.cached_marks.is_empty());
+        fixture.write_file();
+        assert!(engine.on_audio_cache_event(fixture.event(true)), "a post-clear producer has the new capability");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_cache_deletion_is_reported_without_acknowledging_success() {
+        let fixture = AudioCacheFixture::new();
+        let (mut engine, buffer) = fixture.engine();
+        engine.emit_state().unwrap();
+        captured_messages(&buffer);
+        std::fs::remove_dir_all(&fixture.directory).unwrap();
+        std::fs::write(&fixture.directory, b"invalid cache root remains untouched").unwrap();
+        assert!(engine.clear_audio_cache().await.is_err());
+        assert_eq!(std::fs::read(&fixture.directory).unwrap(), b"invalid cache root remains untouched");
+        assert!(!engine.state.playing);
+        assert!(engine.current_needs_load);
+        assert!(engine.state.error.as_deref().is_some_and(|error| error.contains("could not clear audio cache")));
+        assert_eq!(captured_messages(&buffer).len(), 1, "paused/error state is published even when the command fails");
+        std::fs::remove_file(&fixture.directory).unwrap();
+    }
+
+    #[test]
+    fn requested_song_mapping_evicts_the_selected_regional_file_unless_reloaded() {
+        let fixture = AudioCacheFixture::new();
+        fixture.write_file();
+        let (mut engine, _) = fixture.engine();
+        engine.on_audio_cache_event(fixture.event(false));
+        let uri = SpotifyUri::from_uri(&fixture.track().uri).unwrap();
+        let files = engine.cache_eviction_files(&fixture.id);
+        assert_eq!(files, vec![fixture.file_id]);
+        let lease = Arc::new(parking_lot::Mutex::new(true));
+        super::remove_leased_cache_files(&fixture.cache, &files, &lease);
+        assert!(!fixture.cache.file_path(fixture.file_id).unwrap().exists());
+        fixture.write_file();
+        engine.cache_evictions.insert(fixture.id.clone(), Arc::clone(&lease));
+        engine.prepare_cache_reload(&uri);
+        super::remove_leased_cache_files(&fixture.cache, &files, &lease);
+        assert!(fixture.cache.file_path(fixture.file_id).unwrap().exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_save_pruning_and_decoder_removal_publish_negatives_without_quarantine() {
+        let mut fixture = AudioCacheFixture::new();
+        fixture.cache = librespot_core::cache::Cache::new(
+            None::<PathBuf>, None::<PathBuf>, Some(fixture.directory.join("limited-audio")), Some(32),
+        ).unwrap();
+        fixture.cache.save_file(fixture.file_id, &mut std::io::Cursor::new([1u8; 16])).unwrap();
+        let (mut engine, buffer) = fixture.engine();
+        engine.on_audio_cache_event(fixture.event(false));
+        engine.emit_state().unwrap();
+        captured_messages(&buffer);
+        std::thread::sleep(Duration::from_millis(20));
+        let other = librespot_core::FileId::from_raw(&[0x93; 20]);
+        fixture.cache.save_file(other, &mut std::io::Cursor::new([2u8; 24])).unwrap();
+        assert!(!fixture.cache.file_path(fixture.file_id).unwrap().exists());
+        assert!(engine.on_audio_cache_event(librespot_audio::AudioCacheEvent::Stored {
+            track_uri: SpotifyUri::from_uri("spotify:track:0123456789ABCDEFGHIJKL").unwrap(),
+            file_id: other, downloaded: true, epoch: librespot_audio::cache_epoch(),
+        }));
+        assert!(!engine.state.queue[0].cached);
+        assert!(!engine.invalidated_cache_ids.contains(&fixture.id));
+        engine.emit_state().unwrap();
+        let messages = captured_messages(&buffer);
+        assert_eq!(messages[0]["uncached_ids"], serde_json::json!([fixture.id]));
+        assert!(messages[0].get("queue").is_none());
+
+        fixture.cache.save_file(fixture.file_id, &mut std::io::Cursor::new([3u8; 16])).unwrap();
+        engine.on_audio_cache_event(fixture.event(true));
+        engine.emit_state().unwrap();
+        captured_messages(&buffer);
+        let session = librespot_core::Session::new(librespot_core::SessionConfig::default(), Some(fixture.cache.clone()));
+        let uri = SpotifyUri::from_uri(&fixture.track().uri).unwrap();
+        librespot_audio::remove_cached_audio(&session, &uri, fixture.file_id, librespot_audio::cache_epoch()).unwrap();
+        assert!(engine.on_audio_cache_event(librespot_audio::AudioCacheEvent::Removed {
+            track_uri: uri, file_id: fixture.file_id, epoch: librespot_audio::cache_epoch(),
+        }));
+        assert!(!engine.state.queue[0].cached);
+        assert!(!engine.invalidated_cache_ids.contains(&fixture.id));
+        engine.emit_state().unwrap();
+        assert_eq!(captured_messages(&buffer)[0]["uncached_ids"], serde_json::json!([fixture.id]));
+    }
+
+    #[test]
+    fn cache_completion_after_initial_probe_publishes_all_song_duplicates_without_rows() {
+        let fixture = AudioCacheFixture::new();
+        let (mut engine, buffer) = fixture.engine();
+        engine.state.queue.push(fixture.track());
+        engine.state.queue.push(TrackRef {
+            uri: format!("spotify:episode:{}", fixture.id),
+            ..fixture.track()
+        });
+        crate::browse::remember_cached_file(&fixture.id, fixture.file_id);
+        engine.mark_cached_tracks(None);
+        assert!(engine.state.queue.iter().all(|track| !track.cached));
+        engine.emit_state().unwrap();
+        captured_messages(&buffer);
+
+        fixture.write_file();
+        assert!(engine.on_audio_cache_event(fixture.event(true)));
+        assert!(engine.state.queue[..2].iter().all(|track| track.cached));
+        assert!(!engine.state.queue[2].cached, "episode identity is not a song badge");
+        assert!(engine.session.is_none(), "no Spotify session or browse is needed");
+        engine.emit_state().unwrap();
+        assert_cache_delta(&buffer, &fixture.id);
+    }
+
+    #[test]
+    fn restored_never_browsed_song_learns_cache_hit_once() {
+        let fixture = AudioCacheFixture::new();
+        fixture.write_file();
+        let ids = vec![fixture.id.clone()];
+        assert!(crate::browse::cached_track_ids(&ids, Some(&fixture.cache)).is_empty());
+        let (mut engine, buffer) = fixture.engine();
+        engine.mark_cached_tracks(None);
+        assert!(!engine.state.queue[0].cached);
+        engine.emit_state().unwrap();
+        captured_messages(&buffer);
+
+        assert!(engine.on_audio_cache_event(fixture.event(false)));
+        assert_eq!(crate::browse::cached_track_ids(&ids, Some(&fixture.cache)), ids);
+        engine.emit_state().unwrap();
+        assert_cache_delta(&buffer, &fixture.id);
+        assert!(!engine.on_audio_cache_event(fixture.event(false)));
+        engine.emit_state().unwrap();
+        let messages = captured_messages(&buffer);
+        assert!(messages[0].get("cached_ids").is_none());
+        assert!(messages[0].get("queue").is_none());
+    }
+
+    #[test]
+    fn deleted_event_file_cannot_borrow_another_formats_positive_badge() {
+        let fixture = AudioCacheFixture::new();
+        fixture.write_file();
+        let other = librespot_core::FileId::from_raw(&[0x92; 20]);
+        crate::browse::remember_cached_file(&fixture.id, other);
+        let path = fixture.cache.file_path(other).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"another format").unwrap();
+        std::fs::remove_file(fixture.cache.file_path(fixture.file_id).unwrap()).unwrap();
+        let (mut engine, buffer) = fixture.engine();
+        engine.emit_state().unwrap();
+        captured_messages(&buffer);
+
+        for downloaded in [false, true] {
+            assert!(!engine.on_audio_cache_event(fixture.event(downloaded)));
+        }
+        assert!(!engine.state.queue[0].cached);
+        assert!(engine.cached_marks.is_empty());
+        engine.emit_state().unwrap();
+        let messages = captured_messages(&buffer);
+        assert!(messages[0].get("cached_ids").is_none());
+        assert!(messages[0].get("queue").is_none());
+    }
+
+    #[test]
+    fn quarantined_cache_event_seeds_mapping_but_only_real_audio_restores_badge() {
+        for downloaded in [false, true] {
+            let fixture = AudioCacheFixture::new();
+            fixture.write_file();
+            let (mut engine, buffer) = fixture.engine();
+            engine.loaded_track_id = Some(fixture.id.clone());
+            engine.emit_state().unwrap();
+            captured_messages(&buffer);
+            engine.invalidate_cache_mark(&fixture.id);
+
+            assert!(!engine.on_audio_cache_event(fixture.event(downloaded)));
+            assert_eq!(
+                crate::browse::cached_track_ids(&[fixture.id.clone()], Some(&fixture.cache)),
+                vec![fixture.id.clone()],
+                "quarantine must not lose playback's selected file mapping",
+            );
+            engine.mark_cached_tracks(None);
+            assert!(!engine.state.queue[0].cached);
+            assert!(!engine.on_audio_signal(AudioSignal::Output {
+                revision: engine.audio_revision.wrapping_sub(1),
+            }));
+            assert!(!engine.on_audio_signal(AudioSignal::OutputReady {
+                revision: engine.audio_revision,
+            }));
+            assert!(engine.invalidated_cache_ids.contains(&fixture.id));
+            assert!(engine.cached_marks.is_empty());
+
+            note_audio(&mut engine);
+            assert!(!engine.invalidated_cache_ids.contains(&fixture.id));
+            assert!(engine.state.queue[0].cached);
+            assert!(engine.uncached_marks.is_empty(), "positive and negative lanes agree");
+            engine.emit_state().unwrap();
+            assert_cache_delta(&buffer, &fixture.id);
+            assert!(!engine.on_audio_cache_event(fixture.event(false)));
+        }
+    }
+
+    #[test]
+    fn fresh_download_republishes_known_positive_even_after_frontend_cleared_it() {
+        let fixture = AudioCacheFixture::new();
+        fixture.write_file();
+        let (mut engine, buffer) = fixture.engine();
+        engine.emit_state().unwrap();
+        captured_messages(&buffer);
+        assert!(engine.on_audio_cache_event(fixture.event(true)));
+        engine.emit_state().unwrap();
+        assert_cache_delta(&buffer, &fixture.id);
+        assert_eq!(engine.emitted_cached_marks, 1);
+        assert!(!engine.on_audio_cache_event(fixture.event(false)));
+
+        // Clearing frontend cache flags does not clear the engine's old
+        // positive. A later successful download must publish it again.
+        assert!(engine.on_audio_cache_event(fixture.event(true)));
+        assert_eq!(engine.cached_marks, vec![fixture.id.clone()]);
+        engine.emit_state().unwrap();
+        assert_cache_delta(&buffer, &fixture.id);
+    }
+
+    #[test]
+    fn off_queue_completion_publishes_library_badge_but_episode_event_does_not() {
+        let fixture = AudioCacheFixture::new();
+        fixture.write_file();
+        let (mut engine, buffer) = fixture.engine();
+        engine.state.queue.clear();
+        engine.state.current_index = None;
+        engine.emit_state().unwrap();
+        captured_messages(&buffer);
+        let episode = librespot_audio::AudioCacheEvent::Stored {
+            track_uri: SpotifyUri::from_uri(&format!("spotify:episode:{}", fixture.id)).unwrap(),
+            file_id: fixture.file_id,
+            downloaded: true,
+            epoch: librespot_audio::cache_epoch(),
+        };
+        assert!(!engine.on_audio_cache_event(episode));
+        assert!(crate::browse::cached_track_ids(
+            &[fixture.id.clone()], Some(&fixture.cache),
+        ).is_empty(), "episodes must not seed the song index");
+        assert!(engine.cached_marks.is_empty());
+
+        assert!(engine.on_audio_cache_event(fixture.event(true)));
+        engine.emit_state().unwrap();
+        assert_cache_delta(&buffer, &fixture.id);
+        assert!(!engine.on_audio_cache_event(fixture.event(false)));
+    }
+
     /// Stands in for a machine's audio output: librespot needs a sink and
     /// nothing here listens to what it is handed.
     struct TestSink;
@@ -5437,6 +5961,31 @@ mod tests {
         }));
         assert_eq!(engine.state.current_index, Some(1));
         assert!(!engine.state.playing);
+        engine.shutdown();
+    }
+
+    /// The webview keeps the next record's warmed Canvas exactly as long as
+    /// a state names it in `preload_uri`, so a natural advance must move the
+    /// row and drop the preload in the one handler whose state is emitted: a
+    /// state with the preload gone and the old row still playing would have
+    /// the panel let go of the loop just before it is shown.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_natural_advance_moves_the_row_and_drops_the_preload_together() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = two_track_state();
+        engine.state.playing = true;
+        note_audio(&mut engine);
+        engine.update_position(engine.state.duration_ms - 1_000);
+        assert!(engine.tick_playback_health(), "the preload arms");
+        let next = engine.state.queue[1].uri.clone();
+        assert_eq!(engine.preload_row().map(|row| row.uri.clone()), Some(next));
+
+        engine.update_position(engine.state.duration_ms);
+        assert!(engine.on_player_event(PlayerEvent::EndOfTrack {
+            play_request_id: 7, track_id: track_uri(),
+        }));
+        assert_eq!(engine.state.current_index, Some(1));
+        assert!(engine.preload_row().is_none(), "the same state drops it");
         engine.shutdown();
     }
 

@@ -1,5 +1,5 @@
 /* =====================================================================
-   CANVAS — the loop the panel shows, and what lights the haze
+   CANVAS — what the panel shows, and what lights the haze
 
    The panel (NowPlayingPanel.svelte) shows a record's Canvas when it has
    one, and the haze (Ambient.svelte) is lit once per record: from that
@@ -15,9 +15,16 @@
      not known yet        "hold" while it is asked, then as above; "cover"
                           if the answer takes longer than LOOKUP_WAIT_MS.
 
-   Whatever the haze settles on stays for the record. A Canvas decoded
-   after the haze was lit from the cover crossfades in over the cover in
-   the panel, and the haze is left alone.
+   The panel's picture follows the same decision, so the two change in one
+   moment. While the haze holds, the panel keeps exactly what it showed —
+   the last record's loop, or its cover — and then goes once: straight to
+   the new loop, or to the new cover. The copy under the picture is the
+   new record's from the start. Whatever the haze settles on stays for the
+   record; a Canvas decoded after the cover was settled on crossfades in
+   over the cover in the panel, and the haze is left alone.
+
+   An empty panel holds an empty picture until this decision settles, rather
+   than flashing the new cover before a fast Canvas arrives.
 
    A lookup is asked for the record playing, and for the one the engine is
    fetching ahead in the last seconds of a track (its gapless preload,
@@ -89,20 +96,26 @@ const realClock = {
 };
 
 /**
- * The panel's Canvas, one record at a time.
+ * The panel's Canvas and picture, one record at a time.
  *
  * `decoded(url)` answers whether the panel already holds that loop with a
- * frame decoded (warmed ahead, or shared with the last record). `changed`
- * receives { url, ready, haze, warm, resetPreference } after every update:
+ * frame decoded (warmed ahead, shared with the last record, or held on
+ * screen). `changed` receives { url, ready, haze, warm, shown } after every
+ * update:
  *   url    the playing record's Canvas; "" while unknown, or for none
  *   ready  its first frame is decoded
  *   haze   "hold" | "cover" | "video": what the haze is lit from
  *   warm   the loop to load ahead, for the record the engine fetches ahead
- *   resetPreference  a new record: a look at the cover is not carried over
+ *   shown  what the panel shows: { loop, cover, swap } — the loop on screen
+ *          ("" for none), the cover under it (the `cover` its record was
+ *          given), and whether that record offers the cover/Canvas choice.
+ *          The same object until it changes; while the haze holds, the
+ *          last record's.
  */
 export function createCanvasOwner({ lookups, decoded, changed, clock = realClock }) {
   let disposed = false;
   let key = "";
+  let cover = null;
   let allowed = false;
   let visible = false;
   /** Bumped by every change of record; an answer for an older one is dropped. */
@@ -114,21 +127,30 @@ export function createCanvasOwner({ lookups, decoded, changed, clock = realClock
   let url = "";
   let ready = false;
   let haze = "cover";
-  let reset = false;
+  /** A look at this record's cover; the next record arrives on its Canvas. */
+  let preferCover = false;
+  let shown = { loop: "", cover: null, swap: false };
   let ahead = "";
   let aheadTicket = 0;
   let warm = "";
 
+  /** Keep the last picture, or an empty panel, while the source is decided. */
+  function settle() {
+    if (!visible || haze === "hold") return;
+    const swap = Boolean(url && ready);
+    const loop = swap && !preferCover ? url : "";
+    if (loop !== shown.loop || cover !== shown.cover || swap !== shown.swap) shown = { loop, cover, swap };
+  }
   function publish() {
     if (disposed) return;
-    changed({ url, ready, haze, warm, resetPreference: reset });
-    reset = false;
+    settle();
+    changed({ url, ready, haze, warm, shown });
   }
   function stop() {
     if (timer) clock.unwait(timer);
     timer = 0;
   }
-  /** The haze stops holding; a record is lit once. */
+  /** The haze and the picture stop holding; a record is lit once. */
   function light(source) {
     if (haze !== "hold") return;
     stop();
@@ -148,7 +170,7 @@ export function createCanvasOwner({ lookups, decoded, changed, clock = realClock
   function none() {
     url = "";
     ready = false;
-    reset = true;
+    preferCover = false;
     light("cover");
   }
   function found(source) {
@@ -163,7 +185,7 @@ export function createCanvasOwner({ lookups, decoded, changed, clock = realClock
     started = false;
     url = "";
     ready = false;
-    reset = true;
+    preferCover = false;
     haze = allowed && key ? "hold" : "cover";
   }
   function start() {
@@ -173,13 +195,13 @@ export function createCanvasOwner({ lookups, decoded, changed, clock = realClock
     if (known !== undefined) return known ? found(known) : none();
     until(LOOKUP_WAIT_MS);
     const ticket = generation;
-    const settle = (answer) => {
+    const answer = (source) => {
       if (disposed || ticket !== generation) return;
-      if (answer) found(answer);
+      if (source) found(source);
       else none();
       publish();
     };
-    lookups.lookup(key).then(settle, () => settle(""));
+    lookups.lookup(key).then(answer, () => answer(""));
   }
   /** The record fetched ahead, while Canvas is on and the window is seen. */
   function prepare(next) {
@@ -197,34 +219,56 @@ export function createCanvasOwner({ lookups, decoded, changed, clock = realClock
     }, () => {});
   }
 
-  /** The record playing (its track id, "" for none), whether its Canvas
-      may be shown, whether the window is seen, and the record the engine
-      is fetching ahead ("" for none). */
-  function update(nextKey, enabled, seen, next) {
+  /**
+   * The record playing: its track id ("" for none, or for an episode) and
+   * its cover (any value, handed back in `shown`); whether its Canvas may
+   * be shown; whether the window is seen; and the record the engine is
+   * fetching ahead ("" for none).
+   */
+  function update({ key: nextKey, cover: nextCover = null, enabled, visible: seen, ahead: next = "" }) {
     if (disposed) return;
+    cover = nextCover;
     if (nextKey !== key || enabled !== allowed) {
       key = nextKey;
       allowed = enabled;
       begin();
     }
     visible = seen;
+    /* Closing keeps the displayed picture, not a decision still downloading
+       behind it. Its answer may fill the lookup cache, but is adopted only
+       when visible again, with a fresh bounded wait. */
+    if (!visible && started && !ready) {
+      generation++;
+      stop();
+      started = false;
+      url = "";
+      haze = allowed && key ? "hold" : "cover";
+    }
     if (haze === "hold" && !started && visible) start();
     prepare(next);
     publish();
   }
   /** A loop's first frame is decoded. */
   function arrive(source) {
-    if (disposed || !source || source !== url || ready) return;
+    if (disposed || !visible || !source || source !== url || ready) return;
     ready = true;
     light("video");
     publish();
   }
-  /** A loop could not be loaded: the cover is the picture, and a loop
-      warmed for nothing is not loaded again for this preload. */
+  /** A loop could not be loaded. The record's own means the cover from now
+      on; a held one gives way to the cover it covered; and one warmed for
+      nothing is not loaded again for this preload. */
   function fail(source) {
     if (disposed || !source) return;
     if (source === warm) warm = "";
     if (source === url) none();
+    if (haze === "hold" && source === shown.loop) shown = { ...shown, loop: "", swap: false };
+    publish();
+  }
+  /** The cover/Canvas choice, for a record whose loop is on offer. */
+  function swap() {
+    if (disposed || haze === "hold" || !(url && ready)) return;
+    preferCover = !preferCover;
     publish();
   }
   function dispose() {
@@ -233,5 +277,5 @@ export function createCanvasOwner({ lookups, decoded, changed, clock = realClock
     aheadTicket++;
     stop();
   }
-  return { update, arrive, fail, dispose };
+  return { update, arrive, fail, swap, dispose };
 }

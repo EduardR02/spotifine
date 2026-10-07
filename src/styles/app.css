@@ -1964,24 +1964,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .tl-row.current .eq { display: flex; }
 .tl-row.current:hover .eq { display: none; }
 
-/* VU meter: 4 bars animating scaleY only, so each one is a compositor
-   animation and the main thread does nothing at all while they run. Their
-   keyframes are baked at 60 a second (lib/vu-meter.js, with each bar's
-   name, duration and delay), held by step-end, so the compositor draws the
-   window 60 times a second for them rather than at the display's rate.
-   Idle cost is protected by not running at all (see below) rather than by
-   running badly. */
+/* The decorative meter's curves share a visible-only nominal 60 Hz clock
+   (lib/vu-meter.js), not perpetual compositor animations at display refresh. */
 .eq { align-items: flex-end; gap: 2px; height: 13px; flex: none; }
 .eq i {
   width: 2px; height: 100%; flex: none; background: var(--accent); border-radius: 1px;
   transform-origin: bottom; transform: scaleY(0.3);
-  animation-timing-function: step-end;
-  animation-iteration-count: infinite;
-  /* Paused unless the app says otherwise: a paused track or an unfocused
-     window must cost zero commits. `.anim-paused` is set in App.svelte. */
-  animation-play-state: paused;
 }
-.app:not(.anim-paused) .eq i { animation-play-state: running; }
 @media (prefers-reduced-motion: reduce) {
   .eq i { transform: scaleY(0.7); }
 }

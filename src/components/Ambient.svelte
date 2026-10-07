@@ -4,6 +4,7 @@
   import { coverTone, toneSettled } from "../lib/covertone.svelte.js";
   import { haze, publishLight, frost, watchFrost, watchShift } from "../lib/ambient.svelte.js";
   import { rgbOf, parseFrost, RESTRAINED } from "../lib/haze.js";
+  import { frame } from "../lib/window-frame.svelte.js";
 
   /* =====================================================================
      THE HAZE — the layer
@@ -76,12 +77,14 @@
   );
   const trackKey = $derived(current?.id || current?.uri || "");
   const coverUrl = $derived(current?.cover_url ?? "");
-  const tone = $derived(coverTone(coverUrl, current?.album_id || current?.uri || ""));
-  const tint = $derived(rgbOf(tone.glow));
-  const toneFinal = $derived(toneSettled(coverUrl));
+  const tone = $derived(enabled && pageVisible ? coverTone(coverUrl, current?.album_id || current?.uri || "") : null);
+  const tint = $derived(rgbOf(tone?.glow ?? "#000000"));
+  const toneFinal = $derived(enabled && pageVisible && toneSettled(coverUrl));
 
   let enabled = $state(true);
-  let pageVisible = $state(!document.hidden);
+  let reducedMotion = $state(false);
+  let documentVisible = $state(!document.hidden);
+  const pageVisible = $derived(documentVisible && !frame.minimized);
   /** Bumped on every resize; the size itself is read when rendering. */
   let resized = $state(0);
   /** A Canvas whose frames cannot be read (served without CORS). */
@@ -92,18 +95,29 @@
 
   $effect(() => {
     const media = window.matchMedia("(prefers-reduced-transparency: reduce)");
+    const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const updateMotion = () => (reducedMotion = motion.matches);
     const update = () => (enabled = !media.matches);
-    const visibility = () => (pageVisible = !document.hidden);
+    const visibility = () => (documentVisible = !document.hidden);
     const resize = () => resized++;
     update();
+    updateMotion();
+    motion.addEventListener?.("change", updateMotion);
     media.addEventListener?.("change", update);
     document.addEventListener("visibilitychange", visibility);
     window.addEventListener("resize", resize);
     return () => {
       media.removeEventListener?.("change", update);
+      motion.removeEventListener?.("change", updateMotion);
       document.removeEventListener("visibilitychange", visibility);
       window.removeEventListener("resize", resize);
     };
+  });
+
+  $effect(() => {
+    if (reducedMotion) untrack(() => {
+      for (const entry of stack) entry.anim?.finish();
+    });
   });
 
   /** Counters, for the harness to read. Not state: nothing renders them. */
@@ -168,17 +182,19 @@
     el.style.zIndex = String(++z);
     el.style.visibility = "visible";
     const { ms, easing } = FADES[fade];
+    const duration = reducedMotion ? 0 : ms;
     const entry = {
       el,
-      anim: el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: ms, easing, fill: "forwards" }),
+      anim: el.animate([{ opacity: 0 }, { opacity: 1 }], { duration, easing, fill: "forwards" }),
       left: geo?.left ?? null,
       covered: coversPanel(geo),
     };
     slide(entry, dragEdge);
     stack.push(entry);
-    if (stats) stats.fades.push({ fade, ms, at: Math.round(performance.now()), key: asked?.key });
+    if (stats) stats.fades.push({ fade, ms: duration, at: Math.round(performance.now()), key: asked?.key });
     entry.anim.finished.then(
       () => {
+        if (!stack.includes(entry)) return;
         el.style.opacity = "1";
         entry.anim.cancel();
         entry.anim = null;
@@ -278,6 +294,8 @@
     w.postMessage({ type: "init", cpu: CPU_ONLY });
     worker = w;
     return () => {
+      seq++;
+      w.onmessage = null;
       w.terminate();
       worker = null;
       stopPass();
@@ -286,6 +304,7 @@
       queued?.bitmap.close();
       queued?.frosted?.close();
       queued = null;
+      for (const entry of stack) retire(entry);
       stack = [];
       asked = held = null;
       lit = false;
@@ -342,39 +361,67 @@
       with the record's own two colours, so the haze never holds the last
       record's light. `for` is the cover URL it answers. */
   let still = $state.raw(null);
+  let failedCover = $state(null);
+  const hasCurrent = $derived(Boolean(current));
+
+  function keepStill(bitmap, key, url) {
+    still?.bitmap.close();
+    still = { key, for: url, bitmap };
+  }
+
   $effect(() => {
+    if (!enabled || !pageVisible || !hasCurrent) return;
     const url = coverUrl;
-    const colours = [tone.tileA, tone.tileB];
-    if (!current) return;
+    if (!url) return;
+    if (untrack(() => still?.for === url && still?.key === url)) return;
+    if (untrack(() => failedCover === url)) return;
+    untrack(() => (failedCover = null));
     let cancelled = false;
-    const settle = (bitmap, key) => {
-      if (cancelled) return bitmap?.close();
-      /* The worker gets copies; this one is only kept to hand over again,
-         so the one it replaces can go now rather than at some GC. */
-      still?.bitmap.close();
-      still = { key, for: url, bitmap };
-    };
-    const fallback = () => {
-      if (cancelled) return;
-      const c = Object.assign(document.createElement("canvas"), { width: 16, height: 16 });
-      const g = c.getContext("2d");
-      const ramp = g.createLinearGradient(0, 0, 16, 16);
-      ramp.addColorStop(0, colours[0]);
-      ramp.addColorStop(1, colours[1]);
-      g.fillStyle = ramp;
-      g.fillRect(0, 0, 16, 16);
-      createImageBitmap(c).then((b) => settle(b, `tile:${colours.join(":")}`));
-    };
-    if (!url) {
-      fallback();
-      return () => (cancelled = true);
-    }
     const img = new Image();
     img.crossOrigin = "anonymous";
-    img.onload = () => createImageBitmap(img).then((b) => settle(b, url), fallback);
+    img.decoding = "async";
+    const fallback = () => {
+      if (!cancelled) failedCover = url;
+    };
+    img.onload = () => createImageBitmap(img).then((bitmap) => {
+      if (cancelled) bitmap.close();
+      else keepStill(bitmap, url, url);
+    }, fallback);
     img.onerror = fallback;
     img.src = imageUrl(url);
+    return () => {
+      cancelled = true;
+      img.onload = img.onerror = null;
+      img.removeAttribute("src");
+    };
+  });
+
+  /* Only generated/error artwork depends on the palette. A successful cover
+     is decoded once, not again when its extracted hue arrives. */
+  $effect(() => {
+    if (!enabled || !pageVisible || !hasCurrent) return;
+    const url = coverUrl;
+    if (url && failedCover !== url) return;
+    const colours = [tone.tileA, tone.tileB];
+    const key = `tile:${colours.join(":")}`;
+    if (untrack(() => still?.for === url && still?.key === key)) return;
+    let cancelled = false;
+    const c = Object.assign(document.createElement("canvas"), { width: 16, height: 16 });
+    const g = c.getContext("2d");
+    const ramp = g.createLinearGradient(0, 0, 16, 16);
+    ramp.addColorStop(0, colours[0]);
+    ramp.addColorStop(1, colours[1]);
+    g.fillStyle = ramp;
+    g.fillRect(0, 0, 16, 16);
+    createImageBitmap(c).then((bitmap) => {
+      if (cancelled) bitmap.close();
+      else keepStill(bitmap, key, url);
+    }).catch(() => {});
     return () => (cancelled = true);
+  });
+  $effect(() => () => {
+    still?.bitmap.close();
+    still = null;
   });
 
   /** The Canvas while the panel shows it, the haze is lit from it, and its
@@ -383,8 +430,10 @@
   /** The panel shows a Canvas this haze is not drawn from — one whose
       frames cannot be read, or one that arrived after the record's light
       was taken from the cover: its brightness is unknown, and nothing
-      measured on the haze speaks for it. */
-  const foreign = $derived(ui.immersive && !video);
+      measured on the haze speaks for it. Not while the panel holds the
+      last record's picture (haze.awaiting): the light measured on it,
+      under this haze, still stands. */
+  const foreign = $derived(ui.immersive && !video && !haze.awaiting);
   /** The type's light as last measured on the picture shown. */
   let lastLight = null;
   function measured(light) {
@@ -502,6 +551,8 @@
   }
 
   async function render(want, geo, tintKey, fade) {
+    const owner = worker;
+    if (!owner) return;
     const id = ++seq;
     asked = { ...want, geo, tintKey };
     const message = {
@@ -540,13 +591,19 @@
       } else {
         /* A bitmap can only be transferred once: the worker gets a copy. */
         const copy = await createImageBitmap(want.bitmap).catch(() => null);
-        if (id !== seq) return copy?.close();
+        if (id !== seq || worker !== owner) return copy?.close();
+        if (!pageVisible) {
+          copy?.close();
+          asked = null;
+          return;
+        }
         message.source = copy;
         if (copy) transfer.push(copy);
       }
       held = want.key;
     }
-    post(message, transfer);
+    owner.postMessage(message, transfer);
+    if (stats) stats.posts++;
   }
 
   /* ---- The first loop ------------------------------------------------------ */
@@ -571,10 +628,10 @@
     if (!p || p.timer || p.vfc || p.el.paused || !pageVisible) return;
     p.timer = setTimeout(() => {
       p.timer = 0;
-      if (pass !== p || p.el.paused) return;
+      if (pass !== p || p.el.paused || !pageVisible) return;
       p.vfc = p.el.requestVideoFrameCallback(() => {
         p.vfc = 0;
-        if (pass !== p || !worker) return;
+        if (pass !== p || !worker || !pageVisible) return;
         let frame;
         try {
           frame = new VideoFrame(p.el);

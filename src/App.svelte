@@ -32,8 +32,8 @@
   import { startPanelDrag } from "./lib/panel-drag.js";
   import { spaceControlsPlayback } from "./lib/playback-shortcuts.js";
   import { devicesEnabled } from "./lib/personal.svelte.js";
-  import { vuMeterStyle } from "./lib/vu-meter.js";
-  import { os } from "./lib/window-frame.svelte.js";
+  import { setMeterActivity } from "./lib/vu-meter.js";
+  import { os, frame, watchFrame } from "./lib/window-frame.svelte.js";
   import LibraryView from "./views/LibraryView.svelte";
   import MadeForYouView from "./views/MadeForYouView.svelte";
   import LikedSongsView from "./views/LikedSongsView.svelte";
@@ -60,6 +60,8 @@
 
   // The stylesheet's hook for the window frame (see window-frame.svelte.js).
   document.documentElement.dataset.os = os;
+
+  $effect(() => watchFrame());
 
   let trackEditor = null;
   const loadTrackEditor = () => (trackEditor ??= import("./views/TrackEditorView.svelte"));
@@ -179,6 +181,7 @@
 
   /** The keyboard's way: a step per arrow, Home for automatic. */
   function nudgePanel(event) {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
     const step = { ArrowLeft: 16, ArrowRight: -16 }[event.key];
     if (event.key === "Home") {
       event.preventDefault();
@@ -368,21 +371,26 @@
     untrack(() => maybeBackfillLazyQueue().catch(() => {}));
   });
 
-  /* Whether decorative animation is allowed to run at all. A background window
-     redrawing a VU meter is pure waste, and this app exists because the real
-     client burns CPU at idle — so gate it on focus as well as on playback.
-     A class beats a JS ticker: the compositor stops on its own and nothing
-     re-enters the main thread. */
+  /* The decorative meter's one shared clock follows playback and actual
+     window visibility, not the WebView's sometimes-stale focus alone. */
+  let pageVisible = $state(!document.hidden);
   $effect(() => {
     ui.windowFocused = document.hasFocus();
     const on = () => (ui.windowFocused = true);
     const off = () => (ui.windowFocused = false);
+    const visibility = () => (pageVisible = !document.hidden);
     window.addEventListener("focus", on);
     window.addEventListener("blur", off);
+    document.addEventListener("visibilitychange", visibility);
     return () => {
       window.removeEventListener("focus", on);
       window.removeEventListener("blur", off);
+      document.removeEventListener("visibilitychange", visibility);
     };
+  });
+  $effect(() => {
+    setMeterActivity(playback.playing && ui.windowFocused && pageVisible && !frame.minimized);
+    return () => setMeterActivity(false);
   });
 
   /* The same signal paces a Spotify device: the shell reads one regularly only
@@ -391,8 +399,9 @@
      when devices are turned back on. With devices off nothing listens. */
   $effect(() => {
     if (!devicesEnabled()) return;
-    const visibility = () => api.setWindowVisible(!document.hidden).catch(() => {});
-    const focus = () => api.setWindowVisible(true, true).catch(() => {});
+    const minimized = frame.minimized;
+    const visibility = () => api.setWindowVisible(!document.hidden && !minimized).catch(() => {});
+    const focus = () => api.setWindowVisible(!document.hidden && !minimized, true).catch(() => {});
     visibility();
     window.addEventListener("focus", focus);
     document.addEventListener("visibilitychange", visibility);
@@ -505,11 +514,6 @@
   });
 </script>
 
-<svelte:head>
-  <!-- The VU meter's keyframes, baked at 60 a second (lib/vu-meter.js). -->
-  {@html `<style>${vuMeterStyle()}</style>`}
-</svelte:head>
-
 <IconSprite />
 <Ambient />
 
@@ -517,7 +521,6 @@
      press on the grid itself, never on a pane, counts. -->
 <div
   class="app"
-  class:anim-paused={!playback.playing || !ui.windowFocused}
   class:has-panel={nowPlayingShown()}
   style:--np-w="{shownWidth}px"
   data-tauri-drag-region
@@ -586,8 +589,8 @@
     </div>
   </main>
 
+  <NowPlayingPanel open={nowPlayingShown()} />
   {#if nowPlayingShown()}
-    <NowPlayingPanel />
     <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions (a focusable separator is the window-splitter pattern) -->
     <div
       class="np-resize"

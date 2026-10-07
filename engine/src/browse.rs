@@ -349,28 +349,20 @@ fn any_file_on_disk(files: impl IntoIterator<Item = FileId>, cache: &Cache) -> b
     })
 }
 
-/// What a track's audio is made of, for every track parsed this session.
+/// Audio file ids learned from metadata or playback during this session.
 ///
-/// A download mark is derived from a track's FILE ids, and those exist only on
-/// the metadata payload. They are not on `TrackRef` and not in the on-disk
-/// track cache — both of those persist what the UI needs, not what the audio
-/// layer needs — so once a payload has been parsed the ids are gone, and
-/// answering "is this cached?" anywhere else costs a metadata fetch. That is
-/// the reason the mark could only ever be a snapshot taken while browsing, and
-/// why playing a song did not light it up until the next browse.
+/// `TrackRef` and persisted queues carry UI metadata, not file ids. Retaining
+/// metadata formats and playback's actual selected file lets restored queues,
+/// substitute recordings and later cache commits use pure filesystem probes,
+/// without fetching Spotify metadata just to update a badge.
 ///
-/// Keeping the ids makes every later answer pure filesystem. The map is cheap:
-/// an id string and a handful of 20-byte file ids per track, so ten thousand
-/// tracks sit comfortably under a megabyte. It is memory-only on purpose — a
-/// file id outliving the metadata it came from would send us looking for the
-/// wrong file, and a browse refills it for free. Growth is bounded anyway
-/// ([`FILE_IDS_CAPACITY`]): overwriting a known track is refresh-only, so a
-/// long session ages out its stalest parse instead of growing without limit.
+/// The index is memory-only and bounded by [`FILE_IDS_CAPACITY`]. Both metadata
+/// parses and playback events refresh an entry's age; fresh ids age out the
+/// stalest entries instead of growing a long session without limit.
 static FILE_IDS: LazyLock<RwLock<HashMap<String, TrackFiles>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 /// The id index is process-lifetime state with no explicit retirement, so its
-/// worst case is declared here rather than trusted: one entry per distinct
-/// track id parsed this session, refreshed whenever that payload reparses.
+/// worst case is declared here rather than trusted.
 const FILE_IDS_CAPACITY: usize = 10_000;
 
 /// Canvas answers are intentionally process-memory only. A panel opening can
@@ -473,7 +465,7 @@ fn evict_oldest_for_fresh_key<K, V>(
 }
 
 struct TrackFiles {
-    /// When the payload behind these ids was parsed. This is the stamp
+    /// When metadata or playback last supplied these ids. This is the stamp
     /// [`FILE_IDS`] ages entries by, not a freshness signal.
     fetched_at: Instant,
     files: Vec<FileId>,
@@ -487,12 +479,17 @@ fn remember_track_files(id: &str, track: &Track) {
     if id.is_empty() {
         return;
     }
-    let entry = TrackFiles {
+    let mut entry = TrackFiles {
         fetched_at: Instant::now(),
         files: track.files.values().copied().collect(),
         alternatives: track.alternatives.0.iter().map(id_of).collect(),
     };
     if let Ok(mut index) = FILE_IDS.write() {
+        if let Some(previous) = index.get(id) {
+            for file_id in &previous.files {
+                if !entry.files.contains(file_id) { entry.files.push(*file_id); }
+            }
+        }
         let key_is_absent = !index.contains_key(id);
         evict_oldest_for_fresh_key(
             &mut index,
@@ -504,6 +501,42 @@ fn remember_track_files(id: &str, track: &Track) {
         index.insert(id.to_owned(), entry);
     }
 }
+
+/// Remember playback's actual selected file, including substitute recordings
+/// and tracks restored without a metadata browse. Keep the other formats and
+/// alternatives so later filesystem probes still see every known source.
+pub fn remember_cached_file(id: &str, file_id: FileId) {
+    if id.is_empty() {
+        return;
+    }
+    if let Ok(mut index) = FILE_IDS.write() {
+        if let Some(entry) = index.get_mut(id) {
+            entry.fetched_at = Instant::now();
+            if !entry.files.contains(&file_id) {
+                entry.files.push(file_id);
+            }
+            return;
+        }
+        evict_oldest_for_fresh_key(
+            &mut index,
+            FILE_IDS_CAPACITY,
+            FILE_IDS_EVICTION_BATCH,
+            true,
+            |entry| entry.fetched_at,
+        );
+        index.insert(id.to_owned(), TrackFiles {
+            fetched_at: Instant::now(),
+            files: vec![file_id],
+            alternatives: Vec::new(),
+        });
+    }
+}
+
+pub fn cached_file_ids(id: &str) -> Vec<FileId> {
+    FILE_IDS.read().ok().and_then(|index| index.get(id).map(|entry| entry.files.clone()))
+        .unwrap_or_default()
+}
+
 
 /// One level of alternative-chasing, and one only: substitutes do not chain in
 /// practice, and an unbounded walk over attacker-shaped data is not worth the
@@ -548,6 +581,13 @@ pub fn cached_track_ids(ids: &[String], cache: Option<&Cache>) -> Vec<String> {
         .cloned()
         .collect()
 }
+
+/// Known mappings with no remaining file; an unknown mapping proves nothing.
+pub fn missing_cached_track_ids(ids: &[String], cache: &Cache) -> Vec<String> {
+    let Ok(index) = FILE_IDS.read() else { return Vec::new(); };
+    ids.iter().filter(|id| resolve_cached(id, &index, cache, true) == Some(false)).cloned().collect()
+}
+
 
 /// Resolved playlist track lists, keyed by the playlist's revision.
 ///
@@ -2148,9 +2188,8 @@ fn rootlist_nodes(contents: &serde_json::Value) -> Result<Vec<LibraryNode>, Stri
     let mut nodes = Vec::with_capacity(items.len());
     let mut folders: Vec<(String, String, Vec<LibraryNode>)> = Vec::new();
     for (item, meta) in items.iter().zip(metas) {
-        let Some(uri) = item.get("uri").and_then(|value| value.as_str()) else {
-            continue;
-        };
+        let uri = item.get("uri").and_then(|value| value.as_str()).filter(|uri| !uri.is_empty())
+            .ok_or("rootlist item did not contain a URI")?;
         let raw_item = RootlistItemJson { uri: Some(uri.to_owned()) };
         let raw_meta = RootlistMetaItemJson::deserialize(meta)
             .map_err(|error| format!("invalid rootlist item metadata: {error}"))?;
@@ -2180,7 +2219,15 @@ fn rootlist_nodes(contents: &serde_json::Value) -> Result<Vec<LibraryNode>, Stri
             let contents = item.get("contents")
                 .or_else(|| item.get("folder").and_then(|folder| folder.get("contents")));
             let children = match contents {
-                Some(contents) => rootlist_nodes(contents)?,
+                Some(contents) => {
+                    if contents.get("truncated").and_then(|value| value.as_bool()) == Some(true)
+                        || raw_meta.length.is_some_and(|length| contents.get("items").and_then(|items| items.as_array())
+                            .is_none_or(|items| usize::try_from(length).ok() != Some(items.len())))
+                    {
+                        return Err(format!("folder {uri} has incomplete child data"));
+                    }
+                    rootlist_nodes(contents)?
+                }
                 None if raw_meta.length == Some(0) => Vec::new(),
                 None => return Err(format!(
                     "folder {uri} has no child data in this rootlist response"
@@ -2191,6 +2238,8 @@ fn rootlist_nodes(contents: &serde_json::Value) -> Result<Vec<LibraryNode>, Stri
                 name: raw_meta.attributes.and_then(|attributes| attributes.name).unwrap_or_default(),
                 children,
             }
+        } else if uri.starts_with("spotify:playlist:") || uri.contains(":playlist:") {
+            return Err(format!("rootlist contains an invalid playlist URI: {uri}"));
         } else {
             continue;
         };
@@ -2206,6 +2255,80 @@ fn rootlist_nodes(contents: &serde_json::Value) -> Result<Vec<LibraryNode>, Stri
     Ok(nodes)
 }
 
+#[derive(Deserialize)]
+struct RootlistPage {
+    revision: String,
+    length: usize,
+    contents: RootlistPageContents,
+}
+
+#[derive(Deserialize)]
+struct RootlistPageContents {
+    #[serde(default)]
+    pos: usize,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
+    items: Vec<serde_json::Value>,
+    #[serde(default, rename = "metaItems")]
+    meta_items: Vec<serde_json::Value>,
+}
+
+#[derive(Default)]
+struct RootlistSnapshot {
+    revision: Option<Vec<u8>>,
+    length: usize,
+    items: Vec<serde_json::Value>,
+    meta_items: Vec<serde_json::Value>,
+}
+
+impl RootlistSnapshot {
+    fn append(&mut self, payload: &[u8]) -> Result<bool, String> {
+        let page: RootlistPage = serde_json::from_slice(payload)
+            .map_err(|error| format!("unparseable rootlist page: {error}"))?;
+        let revision = base64::engine::general_purpose::STANDARD.decode(&page.revision)
+            .map_err(|error| format!("invalid rootlist revision: {error}"))?;
+        if revision.is_empty() {
+            return Err("rootlist page has no revision".to_owned());
+        }
+        if let Some(previous) = &self.revision {
+            if previous != &revision || self.length != page.length {
+                return Err("rootlist changed while reading its pages".to_owned());
+            }
+        }
+        if page.contents.pos != self.items.len() {
+            return Err("rootlist page position does not match its requested offset".to_owned());
+        }
+        if page.contents.items.len() != page.contents.meta_items.len() {
+            return Err("rootlist items and metadata have different lengths".to_owned());
+        }
+        if page.contents.items.iter().any(|item| item.get("uri").and_then(|uri| uri.as_str()).is_none_or(str::is_empty)) {
+            return Err("rootlist page contains an item without a URI".to_owned());
+        }
+        let next = self.items.len().checked_add(page.contents.items.len())
+            .ok_or("rootlist page size overflow")?;
+        if next > page.length || next < page.length && page.contents.items.is_empty() {
+            return Err("rootlist page ended before the declared rootlist length".to_owned());
+        }
+        if next == page.length && page.contents.truncated {
+            return Err("rootlist page remains truncated at its declared end".to_owned());
+        }
+        self.revision = Some(revision);
+        self.length = page.length;
+        self.items.extend(page.contents.items);
+        self.meta_items.extend(page.contents.meta_items);
+        Ok(next == self.length)
+    }
+
+    fn into_nodes(self) -> Result<Vec<LibraryNode>, String> {
+        if self.revision.is_none() || self.items.len() != self.length {
+            return Err("rootlist snapshot is incomplete".to_owned());
+        }
+        rootlist_nodes(&serde_json::json!({ "items": self.items, "metaItems": self.meta_items }))
+    }
+}
+
+#[cfg(test)]
 fn parse_rootlist_tree(payload: &[u8]) -> Result<Vec<LibraryNode>, String> {
     let value: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|error| format!("unparseable rootlist response: {error}"))?;
@@ -2229,13 +2352,18 @@ pub async fn playlist_tree_browse(
     length: usize,
 ) -> Result<Vec<LibraryNode>, String> {
     let length = length.clamp(1, MAX_PLAYLISTS);
-    let endpoint = format!(
-        "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from=0&length={length}",
-        user = session.username(),
-    );
-    let body = spclient_read(|| async { session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await }).await
-        .map_err(|error| format!("rootlist request failed: GET {endpoint}: {error}"))?;
-    let nodes = parse_rootlist_tree(&body)?;
+    let mut snapshot = RootlistSnapshot::default();
+    loop {
+        let endpoint = format!(
+            "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from={offset}&length={length}",
+            user = session.username(),
+            offset = snapshot.items.len(),
+        );
+        let body = spclient_read(|| async { session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await }).await
+            .map_err(|error| format!("rootlist request failed: GET {endpoint}: {error}"))?;
+        if snapshot.append(&body)? { break; }
+    }
+    let nodes = snapshot.into_nodes()?;
     fn remember_nodes(user: &str, nodes: &[LibraryNode]) {
         for node in nodes {
             match node {
@@ -6630,6 +6758,71 @@ mod tests {
         assert!(parse_rootlist_tree(malformed).is_err());
     }
 
+    fn rootlist_page(revision: &str, total: usize, offset: usize, uris: &[String]) -> Vec<u8> {
+        let items: Vec<_> = uris.iter().map(|uri| serde_json::json!({"uri": uri})).collect();
+        let metas: Vec<_> = uris.iter().map(|uri| serde_json::json!({"attributes":{"name": uri}})).collect();
+        serde_json::to_vec(&serde_json::json!({
+            "revision": revision, "length": total,
+            "contents": {"pos": offset, "truncated": offset + uris.len() < total, "items": items, "metaItems": metas}
+        })).unwrap()
+    }
+
+    #[test]
+    fn paginated_rootlist_keeps_the_1001st_playlist_and_folders_crossing_pages() {
+        let uris: Vec<_> = (0..1001).map(|id| format!("spotify:playlist:{id:022}")).collect();
+        let mut snapshot = RootlistSnapshot::default();
+        assert!(!snapshot.append(&rootlist_page("AAEC", uris.len(), 0, &uris[..1000])).unwrap());
+        assert!(snapshot.append(&rootlist_page("AAEC", uris.len(), 1000, &uris[1000..])).unwrap());
+        let mut playlists = Vec::new();
+        flatten_library_nodes(snapshot.into_nodes().unwrap(), &mut playlists);
+        assert_eq!(playlists.len(), 1001);
+        assert_eq!(playlists[1000].uri, uris[1000]);
+
+        let groups = vec![
+            "spotify:start-group:outer:Outer".to_owned(),
+            uris[0].clone(),
+            "spotify:start-group:inner:Inner".to_owned(),
+            uris[1000].clone(),
+            "spotify:end-group:inner".to_owned(),
+            "spotify:end-group:outer".to_owned(),
+        ];
+        let mut snapshot = RootlistSnapshot::default();
+        assert!(!snapshot.append(&rootlist_page("AAEC", groups.len(), 0, &groups[..3])).unwrap());
+        assert!(snapshot.append(&rootlist_page("AAEC", groups.len(), 3, &groups[3..])).unwrap());
+        let nodes = snapshot.into_nodes().unwrap();
+        assert!(matches!(&nodes[0], LibraryNode::Folder { id, children, .. } if id == "outer" && children.len() == 2));
+        let mut playlists = Vec::new();
+        flatten_library_nodes(nodes, &mut playlists);
+        assert_eq!(playlists.iter().map(|playlist| playlist.uri.as_str()).collect::<Vec<_>>(), [uris[0].as_str(), uris[1000].as_str()]);
+    }
+
+    #[test]
+    fn rootlist_pages_reject_changed_revisions_offsets_lengths_and_missing_tail() {
+        let uris = vec!["spotify:playlist:0123456789ABCDEFGHIJKL".to_owned()];
+        for next in [
+            rootlist_page("AAED", 2, 1, &uris),
+            rootlist_page("AAEC", 3, 1, &uris),
+            rootlist_page("AAEC", 2, 0, &uris),
+            rootlist_page("AAEC", 2, 1, &[]),
+        ] {
+            let mut snapshot = RootlistSnapshot::default();
+            assert!(!snapshot.append(&rootlist_page("AAEC", 2, 0, &uris)).unwrap());
+            assert!(snapshot.append(&next).is_err());
+        }
+        let mut incomplete = RootlistSnapshot::default();
+        incomplete.append(&rootlist_page("AAEC", 2, 0, &uris)).unwrap();
+        assert!(incomplete.into_nodes().is_err());
+        let mut empty = RootlistSnapshot::default();
+        assert!(empty.append(&rootlist_page("AAEC", 0, 0, &[])).unwrap());
+        assert!(empty.into_nodes().unwrap().is_empty());
+        let mut malformed: serde_json::Value = serde_json::from_slice(&rootlist_page("AAEC", 1, 0, &uris)).unwrap();
+        malformed["contents"]["metaItems"] = serde_json::json!([]);
+        assert!(RootlistSnapshot::default().append(&serde_json::to_vec(&malformed).unwrap()).is_err());
+        malformed["contents"]["metaItems"] = serde_json::json!([{}]);
+        malformed["contents"]["truncated"] = serde_json::json!(true);
+        assert!(RootlistSnapshot::default().append(&serde_json::to_vec(&malformed).unwrap()).is_err());
+    }
+
     /// The Canvas write is the official app's, byte for byte: an
     /// `UpdateSettingRequest` naming the product-state key, with the new value
     /// as `SettingValue.string_value` (field 4). Turning Canvas on writes "0"
@@ -9397,6 +9590,50 @@ mod file_index_tests {
             vec!["1indexCCCCCCCCCCCCCCCC".to_owned()],
             "the substitute must be recorded, or the track reads as uncached forever"
         );
+    }
+
+    #[test]
+    fn playback_file_mapping_preserves_formats_and_alternatives_without_duplicates() {
+        use librespot_metadata::audio::file::AudioFileFormat;
+        let id = "2indexAAAAAAAAAAAAAAAA";
+        let alternative = "2indexBBBBBBBBBBBBBBBB";
+        let original = FileId::from_raw(&[0xa1; 20]);
+        let selected = FileId::from_raw(&[0xa2; 20]);
+        let mut track = tests::test_track(
+            id, "Region replaced", 1000,
+            tests::test_album("2indexCCCCCCCCCCCCCCCC", "Album", Vec::new(), Default::default()),
+            Vec::new(),
+        );
+        track.files.insert(AudioFileFormat::OGG_VORBIS_96, original);
+        track.alternatives = Tracks(vec![uri(alternative)]);
+        remember_track_files(id, &track);
+        remember_cached_file(id, selected);
+        remember_cached_file(id, selected);
+        remember_cached_file(id, original);
+
+        let index = FILE_IDS.read().unwrap();
+        let entry = index.get(id).unwrap();
+        assert_eq!(entry.files, vec![original, selected]);
+        assert_eq!(entry.alternatives, vec![alternative.to_owned()]);
+    }
+
+    #[test]
+    fn metadata_refresh_keeps_a_played_regional_file_available_for_cache_probes() {
+        let id = "3indexAAAAAAAAAAAAAAAA";
+        let selected = FileId::from_raw(&[0xa3; 20]);
+        let track = tests::test_track(
+            id, "Region replaced", 1000,
+            tests::test_album("3indexBBBBBBBBBBBBBBBB", "Album", Vec::new(), Default::default()),
+            Vec::new(),
+        );
+        let root = scratch();
+        let cache = Cache::new(None::<PathBuf>, None::<PathBuf>, Some(root.clone()), None).unwrap();
+        cache.save_file(selected, &mut std::io::Cursor::new(b"complete regional file")).unwrap();
+        remember_cached_file(id, selected);
+        remember_track_files(id, &track);
+        assert_eq!(cached_track_ids(&[id.to_owned()], Some(&cache)), vec![id.to_owned()]);
+        assert!(missing_cached_track_ids(&[id.to_owned()], &cache).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,36 +1,149 @@
-import { expect, test } from "bun:test";
-import { BARS, curveAt, vuMeterStyle } from "./vu-meter.js";
+import { expect, spyOn, test } from "bun:test";
+import { createMeterTicker } from "./vu-meter.js";
 
-const TICK = 1000 / 60;
+function clock() {
+  let now = 0;
+  let id = 0;
+  const jobs = new Map();
+  return {
+    now: () => now,
+    repeat: (fn) => (jobs.set(++id, fn), id),
+    cancel: (job) => jobs.delete(job),
+    advance(ms) {
+      now += ms;
+      for (const fn of jobs.values()) fn();
+    },
+    get pending() { return jobs.size; },
+  };
+}
+function meter() {
+  const bars = Array.from({ length: 4 }, () => ({ style: { transform: "" } }));
+  return { bars, picture: () => bars.map((bar) => bar.style.transform) };
+}
 
-test("every bar ticks on the same 60 Hz grid, in whole microseconds", () => {
-  for (const [ms, delay] of BARS) {
-    // 50 ms is three ticks and a whole number of microseconds.
-    expect(Math.abs(ms % 50)).toBe(0);
-    expect(Math.abs(delay % 50)).toBe(0);
-  }
-  const css = vuMeterStyle();
-  BARS.forEach(([ms], i) => {
-    const frames = css.match(new RegExp(`@keyframes vu-${i + 1}\\{(.*?)\\}\\}`))[1];
-    const offsets = [...frames.matchAll(/([\d.]+)%\{/g)].map((m) => Number(m[1]) / 100);
-    expect(offsets.length).toBe(Math.round(ms / TICK) + 1);
-    for (const o of offsets) {
-      const ticks = (o * ms) / TICK;
-      expect(Math.abs(ticks - Math.round(ticks))).toBeLessThan(1e-3);
-    }
+test("hidden meters do no work and all visible meters share one clock", () => {
+  const time = clock();
+  const ticker = createMeterTicker(time);
+  const a = meter(), b = meter();
+  const first = ticker.add(a.bars), second = ticker.add(b.bars);
+  ticker.running(true);
+  time.advance(200);
+  expect(time.pending).toBe(0);
+  expect(a.picture()).toEqual(["", "", "", ""]);
+  ticker.visible(first, true);
+  ticker.visible(second, true);
+  expect(time.pending).toBe(1);
+  expect(a.picture()).toEqual(b.picture());
+  const hidden = a.picture();
+  ticker.visible(first, false);
+  time.advance(300);
+  expect(a.picture()).toEqual(hidden);
+  expect(b.picture()).not.toEqual(hidden);
+  ticker.visible(second, false);
+  expect(time.pending).toBe(0);
+});
+
+test("pause freezes the picture and resume continues without replaying hidden time", () => {
+  const time = clock();
+  const ticker = createMeterTicker(time);
+  const a = meter();
+  const first = ticker.add(a.bars);
+  ticker.visible(first, true);
+  expect(time.pending).toBe(0);
+  ticker.running(true);
+  time.advance(200);
+  ticker.running(false);
+  const paused = a.picture();
+  time.advance(5000);
+  expect(time.pending).toBe(0);
+  expect(a.picture()).toEqual(paused);
+  ticker.running(true);
+  expect(a.picture()).toEqual(paused);
+  time.advance(300);
+  expect(a.picture()).not.toEqual(paused);
+  ticker.running(false);
+  expect(time.pending).toBe(0);
+});
+
+test("removing the last visible meter cancels work and a later mount may animate", () => {
+  const time = clock();
+  const ticker = createMeterTicker(time);
+  const a = meter(), b = meter();
+  const first = ticker.add(a.bars);
+  ticker.running(true);
+  ticker.visible(first, true);
+  ticker.remove(first);
+  const removed = a.picture();
+  time.advance(2000);
+  expect(time.pending).toBe(0);
+  expect(a.picture()).toEqual(removed);
+  const second = ticker.add(b.bars);
+  ticker.visible(second, true);
+  expect(time.pending).toBe(1);
+  const mounted = b.picture();
+  time.advance(200);
+  expect(b.picture()).not.toEqual(mounted);
+  expect(a.picture()).toEqual(removed);
+  ticker.remove(second);
+  expect(time.pending).toBe(0);
+});
+
+test("a delayed real clock skips catch-up work and cancellation cannot restart it", () => {
+  let now = 0;
+  let id = 0;
+  const jobs = new Map();
+  const currentTime = spyOn(performance, "now").mockImplementation(() => now);
+  const schedule = spyOn(globalThis, "setTimeout").mockImplementation((fn, delay) => {
+    jobs.set(++id, { fn, delay });
+    return id;
   });
-});
+  const cancel = spyOn(globalThis, "clearTimeout").mockImplementation((job) => jobs.delete(job));
+  const ticker = createMeterTicker();
+  const a = meter(), b = meter();
+  const first = ticker.add(a.bars), second = ticker.add(b.bars);
+  try {
+    ticker.running(true);
+    ticker.visible(first, true);
+    ticker.visible(second, true);
+    const initial = a.picture();
+    expect(jobs.size).toBe(1);
+    const late = jobs.values().next().value;
+    jobs.clear();
+    now = 1000;
+    late.fn();
+    expect(jobs.size).toBe(1);
+    expect(a.picture()).not.toEqual(initial);
+    expect(a.picture()).toEqual(b.picture());
+    const pending = jobs.values().next().value;
+    expect(pending.delay).toBeGreaterThan(0);
+    expect(Number.isInteger(pending.delay)).toBe(true);
 
-test("the baked curve is the eased shape, through its points", () => {
-  for (const [f, v] of [[0, 0.28], [0.2, 0.9], [0.35, 0.45], [0.5, 1], [0.65, 0.38], [0.8, 0.72], [1, 0.28]]) {
-    expect(curveAt(f)).toBeCloseTo(v, 6);
+    ticker.running(false);
+    const paused = a.picture();
+    expect(jobs.size).toBe(0);
+    now += 5000;
+    pending.fn();
+    expect(jobs.size).toBe(0);
+    expect(a.picture()).toEqual(paused);
+    expect(b.picture()).toEqual(paused);
+
+    ticker.running(true);
+    expect(jobs.size).toBe(1);
+    expect(a.picture()).toEqual(paused);
+    const resumed = jobs.values().next().value;
+    jobs.clear();
+    now += resumed.delay;
+    resumed.fn();
+    expect(a.picture()).not.toEqual(paused);
+    expect(a.picture()).toEqual(b.picture());
+    ticker.remove(first);
+    expect(jobs.size).toBe(1);
+    ticker.remove(second);
+    expect(jobs.size).toBe(0);
+  } finally {
+    ticker.running(false);
+    cancel.mockRestore();
+    schedule.mockRestore();
+    currentTime.mockRestore();
   }
-  // Eased: a quarter of the way through a segment is well short of a quarter of it.
-  const quarter = (curveAt(0.05) - 0.28) / (0.9 - 0.28);
-  expect(quarter).toBeGreaterThan(0.08);
-  expect(quarter).toBeLessThan(0.2);
-});
-
-test("reduced motion names no animation at all", () => {
-  expect(vuMeterStyle().startsWith("@media (prefers-reduced-motion: no-preference){")).toBe(true);
 });

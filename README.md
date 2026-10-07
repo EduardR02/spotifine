@@ -86,6 +86,11 @@ Some extra things I added because we control playback here:
 
 Canvas, the short looping video some songs have, is an account setting on
 Spotify's side. Spotifine shows it whenever it's on for your account.
+The panel holds its previous picture while the next Canvas loads, including
+after closing and reopening it. With no previous picture, it waits for the
+video/artwork decision instead of flashing a temporary cover. Missing Canvas
+or a load timeout falls back to artwork. Videos pause in cover mode, with the
+panel closed, or while the window is hidden or unfocused.
 
 Drag the left edge of the now-playing panel to resize it. The width is
 remembered; double-click the edge to reset it. As the playlist narrows, album
@@ -154,9 +159,22 @@ bun tauri build
 
 The installer lands in `target/release/bundle/nsis/` on Windows, and the app in
 `target/release/bundle/macos/` on macOS. For development, build the playback
-engine once with `bun run build:engine`, then run `bun tauri dev`. The checks
-are `cargo test -p renderer-engine`, `cargo test -p spotifine`, `bun test` and
-`bun run build`.
+engine once with `bun run build:engine`, then run `bun tauri dev`.
+Run native tests serially: audio and cache epochs are process-global.
+
+```bash
+cargo test -p renderer-engine --lib --bin PlaybackEngine -- --test-threads=1
+cargo test -p librespot-audio -- --test-threads=1
+cargo test -p spotifine -- --test-threads=1
+```
+
+Frontend checks are `bun test` and `bun run build`. For an account-free engine
+smoke, build the normal executable with `cargo build -p renderer-engine --bin
+PlaybackEngine`, then launch it with `--state-dir` pointing to a new absolute
+temporary directory, never your app data. Its JSON-lines stdin accepts `status`
+and `clear_audio_cache` requests with a nonempty `request_id`; stdout reports
+the correlated responses. Verify cached audio is absent when a successful clear
+reply arrives, unrelated files survive, and closing stdin exits cleanly.
 
 Publishing a GitHub release runs the [release workflow](../../actions/workflows/release.yml),
 which builds, tests and signs both platforms and attaches the installers and
@@ -207,12 +225,27 @@ matching symbols for the executable being measured.
 
 ## How it works
 
-It has to be cheap to run while sitting open all day, so a few things follow
-from that. While nothing plays, it does nothing: the sound device is closed and
-no timers tick. The playhead is animated with a transform instead of a width,
-so it doesn't force layout on every tick. Long lists are virtualized. The glass
-doesn't re-blur the window as things move: the haze is rendered once per song
-on the GPU, and the panes show a pre-frosted copy of it.
+The playhead uses a transform instead of changing width on every tick. The haze
+is rendered on source or layout changes, and the panes show a pre-frosted copy
+instead of continuously re-blurring the window.
+
+The library rail, Home grid and discography track lists render a viewport window
+with a small buffer, retaining rows needed for focus and active interactions.
+Loaded collections and tracks remain available in memory: bounded rendering is
+not a cap on resident library data.
+
+Playing-row meters are decorative, not audio measurements. Visible meters share
+one nominal 60 Hz clock while playback runs in a focused, visible window. Timer
+delays can skip updates rather than trigger catch-up bursts. Pausing, hiding a
+meter or removing its row stops its updates; reduced motion keeps the bars static.
+The four bars reuse their DOM nodes and transform strings computed once at
+module load: updates select cached transforms, not regenerate graphics. Browser
+rendering and compositing still do work when those transforms change.
+
+On Windows, native minimize state pauses Canvas playback and decorative meters,
+even if the WebView still reports a focused, visible document. The same visibility
+gate defers new cover and haze work. Music continues while minimized; restoring
+the window lets its visual work resume.
 
 Two processes. `engine/` wraps [librespot](https://github.com/librespot-org/librespot)
 and handles everything to do with sound. The Tauri shell in `src-tauri/`
@@ -221,8 +254,20 @@ Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
 Recovery settles against the replacement engine's actual state before publishing
 playback, including a crash during reconnection. Playlist edits fence older
-pending reads, local library activity is written atomically, and download marks
-are invalidated when audio is evicted or the engine session changes.
+pending reads, and local library activity is written atomically. Library,
+playlist-detail and membership caches are scoped to the authenticated account:
+disconnecting retains that account's offline data without exposing it to another
+account. A one-time migration preserves older listening/activity data only when
+its recorded owner matches; unowned detail and membership caches are not imported.
+New download marks arrive when a complete song file is saved, or playback opens
+an existing cached file, without periodic polling or another Spotify request.
+Playback supplies the requested song and selected file IDs, including regional
+substitutes and restored queues that have not been browsed. Marks reflect files
+that still exist, and removals also clear marks on songs outside the current queue.
+Clearing audio stops its producers and fences pending downloads before deleting
+files; success is acknowledged only after deletion. It resets playback and
+download marks, but preserves credentials and the audio-cache layout marker.
+A deletion failure is reported as a failure, not a successful reset.
 
 The audio path has its own resampler. Spotify decodes at 44.1 kHz and most
 Windows devices run at 48 kHz, and librespot's stock conversion comes out about

@@ -395,24 +395,25 @@ function scheduleFrame() {
 function frame(now) {
   rafId = 0;
   if (!press?.active) return;
-  const dt = Math.min(48, now - lastFrame) / 1000;
+  const dt = Math.max(0, Math.min(48, now - lastFrame)) / 1000;
   lastFrame = now;
   const d = trackDrag;
   let scrolling = false;
 
   for (const el of scrollers) {
-    if (el.scrollHeight <= el.clientHeight) continue;
+    const maxScroll = el.scrollHeight - el.clientHeight;
+    if (maxScroll <= 0) continue;
     const r = el.getBoundingClientRect();
     if (pointerX < r.left || pointerX > r.right) continue;
     const fromTop = pointerY - r.top;
     const fromBottom = r.bottom - pointerY;
-    const before = el.scrollTop;
     if (fromTop >= 0 && fromTop < EDGE_BAND) {
       el.scrollTop -= MAX_SCROLL_SPEED * bandPenetration(fromTop) * dt;
+      scrolling ||= el.scrollTop > 0;
     } else if (fromBottom >= 0 && fromBottom < EDGE_BAND) {
       el.scrollTop += MAX_SCROLL_SPEED * bandPenetration(fromBottom) * dt;
+      scrolling ||= el.scrollTop < maxScroll;
     }
-    if (el.scrollTop !== before) scrolling = true;
   }
 
   if (press.kind === "library") {
@@ -426,7 +427,9 @@ function frame(now) {
   }
 
   positionGhost();
-  if (scrolling) scheduleFrame();
+  // Keep edge intent alive when the first elapsed slice rounds below one pixel.
+  // Continuing from the RAF timestamp also includes the full next frame interval.
+  if (scrolling) rafId = requestAnimationFrame(frame);
 }
 
 function endDrag(commit) {

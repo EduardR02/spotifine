@@ -584,8 +584,10 @@ mod song_only_cache_tests {
             let (complete_tx, complete_rx) = oneshot::channel();
             let completion = tokio::spawn(cache_completed_download(
                 id,
+                uri.clone(),
                 audio_cache(&self.session, uri),
                 complete_rx,
+                super::super::cache_epoch(),
             ));
             let (file_data_tx, _) = mpsc::unbounded_channel();
             (
@@ -649,7 +651,7 @@ mod song_only_cache_tests {
         assert_eq!(fs::read(fixture.cache_path(song_id)).unwrap(), b"abcdefghi");
         assert!(!fixture.cache_path(episode_id).exists());
 
-        let mut cached = AudioFile::open(&fixture.session, song_id, 1, &song_uri())
+        let mut cached = AudioFile::open(&fixture.session, song_id, 1, &song_uri(), super::super::cache_epoch())
             .await
             .expect("cached song opens without network");
         assert!(cached.is_cached());
@@ -673,7 +675,7 @@ mod song_only_cache_tests {
         assert!(receive(&mut episode, 0, b"new episode") == ControlFlow::Break);
         done.await.expect("episode completion");
         assert_eq!(fs::read(fixture.cache_path(id)).unwrap(), b"old episode");
-        let mut song = AudioFile::open(&fixture.session, id, 1, &song_uri())
+        let mut song = AudioFile::open(&fixture.session, id, 1, &song_uri(), super::super::cache_epoch())
             .await
             .expect("song cache remains enabled");
         let mut bytes = Vec::new();

@@ -6,7 +6,7 @@
 //! use its own Next button. Replacing a window can rebuffer: Spotify provides
 //! no atomic queue replacement or ordering guarantee across Player endpoints.
 //! The router keeps an occurrence cursor, never a second durable queue.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -175,6 +175,10 @@ struct Remote {
     published_order: Option<u64>,
     shown: Option<Shown>,
     polling: bool,
+    /// Only child disconnection is automatically recoverable; a moved or
+    /// restricted Spotify output still requires an explicit selection.
+    engine_recovery: bool,
+    recovery_ready: bool,
     pending: Option<Pending>,
     start_intent: Option<StartIntent>,
     failures: u32,
@@ -221,6 +225,8 @@ impl Remote {
             published_order: None,
             shown: None,
             polling: false,
+            engine_recovery: false,
+            recovery_ready: false,
             pending: None,
             start_intent: None,
             failures: 0,
@@ -416,7 +422,13 @@ impl PlaybackRouter {
 
     pub fn report_error(&self, app: &AppHandle, error: &str) { self.core.report_error(&self.host(app), error); }
 
-    pub fn suspend(&self, app: &AppHandle, error: &str) { self.core.suspend(&self.host(app), error); }
+    pub fn engine_disconnected(&self, app: &AppHandle, error: &str) {
+        self.core.engine_disconnected(&self.host(app), error);
+    }
+
+    pub async fn engine_recovered(&self, app: &AppHandle, state: &PlaybackState) {
+        self.core.engine_recovered(&self.host(app), state).await;
+    }
 
     pub async fn select(&self, app: &AppHandle, device_id: Option<String>) -> Result<(), String> {
         self.core.select(&self.host(app), device_id).await
@@ -546,8 +558,96 @@ impl Core {
     }
 
     fn suspend<H: Host>(&self, host: &H, error: &str) {
-        if let Some(remote) = self.remote.lock().as_mut() { remote.polling = false; }
+        if let Some(remote) = self.remote.lock().as_mut() {
+            remote.polling = false;
+            remote.engine_recovery = false;
+            remote.recovery_ready = false;
+        }
         self.report_error(host, error);
+    }
+
+    fn engine_disconnected<H: Host>(&self, host: &H, error: &str) {
+        if let Some(remote) = self.remote.lock().as_mut() {
+            remote.engine_recovery |= remote.polling || remote.kind() == Kind::Prepared;
+            remote.polling = false;
+            remote.recovery_ready = false;
+        }
+        self.report_error(host, error);
+    }
+
+    async fn engine_recovered<H: Host>(&self, host: &H, state: &PlaybackState) {
+        if state.auth_state != "ready" { return; }
+        let _operation = self.operation.lock().await;
+        let eligible = self.remote.lock().as_mut().is_some_and(|remote| {
+            if !remote.engine_recovery || remote.state.username != state.username { return false; }
+            remote.polling = true;
+            remote.recovery_ready = true;
+            remote.failures = 0;
+            remote.refresh = true;
+            true
+        });
+        if !eligible { return; }
+        self.reconcile(host).await;
+        self.changed.notify_one();
+    }
+
+    async fn recover_engine<H: Host>(&self, host: &H) -> Result<(), String> {
+        // A restored child must never become a second audible output.
+        host.pause_engine().await?;
+        let mut view = host.engine(None).await?;
+        let restored = view.state.get_or_insert_with(|| host.local_state());
+        {
+            let guard = self.remote.lock();
+            let remote = guard.as_ref().ok_or(RELEASED)?;
+            if restored.auth_state != "ready" || restored.username != remote.state.username {
+                return Err("The engine changed account during output recovery".into());
+            }
+        }
+        {
+            let mut guard = self.remote.lock();
+            let remote = guard.as_mut().ok_or(RELEASED)?;
+            if remote.kind() != Kind::Foreign {
+                // The new engine may refresh metadata or redraw shuffle.
+                // Preserve occurrences, not indexes into obsolete rows.
+                let old_current = remote.state.current_index;
+                let remap: Vec<Option<usize>> = {
+                    let mut occurrences: HashMap<&str, VecDeque<usize>> = HashMap::new();
+                    for (index, track) in restored.queue.iter().enumerate() {
+                        occurrences.entry(&track.uri).or_default().push_back(index);
+                    }
+                    remote.state.queue.iter()
+                        .map(|track| occurrences.get_mut(track.uri.as_str()).and_then(VecDeque::pop_front))
+                        .collect()
+                };
+                let current = old_current.and_then(|row| remap.get(row).copied().flatten());
+                if let Mode::Owned(window) = &mut remote.mode {
+                    for row in &mut window.rows {
+                        *row = row.and_then(|row| remap.get(row).copied().flatten());
+                    }
+                }
+                if let Some(intent) = remote.start_intent.as_mut() {
+                    if let Some(current) = remap.get(intent.current).copied().flatten() {
+                        intent.current = current;
+                    } else { remote.start_intent = None; }
+                }
+                let repeat_before = remote.spotify_repeat();
+                remote.adopt_engine(view);
+                remote.consumed.clear();
+                remote.repeat_dirty |= remote.spotify_repeat() != repeat_before;
+                remote.show_row(current.or(remote.anchor));
+                if old_current.is_some() && current.is_none() { remote.state.position_ms = 0; }
+                if remote.kind() == Kind::Prepared { remote.set_order(remote.plan.clone()); }
+            }
+            remote.pending = None;
+        }
+        self.sync(host).await?;
+        if let Some(remote) = self.remote.lock().as_mut() {
+            remote.engine_recovery = false;
+            remote.recovery_ready = false;
+            remote.state.error.clear();
+        }
+        self.publish_changed(host);
+        Ok(())
     }
 
     async fn command<H: Host>(&self, host: &H, method: Method, endpoint: &str, query: &[(&str, String)], body: Option<Value>) -> Result<(), String> {
@@ -572,6 +672,12 @@ impl Core {
         player_path(&device_id, "play", &[])?;
         let selected = self.remote.lock().as_ref().map(|remote| (remote.state.output_device_id == device_id, remote.kind(), remote.state.playing));
         if let Some((true, kind, _)) = selected {
+            let recovery = self.remote.lock().as_ref().filter(|remote| remote.engine_recovery)
+                .map(|remote| remote.recovery_ready);
+            if let Some(ready) = recovery {
+                if !ready { return Err("Playback engine recovery is still in progress".into()); }
+                return self.recover_engine(host).await;
+            }
             // Reselecting a staged queue must not adopt an unrelated session there.
             return if kind == Kind::Prepared { Ok(()) } else { self.sync(host).await };
         }
@@ -669,6 +775,16 @@ impl Core {
 
     async fn run<H: Host>(&self, host: &H, action: Action) -> Result<(), String> {
         let _operation = self.operation.lock().await;
+        let recovery = self.remote.lock().as_ref()
+            .filter(|remote| remote.engine_recovery).map(|remote| remote.recovery_ready);
+        if let Some(ready) = recovery {
+            let recovered = if ready { self.recover_engine(host).await }
+                else { Err("Playback engine recovery is still in progress".to_owned()) };
+            if let Err(error) = recovered {
+                self.report_error(host, &error);
+                return Err(error);
+            }
+        }
         let kind = self.remote.lock().as_ref().map(Remote::kind);
         let result = match kind {
             None => host.local(action).await,
@@ -1473,7 +1589,7 @@ impl Core {
             Seen::Staged => { self.publish_changed(host); Ok(()) }
             Seen::Start(current) => self.start(host, current, 0).await,
             Seen::Row(row) => {
-                if self.remote.lock().as_ref().is_some_and(|remote| remote.anchor != Some(row)) {
+                if self.remote.lock().as_ref().is_some_and(|remote| remote.engine_recovery || remote.anchor != Some(row)) {
                     self.reanchor(host, row, player.progress_ms.unwrap_or(0)).await?;
                 }
                 let order = self.order(host, Some(row), row).await?;
@@ -1546,14 +1662,17 @@ impl Core {
     async fn watch<H: Host>(&self, host: &H) {
         loop {
             let visible = self.visible.load(Ordering::Relaxed);
-            let delay = self.remote.lock().as_ref().filter(|remote| remote.polling).and_then(|remote| reconcile_delay(remote, visible));
+            let delay = self.remote.lock().as_ref()
+                .filter(|remote| remote.polling && (!remote.engine_recovery || remote.recovery_ready))
+                .and_then(|remote| reconcile_delay(remote, visible));
             let Some(delay) = delay else { self.changed.notified().await; continue; };
             tokio::select! {
                 _ = self.changed.notified() => continue,
                 _ = tokio::time::sleep(delay) => {},
             }
             let _operation = self.operation.lock().await;
-            if self.remote.lock().as_ref().is_some_and(|remote| remote.polling) {
+            if self.remote.lock().as_ref().is_some_and(|remote|
+                remote.polling && (!remote.engine_recovery || remote.recovery_ready)) {
                 self.reconcile(host).await;
             }
         }
@@ -1562,7 +1681,9 @@ impl Core {
     /// One timed check. A transient failure backs off and keeps control; it
     /// surfaces only once it persists.
     async fn reconcile<H: Host>(&self, host: &H) {
-        let Err(error) = self.sync(host).await else { return; };
+        let recovering = self.remote.lock().as_ref().is_some_and(|remote| remote.engine_recovery);
+        let result = if recovering { self.recover_engine(host).await } else { self.sync(host).await };
+        let Err(error) = result else { return; };
         if !personal_api::is_transient(&error) {
             self.suspend(host, &error);
             return;
@@ -1729,23 +1850,18 @@ impl Host for AppHost<'_> {
         }
         // The engine handles requests in order, so once this answer arrives
         // every state line the command produced has already been fanned out.
-        let metadata = self.client.queue_metadata(None).await;
+        let metadata = self.client.queue_metadata(None).await?;
         let mut state = None;
         loop {
             match lines.try_recv() {
                 Ok(StateLine::State(line)) => state = Some(line),
+                Ok(StateLine::Disconnected) => return Err("The playback engine disconnected during the queue operation".into()),
                 Ok(_) | Err(TryRecvError::Lagged(_)) => {}
                 Err(_) => break,
             }
         }
         if state.is_none() { state = self.client.current_state(); }
-        let upcoming = match metadata {
-            Ok(metadata) => metadata.upcoming,
-            Err(error) => match &state {
-                Some(state) => state.upcoming.clone(),
-                None => return Err(error),
-            },
-        };
+        let upcoming = metadata.upcoming;
         Ok(EngineView { state, upcoming })
     }
 
@@ -2351,6 +2467,140 @@ mod tests {
             assert!(host.spotify.lock().writes().is_empty());
             assert!(core.snapshot().unwrap().error.contains(if restricted { "controlling this device" } else { "moved away" }));
         }
+    }
+
+    #[tokio::test]
+    async fn engine_restart_reconciles_device_progress_and_restored_metadata_without_restarting_matching_window() {
+        let (core, host) = owned(150).await;
+        core.engine_disconnected(&host, "engine disconnected");
+        assert!(next_read(&core).is_none());
+        {
+            let mut engine = host.engine.lock();
+            engine.revision += 1;
+            engine.rows[1].name = "Restored title".into();
+            engine.position_ms = 0;
+            engine.playing = true;
+        }
+        host.spotify.lock().player = Some(reading("spotify:track:t1", true, 42_000));
+        let ready = host.local_state();
+        core.engine_recovered(&host, &ready).await;
+        let shown = core.snapshot().unwrap();
+        assert_eq!(shown.current_uri, "spotify:track:t1");
+        assert_eq!(shown.queue[1].name, "Restored title");
+        assert!((42_000..43_000).contains(&shown.position_ms));
+        assert!(shown.error.is_empty());
+        assert!(!host.engine.lock().playing, "local audio stays paused");
+        assert_eq!(host.engine.lock().position_ms, 42_000);
+        assert!(next_read(&core).is_some());
+        assert!(host.spotify.lock().writes().is_empty(), "matching device window is not restarted");
+        host.spotify.lock().player = Some(reading("spotify:track:t95", true, 1234));
+        core.reconcile(&host).await;
+        assert_eq!(core.snapshot().unwrap().current_uri, "spotify:track:t95");
+        let play = host.spotify.lock().last_play().unwrap();
+        assert_eq!(uris(&play)[0], "spotify:track:t95");
+        assert_eq!(play["position_ms"], 1234, "window extension preserves progress");
+    }
+
+    #[tokio::test]
+    async fn engine_restart_uses_restored_canonical_eligibility_and_preserves_staged_output() {
+        for staged in [false, true] {
+            let (core, host) = if staged { fixture(3, false).await } else { owned(3).await };
+            if staged { core.select(&host, Some("phone".into())).await.unwrap(); }
+            host.spotify.lock().log.clear();
+            core.engine_disconnected(&host, "engine disconnected");
+            {
+                let mut engine = host.engine.lock();
+                engine.revision += 1;
+                engine.excluded.insert("t1".into());
+            }
+            if !staged { host.spotify.lock().player = Some(reading("spotify:track:t0", true, 4321)); }
+            core.engine_recovered(&host, &host.local_state()).await;
+            let state = core.snapshot().unwrap();
+            assert_eq!(state.upcoming, [2]);
+            assert!(!host.engine.lock().playing);
+            if staged {
+                assert!(!state.playing);
+                assert!(host.spotify.lock().writes().is_empty());
+                assert!(next_read(&core).is_none());
+            } else {
+                let play = host.spotify.lock().last_play().unwrap();
+                assert_eq!(uris(&play), ["spotify:track:t0", "spotify:track:t2"]);
+                assert_eq!(play["position_ms"], 4321);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_engine_redraw_replaces_remote_shuffle_plan_at_device_progress() {
+        struct RedrawHost {
+            base: TestHost,
+        }
+        impl Host for RedrawHost {
+            async fn spotify(&self, method: Method, path: String, body: Option<Value>) -> Result<Option<Value>, String> {
+                self.base.spotify(method, path, body).await
+            }
+            async fn engine(&self, op: Option<EngineOp<'_>>) -> Result<EngineView, String> {
+                let mut view = self.base.engine(op).await?;
+                let mut state = view.state.take().unwrap_or_else(|| self.base.local_state());
+                state.shuffle = true;
+                view.upcoming = [2, 1].into_iter().filter(|row| Some(*row) != state.current_index).collect();
+                state.upcoming = view.upcoming.clone();
+                view.state = Some(state);
+                Ok(view)
+            }
+            async fn exclusions(&self, context: &str) -> Result<Vec<String>, String> { self.base.exclusions(context).await }
+            async fn pause_engine(&self) -> Result<(), String> { self.base.pause_engine().await }
+            async fn local(&self, action: Action) -> Result<(), String> { self.base.local(action).await }
+            fn local_state(&self) -> PlaybackState { self.base.local_state() }
+            fn publish_local(&self) { self.base.publish_local(); }
+            fn emit<S: Serialize + Clone>(&self, event: &str, payload: S) { self.base.emit(event, payload); }
+            fn media(&self, state: &PlaybackState) { self.base.media(state); }
+        }
+        let (core, base) = owned(3).await;
+        remote(&core, |remote| remote.state.shuffle = true);
+        core.engine_disconnected(&base, "engine disconnected");
+        base.engine.lock().revision += 1;
+        base.spotify.lock().player = Some(reading("spotify:track:t0", true, 4321));
+        let host = RedrawHost { base };
+        core.engine_recovered(&host, &host.local_state()).await;
+        let state = core.snapshot().unwrap();
+        assert_eq!(state.upcoming, [2, 1]);
+        let play = host.base.spotify.lock().last_play().unwrap();
+        assert_eq!(uris(&play), ["spotify:track:t0", "spotify:track:t2", "spotify:track:t1"]);
+        assert_eq!(play["position_ms"], 4321);
+        assert!(!host.base.engine.lock().playing);
+    }
+
+    #[tokio::test]
+    async fn engine_ready_cannot_revive_moved_output_or_recover_under_a_different_account() {
+        let (core, host) = owned(3).await;
+        core.suspend(&host, MOVED_AWAY);
+        core.engine_disconnected(&host, "engine disconnected");
+        core.engine_recovered(&host, &host.local_state()).await;
+        assert!(next_read(&core).is_none());
+        assert!(host.spotify.lock().log.is_empty());
+        let (core, host) = owned(3).await;
+        core.engine_disconnected(&host, "engine disconnected");
+        let ready = PlaybackState { username: "other-account".into(), ..host.local_state() };
+        core.engine_recovered(&host, &ready).await;
+        assert!(next_read(&core).is_none());
+        assert!(host.spotify.lock().log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn engine_restart_keeps_foreign_queue_and_reads_its_device_without_adopting_local_rows() {
+        let (core, host) = owned(3).await;
+        host.spotify.lock().player = Some(reading("spotify:track:foreign", true, 12_000));
+        core.sync(&host).await.unwrap();
+        core.engine_disconnected(&host, "engine disconnected");
+        host.spotify.lock().log.clear();
+        core.engine_recovered(&host, &host.local_state()).await;
+        let state = core.snapshot().unwrap();
+        assert_eq!(state.current_uri, "spotify:track:foreign");
+        assert_eq!(state.queue[0].id, "foreign");
+        assert!(!host.engine.lock().playing);
+        assert!(next_read(&core).is_some());
+        assert!(host.spotify.lock().writes().is_empty());
     }
 
     /// The router owns the phone, which plays `t0` of a queue of `rows`.

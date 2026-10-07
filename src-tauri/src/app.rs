@@ -18,8 +18,8 @@ use crate::types::{
     LibraryNodeDetail, PlaybackState, Playlist, PlaylistDetail, Track,
 };
 
-/// Number of playlists requested from the engine's rootlist browse.
-pub const LIBRARY_LENGTH: usize = 1000;
+/// Page size for the engine's complete, revision-consistent rootlist walk.
+pub const LIBRARY_PAGE_SIZE: usize = 1000;
 
 /// Most-recent-first cap for the playlist tracks cache.
 const TRACKS_CACHE_MAX: usize = 25;
@@ -209,6 +209,13 @@ pub struct AppState {
     /// The initial get_state pull can race the `library` event.
     #[serde(skip)]
     pub library_fresh: bool,
+    /// Library events must follow publication of their playback identity.
+    #[serde(skip)]
+    pub(crate) library_identity_published: bool,
+    /// An unsuccessful one-time activity import must finish before a new
+    /// namespace snapshot can make its retained source unreachable.
+    #[serde(skip)]
+    library_import_pending: bool,
     /// Most-recently-opened first; limited to [`TRACKS_CACHE_MAX`] entries.
     #[serde(skip)]
     pub tracks_cache: Vec<PlaylistTracksEntry>,
@@ -243,6 +250,9 @@ pub struct AppState {
     /// carry this ephemeral generation across launches.
     #[serde(skip)]
     pub library_generation: u64,
+    /// Successful mutations must not install into a different login session.
+    #[serde(skip)]
+    pub(crate) account_generation: u64,
     /// Confirmed track edits fence every detail and membership read, including
     /// uncached foreground browses that bypass background refresh coalescing.
     #[serde(skip)]
@@ -278,6 +288,8 @@ impl AppState {
             me_id: String::new(),
             playlists_fetched_at: None,
             library_fresh: false,
+            library_identity_published: false,
+            library_import_pending: false,
             tracks_cache: Vec::new(),
             data_dir,
             playlist_refreshing: HashSet::new(),
@@ -286,6 +298,7 @@ impl AppState {
             library_fetching: false,
             library_refresh_queued: false,
             library_generation: 0,
+            account_generation: 0,
             playlist_generations: HashMap::new(),
             liked_generation: 0,
             cache_stats: None,
@@ -295,13 +308,85 @@ impl AppState {
         }
     }
 
+    pub(crate) fn library_dir(&self) -> PathBuf {
+        use sha1::{Digest, Sha1};
+        self.data_dir.join("library").join(format!("{:x}", Sha1::digest(self.me_id.as_bytes())))
+    }
+
+    /// Account namespaces retain offline data across disconnects without ever
+    /// borrowing another account's library or listening history.
+    pub(crate) fn select_library_account(&mut self, account: &str) -> bool {
+        if self.me_id == account { return false; }
+        self.account_generation = self.account_generation.wrapping_add(1);
+        self.library_generation = self.library_generation.wrapping_add(1);
+        self.liked_generation = self.liked_generation.wrapping_add(1);
+        self.me_id = account.to_owned();
+        self.library_fresh = false;
+        self.library_identity_published = false;
+        self.library_import_pending = false;
+        self.playlists_fetched_at = None;
+        self.playlists.clear();
+        self.playlist_tree.clear();
+        self.tracks_cache.clear();
+        self.memberships.clear();
+        self.playlist_generations.clear();
+        if account.is_empty() { return true; }
+        let dir = self.library_dir();
+        self.library_import_pending = true;
+        if let Err(error) = self.finish_library_import() {
+            eprintln!("Spotifine: could not preserve the previous library history: {error}");
+        }
+        self.tracks_cache = load_tracks_cache(&dir);
+        self.memberships = load_membership(&dir);
+        true
+    }
+
+    pub(crate) fn finish_library_import(&mut self) -> Result<(), String> {
+        if !self.library_import_pending { return Ok(()); }
+        let dir = self.library_dir();
+        import_owned_library_list(&self.data_dir, &dir, &self.me_id)?;
+        if let Some(mut cache) = load_playlist_list(&dir).filter(|cache| cache.me_id == self.me_id) {
+            order_by_last_activity(&mut cache.playlists);
+            self.playlists = cache.playlists;
+            self.playlist_tree = cache.playlist_tree;
+            self.playlists_fetched_at = cache.fetched_at;
+        }
+        self.library_import_pending = false;
+        Ok(())
+    }
+
+    pub(crate) fn fence_library_reads(&mut self) {
+        self.account_generation = self.account_generation.wrapping_add(1);
+        self.library_generation = self.library_generation.wrapping_add(1);
+        self.library_fresh = false;
+    }
+
+    pub(crate) fn check_account_generation(&self, generation: u64) -> Result<(), String> {
+        if self.account_generation == generation {
+            Ok(())
+        } else {
+            Err("the account changed before the library operation completed".to_owned())
+        }
+    }
+
     pub(crate) fn playlist_generation(&self, id: &str) -> u64 {
         self.playlist_generations.get(id).copied().unwrap_or(0)
     }
 
-    pub(crate) fn record_playlist_edit(&mut self, id: &str) {
+    pub(crate) fn record_playlist_edit(&mut self, id: &str) -> bool {
         let generation = self.playlist_generations.entry(id.to_owned()).or_default();
         *generation = generation.wrapping_add(1);
+        let before = self.tracks_cache.len();
+        self.tracks_cache.retain(|entry| entry.id != id);
+        before != self.tracks_cache.len()
+    }
+
+    pub(crate) fn record_playlist_rename(&mut self, id: &str, name: &str) {
+        let generation = self.playlist_generations.entry(id.to_owned()).or_default();
+        *generation = generation.wrapping_add(1);
+        if let Some(playlist) = self.playlists.iter_mut().find(|playlist| playlist.id == id) {
+            playlist.name = name.trim().to_owned();
+        }
     }
 
     pub(crate) fn playlist_read_is_current(&self, id: &str, generation: u64) -> bool {
@@ -411,6 +496,7 @@ pub fn data_dir() -> PathBuf {
         std::env::temp_dir().join("Spotifine")
     }
 }
+
 
 fn settings_path() -> PathBuf {
     data_dir().join("settings.json")
@@ -620,6 +706,19 @@ pub fn save_playlist_list(dir: &Path, cache: &PlaylistListCache) {
     }
 }
 
+/// One-time transfer of identity-stamped durable activity, never a fallback
+/// read path. Unstamped tracks and memberships are deliberately not imported.
+fn import_owned_library_list(root: &Path, destination: &Path, account: &str) -> Result<(), String> {
+    let target = destination.join("playlist_list.json");
+    if target.exists() { return Ok(()); }
+    let Some(cache) = load_playlist_list(root).filter(|cache| cache.me_id == account && !account.is_empty()) else {
+        return Ok(());
+    };
+    write_json_atomic_result(target, &cache)?;
+    std::fs::remove_file(root.join("playlist_list.json"))
+        .map_err(|error| format!("could not retire the previous library file: {error}"))
+}
+
 // ---------------------------------------------------------------------------
 // playlist_tracks_cache.json
 // ---------------------------------------------------------------------------
@@ -729,7 +828,8 @@ pub fn tracks_cache_bytes(playlists: &[PlaylistTracksEntry]) -> Option<Vec<u8>> 
 /// as [`save_tracks_cache`]. A partial cache is discarded on its next read.
 pub fn write_tracks_cache_bytes(dir: &Path, bytes: &[u8]) {
     let path = dir.join("playlist_tracks_cache.json");
-    if let Err(error) = std::fs::write(&path, bytes) {
+    let result = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, bytes));
+    if let Err(error) = result {
         eprintln!(
             "Spotifine: could not write cache {}: {error}",
             path.display()
@@ -811,11 +911,13 @@ pub fn load_membership(dir: &Path) -> Vec<MembershipEntry> {
 }
 
 pub fn save_membership(dir: &Path, entries: &[MembershipEntry]) {
-    let cache = MembershipCache {
-        version: 1,
-        saved_at: Some(now_secs()),
-        entries: entries.to_vec(),
-    };
+    #[derive(Serialize)]
+    struct MembershipCacheRef<'a> {
+        version: u32,
+        saved_at: Option<i64>,
+        entries: &'a [MembershipEntry],
+    }
+    let cache = MembershipCacheRef { version: 1, saved_at: Some(now_secs()), entries };
     write_json_cache(dir.join("playlist_membership.json"), &cache);
 }
 
@@ -915,7 +1017,7 @@ pub fn playlist_detail_from_cache(state: &AppState, entry: PlaylistTracksEntry) 
 /// A browsed playlist has no local activity timestamps and may have an empty
 /// description when Spotify omits it; incoming empty values never overwrite
 /// those fields from the existing library snapshot.
-pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) {
+pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) -> bool {
     playlist.description = normalize_canonical_playlist_description(&playlist.description);
     if let Some(existing) = playlists.iter_mut().find(|entry| entry.id == playlist.id) {
         playlist.last_played = playlist.last_played.or(existing.last_played);
@@ -926,10 +1028,12 @@ pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) {
         if playlist.cover_url.is_empty() {
             playlist.cover_url = existing.cover_url.clone();
         }
+        if *existing == playlist { return false; }
         *existing = playlist;
     } else {
         playlists.push(playlist);
     }
+    true
 }
 
 /// Reports whether a playlist belongs to the rootlist-backed library.
@@ -1178,7 +1282,12 @@ pub fn now_secs() -> i64 {
 fn write_json_cache<T: Serialize>(path: PathBuf, value: &T) {
     let result = serde_json::to_vec(value)
         .map_err(|error| format!("could not serialize {}: {error}", path.display()))
-        .and_then(|bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()));
+        .and_then(|bytes| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(&path, bytes).map_err(|error| error.to_string())
+        });
     if let Err(error) = result {
         eprintln!(
             "Spotifine: could not write cache {}: {error}",
@@ -1205,6 +1314,10 @@ fn write_bytes_atomic_with(
     replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), String> {
     use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    }
 
     let temp = path.with_extension("json.tmp");
     let mut file = std::fs::File::create(&temp)
@@ -1224,6 +1337,158 @@ fn write_bytes_atomic_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_history(root: &Path, account: &str, activity: i64) {
+        let mut row = playlist("shared");
+        row.last_played = Some(activity);
+        row.last_activity = Some(activity);
+        save_playlist_list(root, &PlaylistListCache {
+            version: 1, fetched_at: Some(123), me_id: account.into(), playlists: vec![row],
+            playlist_tree: vec![LibraryNodeDetail::Folder { id: "folder".into(), name: "History".into(),
+                children: vec![LibraryNodeDetail::Playlist { id: "shared".into() }], last_activity: Some(activity) }],
+        });
+    }
+
+    #[test]
+    fn matching_legacy_history_moves_only_after_authentication_and_never_imports_unstamped_caches() {
+        let root = std::env::temp_dir().join(format!("renderer-history-import-{}", std::process::id()));
+        legacy_history(&root, "account-a", 456);
+        save_tracks_cache(&root, &[PlaylistTracksEntry { id: "shared".into(), fetched_at: None,
+            revision: "old".into(), tracks: vec![track("private")], excluded_track_ids: Vec::new() }]);
+        save_membership(&root, &[membership(LIKED_MEMBERSHIP_ID, "", &["spotify:track:private"])]);
+        let mut state = AppState::new(root.clone());
+        assert!(state.playlists.is_empty());
+        assert!(root.join("playlist_list.json").exists());
+        state.select_library_account("account-a");
+        assert_eq!(state.playlists[0].last_played, Some(456));
+        assert!(matches!(&state.playlist_tree[0], LibraryNodeDetail::Folder { last_activity: Some(456), .. }));
+        assert!(state.tracks_cache.is_empty() && state.memberships.is_empty());
+        assert!(!root.join("playlist_list.json").exists());
+        assert_eq!(load_playlist_list(&state.library_dir()).unwrap().playlists[0].last_activity, Some(456));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mismatched_legacy_owner_is_never_exposed_or_retired() {
+        let root = std::env::temp_dir().join(format!("renderer-history-wrong-owner-{}", std::process::id()));
+        legacy_history(&root, "account-a", 456);
+        let mut state = AppState::new(root.clone());
+        state.select_library_account("account-b");
+        assert!(state.playlists.is_empty() && state.playlist_tree.is_empty());
+        assert!(root.join("playlist_list.json").exists());
+        assert!(!state.library_dir().join("playlist_list.json").exists());
+        state.select_library_account("account-a");
+        assert_eq!(state.playlists[0].last_played, Some(456));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_history_import_preserves_the_original_for_a_later_retry() {
+        let root = std::env::temp_dir().join(format!("renderer-history-failed-import-{}", std::process::id()));
+        legacy_history(&root, "account-a", 456);
+        let mut state = AppState::new(root.clone());
+        state.me_id = "account-a".into();
+        let destination = state.library_dir();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, b"directory blocked").unwrap();
+        assert!(import_owned_library_list(&root, &destination, "account-a").is_err());
+        assert_eq!(load_playlist_list(&root).unwrap().playlists[0].last_played, Some(456));
+        std::fs::remove_file(&destination).unwrap();
+        let mut current = AppState::new(root.clone());
+        std::fs::write(&destination, b"directory blocked again").unwrap();
+        current.select_library_account("account-a");
+        assert!(current.playlists.is_empty());
+        std::fs::remove_file(&destination).unwrap();
+        current.finish_library_import().unwrap();
+        let mut fresh = vec![playlist("shared")];
+        let mut tree = vec![LibraryNodeDetail::Folder { id: "folder".into(), name: "Fresh".into(),
+            children: vec![LibraryNodeDetail::Playlist { id: "shared".into() }], last_activity: None }];
+        carry_local_fields(&current.playlists, &mut fresh);
+        LibraryNodeDetail::carry_folder_activity(&current.playlist_tree, &mut tree);
+        save_playlist_list(&destination, &PlaylistListCache { version: 1, fetched_at: Some(999),
+            me_id: "account-a".into(), playlists: fresh, playlist_tree: tree });
+        let mut restarted = AppState::new(root.clone());
+        restarted.select_library_account("account-a");
+        assert_eq!(restarted.playlists[0].last_played, Some(456));
+        assert!(matches!(&restarted.playlist_tree[0], LibraryNodeDetail::Folder { last_activity: Some(456), .. }));
+        assert!(!root.join("playlist_list.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_account_history_is_never_overwritten_by_legacy_activity() {
+        let root = std::env::temp_dir().join(format!("renderer-history-existing-{}", std::process::id()));
+        legacy_history(&root, "account-a", 100);
+        let mut state = AppState::new(root.clone());
+        state.me_id = "account-a".into();
+        legacy_history(&state.library_dir(), "account-a", 900);
+        let mut restarted = AppState::new(root.clone());
+        restarted.select_library_account("account-a");
+        assert_eq!(restarted.playlists[0].last_activity, Some(900));
+        assert_eq!(load_playlist_list(&root).unwrap().playlists[0].last_activity, Some(100));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_library_namespaces_preserve_offline_history_without_cross_account_data() {
+        let root = std::env::temp_dir().join(format!("renderer-account-cache-{}-{}", std::process::id(), now_secs()));
+        let mut first = AppState::new(root.clone());
+        assert!(first.select_library_account("account-a"));
+        let a_dir = first.library_dir();
+        let mut shared = playlist("shared");
+        shared.last_played = Some(123);
+        shared.last_activity = Some(456);
+        first.playlists.push(shared);
+        first.playlist_tree.push(LibraryNodeDetail::Playlist { id: "shared".into() });
+        let cache = PlaylistListCache { version: 1, fetched_at: Some(100), me_id: first.me_id.clone(),
+            playlists: first.playlists.clone(), playlist_tree: first.playlist_tree.clone() };
+        save_playlist_list(&a_dir, &cache);
+        save_tracks_cache(&a_dir, &[PlaylistTracksEntry { id: "shared".into(), fetched_at: Some(100),
+            revision: "r".into(), tracks: vec![track("a")], excluded_track_ids: Vec::new() }]);
+        save_membership(&a_dir, &[membership(LIKED_MEMBERSHIP_ID, "", &["spotify:track:a"])]);
+
+        let mut restarted = AppState::new(root.clone());
+        assert!(restarted.playlists.is_empty(), "identity must be known before cache exposure");
+        restarted.select_library_account("account-a");
+        assert_eq!(restarted.playlists[0].last_played, Some(123));
+        assert_eq!(restarted.tracks_cache[0].tracks[0].id, "a");
+        assert!(restarted.memberships[0].contains("spotify:track:a"));
+        let generation = restarted.account_generation;
+        restarted.fence_library_reads();
+        assert!(restarted.check_account_generation(generation).is_err());
+        assert_eq!(restarted.playlists[0].last_played, Some(123), "temporary disconnect retains offline data");
+        assert!(!restarted.select_library_account("account-a"));
+
+        restarted.select_library_account("account-b");
+        assert_ne!(a_dir, restarted.library_dir());
+        assert!(restarted.playlists.is_empty() && restarted.playlist_tree.is_empty());
+        assert!(restarted.tracks_cache.is_empty() && restarted.memberships.is_empty());
+        let mut fresh_shared = vec![playlist("shared")];
+        carry_local_fields(&restarted.playlists, &mut fresh_shared);
+        assert_eq!(fresh_shared[0].last_played, None);
+        restarted.select_library_account("");
+        assert!(restarted.me_id.is_empty() && restarted.playlists.is_empty());
+        restarted.select_library_account("account-a");
+        assert_eq!(restarted.playlists[0].last_activity, Some(456));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_sparse_detail_preserves_local_fields_without_a_durable_change() {
+        let mut initial = playlist("p");
+        initial.description = "description".into();
+        initial.cover_url = "cover".into();
+        initial.last_played = Some(123);
+        initial.last_activity = Some(456);
+        let mut rows = vec![initial.clone()];
+        assert!(!upsert_playlist(&mut rows, playlist("p")));
+        assert_eq!(rows[0], initial);
+        let mut renamed = playlist("p");
+        renamed.name = "new name".into();
+        assert!(upsert_playlist(&mut rows, renamed));
+        assert_eq!(rows[0].last_played, Some(123));
+        assert_eq!(rows[0].name, "new name");
+    }
 
     #[test]
     fn failed_library_replacement_preserves_local_activity_and_next_write_recovers() {

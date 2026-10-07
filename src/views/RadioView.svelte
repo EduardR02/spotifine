@@ -70,13 +70,12 @@
     error: "",
   });
 
-  $effect(() => {
+  let mounted = true;
+  $effect(() => () => { mounted = false; });
+  $effect.pre(() => {
     const routeId = route.id;
     if (saveState.routeId === routeId) return;
-    saveState.routeId = routeId;
-    saveState.busy = false;
-    saveState.playlistId = null;
-    saveState.error = "";
+    saveState = { routeId, busy: false, playlistId: null, error: "" };
   });
 
   function playFrom(index) {
@@ -104,21 +103,25 @@
 
   async function saveAsPlaylist() {
     if (saveState.busy || !radio || !tracks.length) return;
+    const request = saveState;
+    const name = title;
+    const current = () => mounted && saveState === request &&
+      route.name === "radio" && route.id === request.routeId;
     const uris = tracks.map((track) => track?.uri);
     if (uris.some((uri) => !uri)) {
-      saveState.error = "This radio contains a track without a Spotify URI.";
+      request.error = "This radio contains a track without a Spotify URI.";
       return;
     }
 
-    saveState.busy = true;
-    saveState.error = "";
+    request.busy = true;
+    request.error = "";
     try {
-      let playlistId = saveState.playlistId;
+      let playlistId = request.playlistId;
       if (!playlistId) {
-        const created = await api.createPlaylist(title);
+        const created = await api.createPlaylist(name);
         playlistId = created?.id;
         if (!playlistId) throw new Error("Playlist creation returned no id.");
-        saveState.playlistId = playlistId;
+        request.playlistId = playlistId;
         /* The row has to exist before anything can promote it: the
            `promotePlaylist` below is a no-op for a playlist the library has
            never heard of, so without this the freshly saved radio was absent
@@ -129,11 +132,11 @@
       await api.addPlaylistTracks(playlistId, uris);
       promotePlaylist(playlistId);
       api.touchPlaylistActivity(playlistId).catch(() => {});
-      navigate("playlist", playlistId);
+      if (current()) navigate("playlist", playlistId);
     } catch (reason) {
-      saveState.error = String(reason?.message ?? reason ?? "Could not save this radio.");
+      if (current()) request.error = String(reason?.message ?? reason ?? "Could not save this radio.");
     } finally {
-      saveState.busy = false;
+      request.busy = false;
     }
   }
 </script>

@@ -1,4 +1,5 @@
 mod app;
+mod autostart;
 mod commands;
 mod covers;
 mod engine_client;
@@ -14,7 +15,7 @@ use parking_lot::Mutex;
 use tauri::Manager;
 
 use app::{
-    data_dir, load_app_settings, load_membership, load_tracks_cache, update_app_settings, AppState,
+    data_dir, load_app_settings, update_app_settings, AppState,
 };
 use engine_client::EngineClient;
 
@@ -38,7 +39,7 @@ fn restore_main_window(app: &tauri::AppHandle) {
 /// particular, disabling this app in Windows Startup Apps must not be undone
 /// by the next launch. Only `set_launch_at_login` changes the registration.
 fn reconcile_autostart_preference(app: &tauri::AppHandle, settings: &mut app::AppSettings) {
-    let actual = match tauri_plugin_autostart::ManagerExt::autolaunch(app).is_enabled() {
+    let actual = match autostart::is_enabled(app) {
         Ok(actual) => actual,
         Err(error) => {
             log::warn(&format!(
@@ -58,15 +59,19 @@ fn reconcile_autostart_preference(app: &tauri::AppHandle, settings: &mut app::Ap
     }
 }
 
-/// The Windows window has no native frame (tauri.windows.conf.json), so the
-/// frontend draws maximize and restore and has to know which one to show.
-/// Every way in or out of maximized resizes the window — the button, a
-/// double-click on a drag area, Aero snap, Win+Up — so Resized is the one
-/// place to look, and only a change is sent on.
+/// Native Windows state also gates background work: WebView2 can keep its
+/// document visible and focused after the HWND has been minimized. Resize
+/// covers minimize/restore as well as every maximize path, without polling.
 #[cfg(windows)]
-fn report_maximized(window: tauri::WebviewWindow) {
+fn report_window_state(window: tauri::WebviewWindow) {
     use std::cell::Cell;
     use tauri::Emitter;
+
+    #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    struct WindowState {
+        maximized: bool,
+        minimized: bool,
+    }
 
     let last = Cell::new(None);
     let handle = window.clone();
@@ -77,8 +82,12 @@ fn report_maximized(window: tauri::WebviewWindow) {
         let Ok(maximized) = handle.is_maximized() else {
             return;
         };
-        if last.replace(Some(maximized)) != Some(maximized) {
-            let _ = handle.emit("window-maximized", maximized);
+        let Ok(minimized) = handle.is_minimized() else {
+            return;
+        };
+        let state = WindowState { maximized, minimized };
+        if last.replace(Some(state)) != Some(state) {
+            let _ = handle.emit("window-state", state);
         }
     });
 }
@@ -102,10 +111,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
+        .plugin(autostart::init())
         .invoke_handler(tauri::generate_handler![
             commands::check_for_update,
             commands::play,
@@ -198,24 +204,22 @@ pub fn run() {
                             "could not minimize the main window at startup: {error}"
                         ));
                     }
-                } else if let Err(error) = window.show() {
+                }
+                // The configured window starts hidden. Minimize preserves that
+                // visibility flag, so show it afterward in its iconic state
+                // rather than briefly showing a normal window first.
+                if let Err(error) = window.show() {
                     log::warn(&format!(
                         "could not show the main window at startup: {error}"
                     ));
                 }
                 #[cfg(windows)]
-                report_maximized(window);
+                report_window_state(window);
             } else {
                 log::warn("could not find the main window at startup");
             }
 
             let state = Mutex::new(AppState::new(data_dir()));
-            let dir = state.lock().data_dir.clone();
-            state.lock().tracks_cache = load_tracks_cache(&dir);
-            // The saved-mark index hydrates from disk so a returning user's
-            // very first track change already resolves without any fetch; the
-            // ready-transition reconciliation supersedes stale rows.
-            state.lock().memberships = load_membership(&dir);
             app.manage(state);
             let personal = personal_api::PersonalApi::new().map_err(std::io::Error::other)?;
             app.manage(personal.clone());

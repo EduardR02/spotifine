@@ -1,4 +1,5 @@
 <script>
+  import { untrack } from "svelte";
   import { route, search, api, focusSearch, watchCacheMarks } from "../lib/state.svelte.js";
   import { applyCacheMarks } from "../lib/cache-marks.js";
   import TrackList from "../components/TrackList.svelte";
@@ -8,29 +9,30 @@
   let tracks = $state([]);
   let loading = $state(false);
   let error = $state("");
-  let requested = "";
+  let generation = 0;
 
   /* This view is entered only through SearchView's See all action. That click
      is the lazy-load boundary: ordinary searches never issue this limit=50
      request or resolve its extra artwork. */
   $effect(() => {
     const q = query;
-    if (!q || requested === q) return;
-    requested = q;
-    tracks = search.query === q ? (search.results?.tracks ?? []) : [];
+    if (!q) return;
+    const mine = ++generation;
+    tracks = untrack(() => search.query === q ? (search.results?.tracks ?? []) : []);
     loading = true;
     error = "";
     api.search(q, 50)
       .then((result) => {
-        if (requested !== q) return;
+        if (mine !== generation) return;
         tracks = result?.tracks ?? tracks;
       })
       .catch((reason) => {
-        if (requested === q) error = String(reason || "Could not load more songs.");
+        if (mine === generation) error = String(reason || "Could not load more songs.");
       })
       .finally(() => {
-        if (requested === q) loading = false;
+        if (mine === generation) loading = false;
       });
+    return () => { generation += 1; };
   });
 
   /* Download marks reach these songs in place. */

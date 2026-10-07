@@ -77,6 +77,25 @@ fn publish_metadata<E>(
     Ok(())
 }
 
+#[cfg(windows)]
+fn publish_windows_metadata(
+    hwnd: usize,
+    controls: &mut MediaControls,
+    previous: &mut Option<Metadata>,
+    next: Metadata,
+) -> Result<(), souvlaki::Error> {
+    let remove_cover = next.cover.is_empty()
+        && previous.as_ref().is_some_and(|metadata| !metadata.cover.is_empty());
+    publish_metadata(previous, next, |metadata| {
+        // Souvlaki skips SetThumbnail for None; it does not remove the old
+        // artwork. Clear and retype before publishing the replacement fields.
+        if remove_cover {
+            clear_windows_metadata(hwnd)?;
+        }
+        controls.set_metadata(metadata)
+    })
+}
+
 /// Attaches system media controls. Failures are warnings, never fatal: a
 /// player without media keys still plays.
 pub fn init(app: AppHandle, client: Arc<EngineClient>, hwnd: Option<usize>) {
@@ -148,8 +167,15 @@ fn run_controls(
                 position_ms,
                 metadata,
             } => {
-                if let Err(error) = publish_metadata(&mut last_metadata, metadata,
-                    |metadata| controls.set_metadata(metadata)) {
+                #[cfg(windows)]
+                let publication = publish_windows_metadata(
+                    hwnd.expect("Windows media controls require a window"),
+                    &mut controls, &mut last_metadata, metadata,
+                );
+                #[cfg(not(windows))]
+                let publication = publish_metadata(&mut last_metadata, metadata,
+                    |metadata| controls.set_metadata(metadata));
+                if let Err(error) = publication {
                     log::warn(&format!("could not update media metadata: {error:?}"));
                 }
                 controls.set_playback(transport(playing, position_ms))
@@ -379,5 +405,90 @@ mod tests {
         publish_metadata(&mut previous, song(), |_| { calls += 1; Ok::<_, ()>(()) }).unwrap();
         publish_metadata(&mut previous, song(), |_| { calls += 1; Ok::<_, ()>(()) }).unwrap();
         assert_eq!(calls, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_media_session_removes_old_artwork_and_can_publish_artwork_again() {
+        use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
+
+        // A hidden, independent HWND: no running app, Spotify account or
+        // visible window is needed to inspect the actual SMTC metadata.
+        #[link(name = "user32")]
+        extern "system" {
+            fn CreateWindowExW(
+                extended_style: u32, class: *const u16, title: *const u16, style: u32,
+                x: i32, y: i32, width: i32, height: i32,
+                parent: isize, menu: isize, instance: isize, parameter: *const std::ffi::c_void,
+            ) -> isize;
+            fn DestroyWindow(hwnd: isize) -> i32;
+        }
+        struct Session {
+            hwnd: isize,
+            cover: std::path::PathBuf,
+        }
+        impl Drop for Session {
+            fn drop(&mut self) {
+                unsafe {
+                    if self.hwnd != 0 { DestroyWindow(self.hwnd); }
+                    RoUninitialize();
+                }
+                let _ = std::fs::remove_file(&self.cover);
+            }
+        }
+        unsafe { RoInitialize(RO_INIT_MULTITHREADED).unwrap(); }
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let mut session = Session {
+            hwnd: 0,
+            cover: std::env::temp_dir().join(format!(
+                "spotifine-smtc-cover-{}-{}.png", std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            )),
+        };
+        session.hwnd = unsafe {
+            CreateWindowExW(0, class.as_ptr(), class.as_ptr(), 0,
+                0, 0, 1, 1, 0, 0, 0, std::ptr::null())
+        };
+        assert_ne!(session.hwnd, 0, "independent SMTC window must be created");
+        std::fs::write(&session.cover, include_bytes!("../icons/32x32.png")).unwrap();
+        let cover = format!("file://{}", session.cover.display());
+        let hwnd = session.hwnd as usize;
+        let mut controls = MediaControls::new(PlatformConfig {
+            dbus_name: "spotifine-test", display_name: "Spotifine test",
+            hwnd: Some(hwnd as *mut std::ffi::c_void),
+        }).unwrap();
+        clear_windows_metadata(hwnd).unwrap();
+        let updater = windows_controls(hwnd).unwrap().DisplayUpdater().unwrap();
+        let mut previous = None;
+        for (title, artwork) in [
+            ("With artwork", cover.as_str()), ("Without artwork", ""),
+            ("Restored artwork", cover.as_str()), ("Restored artwork", ""),
+        ] {
+            publish_windows_metadata(hwnd, &mut controls, &mut previous, Metadata {
+                duration_ms: 30_000, title: title.into(), artist: "Artist".into(),
+                album: "Album".into(), cover: artwork.into(),
+            }).unwrap();
+            let properties = updater.MusicProperties().unwrap();
+            assert_eq!(properties.Title().unwrap().to_string(), title);
+            assert_eq!(properties.Artist().unwrap().to_string(), "Artist");
+            assert_eq!(properties.AlbumTitle().unwrap().to_string(), "Album");
+            // The native getter returns S_OK plus a null interface for no
+            // artwork. windows 0.44's non-null wrapper converts that to an
+            // Err(S_OK), so inspect the ABI result separately from its pointer.
+            let mut thumbnail = std::ptr::null_mut();
+            let result = unsafe {
+                (windows::core::Vtable::vtable(&updater).Thumbnail)(
+                    windows::core::Vtable::as_raw(&updater), &mut thumbnail,
+                )
+            };
+            let thumbnail = if thumbnail.is_null() {
+                None
+            } else {
+                Some(unsafe { <windows::core::IUnknown as windows::core::Vtable>::from_raw(thumbnail) })
+            };
+            result.ok().expect("native thumbnail getter must succeed");
+            assert_eq!(thumbnail.is_some(), !artwork.is_empty(),
+                "artwork presence follows the current metadata, including removal and restoration");
+        }
     }
 }

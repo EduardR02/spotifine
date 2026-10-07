@@ -45,8 +45,10 @@
   function close(returnFocus = false) {
     const hadFocus = !!el?.contains(document.activeElement);
     const target = returnTo ?? anchor;
+    // A virtualized host may drop its anchor when onclose clears the menu.
+    // Manual popovers are not modal: hand focus back while that anchor is owned.
+    if (returnFocus && hadFocus && target?.isConnected) target.focus({ preventScroll: true });
     onclose?.();
-    if (returnFocus && hadFocus) queueMicrotask(() => target?.isConnected && target.focus());
   }
 
   function place() {
@@ -74,7 +76,8 @@
   }
 
   function items() {
-    return [...el.querySelectorAll('[role^="menuitem"]:not(:disabled)')];
+    return [...el.querySelectorAll('[role^="menuitem"]:not(:disabled)')]
+      .filter((item) => item.closest('[role="menu"]') === el);
   }
 
   $effect(() => {
@@ -108,6 +111,7 @@
   });
 
   function onKeyDown(event) {
+    if (event.target.closest?.('[role="menu"]') !== el && event.key !== "Tab") return;
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
@@ -120,6 +124,7 @@
     }
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
+    event.stopPropagation();
     const list = items();
     if (!list.length) return;
     const current = list.indexOf(document.activeElement);

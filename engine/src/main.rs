@@ -196,6 +196,14 @@ fn main() -> ExitCode {
     }
 }
 
+fn drain_audio_cache_events(engine: &mut Engine, receiver: &mut mpsc::UnboundedReceiver<librespot_audio::AudioCacheEvent>) -> bool {
+    let mut changed = false;
+    while let Ok(event) = receiver.try_recv() {
+        changed |= engine.on_audio_cache_event(event);
+    }
+    changed
+}
+
 async fn run(
     writer: ProtocolWriter,
     cache: Cache,
@@ -210,10 +218,12 @@ async fn run(
     let (audio_sender, mut audio_receiver) = mpsc::unbounded_channel();
     let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
     let (cache_sender, mut cache_receiver) = mpsc::unbounded_channel();
+    let (audio_cache_sender, mut audio_cache_receiver) = mpsc::unbounded_channel();
     io::spawn_input_reader(input_sender);
 
     configure_audio_fetch();
     audio::install_signal_sender(audio_sender);
+    librespot_audio::install_cache_event_sender(audio_cache_sender);
     let (mut waveform_service, mut waveform_receiver) =
         WaveformService::new(cache.clone(), &state_directory)?;
 
@@ -598,20 +608,28 @@ async fn run(
             }
             signal = player_receiver.recv() => {
                 if let Some(signal) = signal {
-                    if engine.on_player_signal(signal) {
-                        engine.emit_state()?;
-                    }
+                    // Cache hits precede decoder failures on the producer, but
+                    // use a different channel. Learn their selected FileId
+                    // before a failure chooses its leased eviction targets.
+                    let mut changed = drain_audio_cache_events(&mut engine, &mut audio_cache_receiver);
+                    changed |= engine.on_player_signal(signal);
+                    if changed { engine.emit_state()?; }
                 }
             }
             signal = audio_receiver.recv() => {
                 if let Some(signal) = signal {
-                    if engine.on_audio_signal(signal) {
+                    let mut changed = drain_audio_cache_events(&mut engine, &mut audio_cache_receiver);
+                    changed |= engine.on_audio_signal(signal);
+                    if changed {
                         engine.emit_state()?;
                     }
                 }
             }
             Some(signal) = cache_receiver.recv() => {
                 if engine.on_cache_signal(signal) { engine.emit_state()?; }
+            }
+            Some(event) = audio_cache_receiver.recv() => {
+                if engine.on_audio_cache_event(event) { engine.emit_state()?; }
             }
             outcome = waveform_receiver.recv() => {
                 if let Some(outcome) = outcome {

@@ -28,6 +28,118 @@ use crate::range_set::{Range, RangeSet};
 
 pub type AudioFileResult = Result<(), librespot_core::Error>;
 
+/// An observation of a song's persistent audio file.
+#[derive(Debug)]
+pub enum AudioCacheEvent {
+    Stored { track_uri: SpotifyUri, file_id: FileId, downloaded: bool, epoch: u64 },
+    Removed { track_uri: SpotifyUri, file_id: FileId, epoch: u64 },
+    /// A failed save may still have pruned other entries before reporting an error.
+    Revalidate { epoch: u64 },
+}
+
+static AUDIO_CACHE_EVENT_SENDER: OnceLock<mpsc::UnboundedSender<AudioCacheEvent>> = OnceLock::new();
+// A clear advances this epoch while holding the same lock as cache commits.
+// Pending loaders capture it before resolving metadata or opening audio.
+static CACHE_COMMIT_EPOCH: Mutex<u64> = Mutex::new(0);
+
+pub fn cache_epoch() -> u64 {
+    *CACHE_COMMIT_EPOCH.lock().expect("cache commit mutex poisoned")
+}
+
+pub fn advance_cache_epoch() -> u64 {
+    let mut epoch = CACHE_COMMIT_EPOCH.lock().expect("cache commit mutex poisoned");
+    *epoch = epoch.wrapping_add(1);
+    *epoch
+}
+
+/// Deletes only this cache's audio directory. Shared limiter state is updated
+/// through Cache::remove_file for recognized content-addressed entries.
+pub fn clear_cached_audio(cache: &Cache) -> Result<(), Error> {
+    let mut epoch = CACHE_COMMIT_EPOCH.lock().expect("cache commit mutex poisoned");
+    *epoch = epoch.wrapping_add(1);
+    let Some(sample) = cache.file_path(FileId::from_raw(&[0; 20])) else { return Ok(()); };
+    let root = sample.parent().and_then(|parent| parent.parent())
+        .ok_or_else(|| Error::failed_precondition("audio cache has no root directory"))?;
+    if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(Error::failed_precondition("audio cache root is a symbolic link"));
+    }
+    match fs::read_dir(root) {
+        Ok(entries) => clear_audio_directory(cache, root, root, entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn clear_audio_directory(cache: &Cache, root: &std::path::Path, directory: &std::path::Path, entries: fs::ReadDir) -> Result<(), Error> {
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if directory == root && entry.file_name() == "cache-version" { continue; }
+        let kind = entry.file_type()?;
+        if kind.is_dir() && !kind.is_symlink() {
+            clear_audio_directory(cache, root, &path, fs::read_dir(&path)?)?;
+            fs::remove_dir(&path)?;
+        } else if let Some(file_id) = cache_file_id(root, &path) {
+            cache.remove_file(file_id)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn cache_file_id(root: &std::path::Path, path: &std::path::Path) -> Option<FileId> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut components = relative.iter();
+    let shard = components.next()?.to_str()?.as_bytes();
+    let name = components.next()?.to_str()?.as_bytes();
+    if components.next().is_some() || shard.len() != 2 || name.len() != 38 { return None; }
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    let mut bytes = [0; 20];
+    bytes[0] = digit(shard[0])? * 16 + digit(shard[1])?;
+    for (index, pair) in name.chunks_exact(2).enumerate() {
+        bytes[index + 1] = digit(pair[0])? * 16 + digit(pair[1])?;
+    }
+    Some(FileId::from_raw(&bytes))
+}
+
+pub fn remove_cached_audio(session: &Session, track_uri: &SpotifyUri, file_id: FileId, epoch: u64) -> Result<(), Error> {
+    let active = CACHE_COMMIT_EPOCH.lock().expect("cache commit mutex poisoned");
+    if *active != epoch {
+        return Err(Error::aborted("audio cache was cleared"));
+    }
+    let cache = session.cache().ok_or_else(|| Error::failed_precondition("audio cache unavailable"))?;
+    cache.remove_file(file_id)?;
+    if let Some(sender) = AUDIO_CACHE_EVENT_SENDER.get() {
+        let _ = sender.send(AudioCacheEvent::Removed { track_uri: track_uri.clone(), file_id, epoch });
+    }
+    Ok(())
+}
+
+/// Installs the process-wide cache event destination once, before loading audio.
+pub fn install_cache_event_sender(sender: mpsc::UnboundedSender<AudioCacheEvent>) {
+    assert!(
+        AUDIO_CACHE_EVENT_SENDER.set(sender).is_ok(),
+        "audio cache event sender already installed"
+    );
+}
+
+fn send_cache_event(track_uri: &SpotifyUri, file_id: FileId, downloaded: bool, epoch: u64) {
+    if let Some(sender) = AUDIO_CACHE_EVENT_SENDER.get() {
+        if matches!(track_uri, SpotifyUri::Track { .. }) {
+            let _ = sender.send(AudioCacheEvent::Stored {
+                track_uri: track_uri.clone(), file_id, downloaded, epoch,
+            });
+        }
+    }
+}
+
 const DOWNLOAD_STATUS_POISON_MSG: &str = "audio download status mutex should not be poisoned";
 
 #[derive(Error, Debug)]
@@ -388,8 +500,10 @@ fn audio_cache(session: &Session, track_uri: &SpotifyUri) -> Option<Arc<Cache>> 
 
 async fn cache_completed_download(
     file_id: FileId,
+    track_uri: SpotifyUri,
     cache: Option<Arc<Cache>>,
     complete_rx: oneshot::Receiver<NamedTempFile>,
+    epoch: u64,
 ) {
     let Ok(mut file) = complete_rx.await else {
         return;
@@ -398,12 +512,18 @@ async fn cache_completed_download(
 
     // Always consume completion, even for episodes, so the temporary file is
     // dropped normally rather than causing the downloader's send to fail.
+    let active = CACHE_COMMIT_EPOCH.lock().expect("cache commit mutex poisoned");
+    if *active != epoch { return; }
     if let Some(cache) = cache {
         if let Some(cache_id) = cache.file_path(file_id) {
             if let Err(e) = cache.save_file(file_id, &mut file) {
                 error!("Error caching file {file_id} to {cache_id:?}: {e}");
+                if let Some(sender) = AUDIO_CACHE_EVENT_SENDER.get() {
+                    let _ = sender.send(AudioCacheEvent::Revalidate { epoch });
+                }
             } else {
                 debug!("File {file_id} cached to {cache_id:?}");
+                send_cache_event(&track_uri, file_id, true, epoch);
             }
         }
     }
@@ -415,11 +535,19 @@ impl AudioFile {
         file_id: FileId,
         bytes_per_second: usize,
         track_uri: &SpotifyUri,
+        epoch: u64,
     ) -> Result<AudioFile, Error> {
         let cache = audio_cache(session, track_uri);
-        if let Some(file) = cache.as_ref().and_then(|cache| cache.file(file_id)) {
-            debug!("File {file_id} already in cache");
-            return Ok(AudioFile::Cached(file));
+        {
+            let active = CACHE_COMMIT_EPOCH.lock().expect("cache commit mutex poisoned");
+            if *active != epoch {
+                return Err(Error::aborted("audio cache was cleared"));
+            }
+            if let Some(file) = cache.as_ref().and_then(|cache| cache.file(file_id)) {
+                debug!("File {file_id} already in cache");
+                send_cache_event(track_uri, file_id, false, epoch);
+                return Ok(AudioFile::Cached(file));
+            }
         }
 
         debug!("Downloading file {file_id}");
@@ -429,7 +557,13 @@ impl AudioFile {
         let streaming =
             AudioFileStreaming::open(session.clone(), file_id, complete_tx, bytes_per_second);
 
-        session.spawn(cache_completed_download(file_id, cache, complete_rx));
+        session.spawn(cache_completed_download(
+            file_id,
+            track_uri.clone(),
+            cache,
+            complete_rx,
+            epoch,
+        ));
 
         Ok(AudioFile::Streaming(streaming.await?))
     }
@@ -707,5 +841,189 @@ impl Seek for AudioFile {
             AudioFile::Cached(ref mut file) => file.seek(pos),
             AudioFile::Streaming(ref mut file) => file.seek(pos),
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_event_tests {
+    use std::{io::Write, path::PathBuf};
+
+    use librespot_core::SessionConfig;
+
+    use super::*;
+
+    fn completed_file() -> oneshot::Receiver<NamedTempFile> {
+        let mut file = NamedTempFile::new().expect("completed download");
+        file.write_all(b"complete audio file").unwrap();
+        file.rewind().unwrap();
+        let (sender, receiver) = oneshot::channel();
+        sender.send(file).expect("completion receiver");
+        receiver
+    }
+
+    #[tokio::test]
+    async fn cache_events_require_successful_song_persistence() {
+        // One test owns the process-wide sender. Distinct URIs isolate events
+        // from the existing persistence tests, which may run concurrently.
+        let song_uri =
+            SpotifyUri::from_uri("spotify:track:0000000000000000000200").unwrap();
+        let episode_uri =
+            SpotifyUri::from_uri("spotify:episode:0000000000000000000201").unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        install_cache_event_sender(sender);
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::new(
+            None::<PathBuf>,
+            None::<PathBuf>,
+            Some(directory.path().join("audio")),
+            None,
+        )
+        .unwrap();
+        let session = Session::new(SessionConfig::default(), Some(cache));
+        let cache = session.cache().unwrap();
+        let saved_id = FileId::from_raw(&[200; 20]);
+
+        cache_completed_download(
+            saved_id,
+            song_uri.clone(),
+            audio_cache(&session, &song_uri),
+            completed_file(),
+            cache_epoch(),
+        )
+        .await;
+        assert_eq!(
+            fs::read(cache.file_path(saved_id).unwrap()).unwrap(),
+            b"complete audio file"
+        );
+
+        let mut cached = AudioFile::open(&session, saved_id, 1, &song_uri, cache_epoch())
+            .await
+            .expect("saved song opens without network");
+        assert!(cached.is_cached());
+        let mut bytes = Vec::new();
+        cached.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"complete audio file");
+
+        let cancelled_id = FileId::from_raw(&[201; 20]);
+        let (cancelled, completion) = oneshot::channel();
+        drop(cancelled);
+        cache_completed_download(
+            cancelled_id,
+            song_uri.clone(),
+            audio_cache(&session, &song_uri),
+            completion,
+            cache_epoch(),
+        )
+        .await;
+        assert!(!cache.file_path(cancelled_id).unwrap().exists());
+
+        let uncached_id = FileId::from_raw(&[202; 20]);
+        cache_completed_download(
+            uncached_id,
+            song_uri.clone(),
+            None,
+            completed_file(),
+            cache_epoch(),
+        )
+        .await;
+        assert!(!cache.file_path(uncached_id).unwrap().exists());
+
+        let episode_id = FileId::from_raw(&[203; 20]);
+        assert!(audio_cache(&session, &episode_uri).is_none());
+        cache_completed_download(
+            episode_id,
+            episode_uri.clone(),
+            audio_cache(&session, &episode_uri),
+            completed_file(),
+            cache_epoch(),
+        )
+        .await;
+        assert!(!cache.file_path(episode_id).unwrap().exists());
+
+        // A directory at the destination forces a real save error on all
+        // platforms, rather than relying on permissions or read-only flags.
+        let failed_id = FileId::from_raw(&[204; 20]);
+        fs::create_dir_all(cache.file_path(failed_id).unwrap()).unwrap();
+        cache_completed_download(
+            failed_id,
+            song_uri.clone(),
+            audio_cache(&session, &song_uri),
+            completed_file(),
+            cache_epoch(),
+        )
+        .await;
+        assert!(cache.file_path(failed_id).unwrap().is_dir());
+
+        let disabled_cache = Arc::new(
+            Cache::new(None::<PathBuf>, None::<PathBuf>, None::<PathBuf>, None).unwrap(),
+        );
+        assert!(disabled_cache.file_path(saved_id).is_none());
+        cache_completed_download(
+            saved_id,
+            song_uri.clone(),
+            Some(disabled_cache),
+            completed_file(),
+            cache_epoch(),
+        )
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if matches!(&event, AudioCacheEvent::Stored { track_uri, .. } | AudioCacheEvent::Removed { track_uri, .. } if track_uri == &song_uri || track_uri == &episode_uri) {
+                events.push(event);
+            }
+        }
+        assert_eq!(events.len(), 2, "only successful save and cache hit emit");
+        for (index, event) in events.iter().enumerate() {
+            let AudioCacheEvent::Stored { track_uri, file_id, downloaded, .. } = event else { panic!("unexpected removal") };
+            assert_eq!(track_uri, &song_uri);
+            assert_eq!(file_id, &saved_id);
+            assert_eq!(*downloaded, index == 0);
+        }
+
+        // The producer starts before clear, but completion reaches persistence
+        // afterwards. Clearing must fence the commit, not only its UI event.
+        let epoch = cache_epoch();
+        let late_id = FileId::from_raw(&[205; 20]);
+        let (completion, completion_receiver) = oneshot::channel();
+        let late = tokio::spawn(cache_completed_download(
+            late_id, song_uri.clone(), audio_cache(&session, &song_uri), completion_receiver, epoch,
+        ));
+        let root = directory.path().join("audio");
+        fs::write(root.join("cache-version"), b"2\n").unwrap();
+        let credentials = directory.path().join("credentials.json");
+        fs::write(&credentials, b"outside audio cache").unwrap();
+        clear_cached_audio(cache).unwrap();
+        let new_epoch = cache_epoch();
+        assert_ne!(new_epoch, epoch);
+        assert_eq!(fs::read(root.join("cache-version")).unwrap(), b"2\n");
+        assert_eq!(fs::read(&credentials).unwrap(), b"outside audio cache");
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"late complete download").unwrap();
+        file.rewind().unwrap();
+        completion.send(file).unwrap();
+        late.await.unwrap();
+        assert!(!cache.file_path(late_id).unwrap().exists());
+        assert!(!cache.file_path(saved_id).unwrap().exists());
+        assert!(AudioFile::open(&session, saved_id, 1, &song_uri, epoch).await.is_err());
+
+        cache_completed_download(late_id, song_uri.clone(), audio_cache(&session, &song_uri), completed_file(), new_epoch).await;
+        assert!(cache.file_path(late_id).unwrap().exists());
+        remove_cached_audio(&session, &song_uri, late_id, new_epoch).unwrap();
+        assert!(!cache.file_path(late_id).unwrap().exists());
+        let mut removal = false;
+        while let Ok(event) = receiver.try_recv() {
+            if matches!(event, AudioCacheEvent::Removed { file_id, epoch, .. } if file_id == late_id && epoch == new_epoch) {
+                removal = true;
+            }
+        }
+        assert!(removal, "successful decoder rejection publishes file removal");
+
+        let limited_root = directory.path().join("limited-audio");
+        let limited = Cache::new(None::<PathBuf>, None::<PathBuf>, Some(limited_root), Some(32)).unwrap();
+        limited.save_file(saved_id, &mut std::io::Cursor::new([1u8; 24])).unwrap();
+        clear_cached_audio(&limited).unwrap();
+        limited.save_file(late_id, &mut std::io::Cursor::new([2u8; 24])).unwrap();
+        assert!(limited.file_path(late_id).unwrap().exists(), "clear updates the existing cache limiter instead of leaving phantom entries");
     }
 }

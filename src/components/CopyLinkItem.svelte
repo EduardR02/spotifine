@@ -16,14 +16,27 @@
 
   let copied = $state("idle");
   let timer = 0;
-  $effect(() => () => clearTimeout(timer));
+  let generation = 0;
+  $effect(() => {
+    link;
+    copied = "idle";
+    return () => {
+      generation += 1;
+      clearTimeout(timer);
+    };
+  });
 
   async function copy() {
-    if (!link) return;
-    const ok = await writeClipboard(link);
+    const target = link;
+    if (!target) return;
+    const mine = generation;
+    const ok = await writeClipboard(target);
+    if (mine !== generation) return;
     copied = ok ? "copied" : "failed";
     clearTimeout(timer);
-    if (ok) timer = setTimeout(() => close?.(true), 900);
+    if (ok) timer = setTimeout(() => {
+      if (mine === generation) close?.(true);
+    }, 900);
   }
 </script>
 

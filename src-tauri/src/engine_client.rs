@@ -95,6 +95,33 @@ pub struct EngineReply {
 struct PendingRequest {
     sender: oneshot::Sender<EngineReply>,
     cache_generation: u64,
+    account_generation: u64,
+    resets_cache_marks: bool,
+}
+
+struct RequestGuard<'a> {
+    pending: &'a Mutex<HashMap<String, PendingRequest>>,
+    id: &'a str,
+}
+
+impl Drop for RequestGuard<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.pending.lock();
+        // A sent clear still owns a reset even if its caller stops waiting.
+        // Its small correlation entry is retired by the ACK or EOF.
+        if pending.get(self.id).is_some_and(|request| request.resets_cache_marks) { return; }
+        pending.remove(self.id);
+    }
+}
+
+struct InputLine {
+    line: String,
+    written: oneshot::Sender<Result<(), String>>,
+}
+
+struct EngineInput {
+    generation: u64,
+    sender: SyncSender<InputLine>,
 }
 
 /// The engine's 2-second scalar position heartbeat. Deliberately not a
@@ -702,8 +729,8 @@ fn discard_invalidated_claims(value: &mut Value, ids: &HashSet<String>) {
 
 pub struct EngineClient {
     state_dir: PathBuf,
-    pending: tokio::sync::Mutex<HashMap<String, PendingRequest>>,
-    stdin: Mutex<Option<ChildStdin>>,
+    pending: Mutex<HashMap<String, PendingRequest>>,
+    stdin: Mutex<Option<EngineInput>>,
     process: Mutex<Option<Child>>,
     state_tx: tokio::sync::broadcast::Sender<StateLine>,
     exit_tx: watch::Sender<bool>,
@@ -712,6 +739,8 @@ pub struct EngineClient {
     observed_state: Mutex<Option<PlaybackState>>,
     has_authenticated_state: AtomicBool,
     cache_generation: AtomicU64,
+    account_generation: AtomicU64,
+    account_identity: Mutex<Option<String>>,
     /// The rows of the newest payload that carried a queue, for filling the
     /// ones that omit it. Kept apart from `last_state` on purpose: the
     /// durability filter below refuses previews and restore intermediates,
@@ -736,8 +765,9 @@ pub struct EngineClient {
     queue_generation: AtomicU64,
     persist_thread: Mutex<Option<JoinHandle<()>>>,
     next_request_id: AtomicU64,
+    process_generation: AtomicU64,
     shutting_down: AtomicBool,
-    /// Serializes duplicate exit paths; every caller waits for the final flush.
+    /// Serializes child admission/publication, EOF cleanup and final shutdown.
     shutdown_lock: Mutex<()>,
 }
 
@@ -757,7 +787,7 @@ impl EngineClient {
         });
         let client = Arc::new(Self {
             state_dir: engine_state_dir(),
-            pending: tokio::sync::Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             stdin: Mutex::new(None),
             process: Mutex::new(None),
             state_tx,
@@ -766,6 +796,8 @@ impl EngineClient {
             observed_state: Mutex::new(None),
             has_authenticated_state: AtomicBool::new(false),
             cache_generation: AtomicU64::new(0),
+            account_generation: AtomicU64::new(0),
+            account_identity: Mutex::new(None),
             delta_base: Mutex::new(DeltaBase::default()),
             preview_active: AtomicBool::new(false),
             restore_pending: Mutex::new(restore_pending),
@@ -775,6 +807,7 @@ impl EngineClient {
             queue_generation: AtomicU64::new(0),
             persist_thread: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
+            process_generation: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             shutdown_lock: Mutex::new(()),
         });
@@ -1001,8 +1034,11 @@ impl EngineClient {
     /// Spawns the engine process and its reader thread. Only called when no
     /// process is currently running.
     fn spawn_engine(self: &Arc<Self>) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("the playback engine is shutting down".to_owned());
+        }
         let exe = locate_engine()
-            .ok_or_else(|| format!("{ENGINE_BINARY} not found (set SPOTIFY_ENGINE_PATH)"))?;
+            .ok_or_else(|| format!("bundled {ENGINE_BINARY} not found"))?;
         std::fs::create_dir_all(&self.state_dir)
             .map_err(|error| format!("could not create engine state dir: {error}"))?;
         // The engine's diagnostics live in the same file the panic hook
@@ -1053,26 +1089,32 @@ impl EngineClient {
             use std::os::windows::process::CommandExt;
             command.creation_flags(DETACHED_PROCESS);
         }
-        let mut child = command
-            .spawn()
+        let pid = self.spawn_child(&mut command)
             .map_err(|error| format!("could not spawn {exe:?}: {error}"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "engine stdout is unavailable".to_owned())?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "engine stdin is unavailable".to_owned())?;
-        let pid = child.id();
-        *self.stdin.lock() = Some(stdin);
-        *self.process.lock() = Some(child);
-        spawn_reader(stdout, self);
         log::info(&format!(
             "engine spawned (pid {pid}); log={}",
             engine_log.display()
         ));
         Ok(())
+    }
+
+    fn spawn_child(self: &Arc<Self>, command: &mut Command) -> Result<u32, String> {
+        let _lifecycle = self.shutdown_lock.lock();
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("the playback engine is shutting down".to_owned());
+        }
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("engine input/output pipe is unavailable".to_owned());
+        };
+        let pid = child.id();
+        let generation = self.process_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *self.process.lock() = Some(child);
+        *self.stdin.lock() = Some(spawn_input_writer(stdin, generation));
+        spawn_reader(stdout, self);
+        Ok(pid)
     }
 
     fn next_request_id(&self) -> String {
@@ -1084,63 +1126,75 @@ impl EngineClient {
 
     /// Writes one request line and awaits its reply.
     pub async fn request(&self, kind: &str, args: Value) -> Result<EngineReply, String> {
+        let timeout = request_timeout(kind);
+        let deadline = tokio::time::Instant::now() + timeout;
         let request_id = self.next_request_id();
         let cancellation_track_id = waveform_timeout_cancellation(kind, &args);
         let (sender, receiver) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().await;
+            let mut pending = self.pending.lock();
             pending.insert(request_id.clone(), PendingRequest {
                 sender,
                 cache_generation: self.cache_generation(),
+                account_generation: self.account_generation.load(Ordering::Acquire),
+                resets_cache_marks: kind == "clear_audio_cache",
             });
         }
+        let _pending = RequestGuard { pending: &self.pending, id: &request_id };
         let line = build_line(&request_id, kind, args);
-        if let Err(error) = self.write_line(&line) {
-            let mut pending = self.pending.lock().await;
-            pending.remove(&request_id);
-            return Err(error);
-        }
-        let timeout = request_timeout(kind);
-        match tokio::time::timeout(timeout, receiver).await {
-            Ok(Ok(reply)) if reply.ok => Ok(reply),
-            Ok(Ok(reply)) => Err(reply
-                .error
-                .unwrap_or_else(|| "engine rejected the request".to_owned())),
-            Ok(Err(_)) => Err("engine request was dropped".to_owned()),
+        let (generation, written) = match self.write_line(line) {
+            Ok(queued) => queued,
+            Err(error) => {
+                self.pending.lock().remove(&request_id);
+                return Err(error);
+            }
+        };
+        let mut write_complete = false;
+        let result = tokio::time::timeout_at(deadline, async {
+            written.await.map_err(|_| "engine input writer stopped".to_owned())??;
+            write_complete = true;
+            let reply = receiver.await.map_err(|_| "engine request was dropped".to_owned())?;
+            if reply.ok { Ok(reply) }
+            else { Err(reply.error.unwrap_or_else(|| "engine rejected the request".to_owned())) }
+        }).await;
+        if !write_complete { self.retire_process(generation); }
+        match result {
+            Ok(result) => {
+                result
+            }
             Err(_) => {
-                let mut pending = self.pending.lock().await;
-                pending.remove(&request_id);
-                drop(pending);
-                if let Some(track_id) = cancellation_track_id {
-                    // The caller has stopped waiting, so release the engine's
-                    // one global waveform worker as well. This is deliberately
-                    // untracked: cancellation is idempotent and its response
-                    // has no payload the shell needs.
-                    let cancel_id = self.next_request_id();
-                    let cancel = build_line(
-                        &cancel_id,
-                        "cancel_track_waveform",
-                        json!({"track_id": track_id}),
-                    );
-                    let _ = self.write_line(&cancel);
+                if write_complete {
+                    if let Some(track_id) = cancellation_track_id {
+                        let cancel = build_line(&self.next_request_id(), "cancel_track_waveform",
+                            json!({"track_id": track_id}));
+                        let input = self.stdin.lock();
+                        if let Some(input) = input.as_ref().filter(|input| input.generation == generation) {
+                            let (written, _) = oneshot::channel();
+                            let _ = input.sender.try_send(InputLine { line: cancel, written });
+                        }
+                    }
                 }
-                Err(format!(
-                    "engine did not answer {kind} within {}s",
-                    timeout.as_secs()
-                ))
+                Err(format!("engine did not answer {kind} within {}s", timeout.as_secs()))
             }
         }
     }
 
-    fn write_line(&self, line: &str) -> Result<(), String> {
-        let mut stdin = self.stdin.lock();
-        let pipe = stdin
-            .as_mut()
-            .ok_or_else(|| "the playback engine is not running".to_owned())?;
-        pipe.write_all(line.as_bytes())
-            .and_then(|_| pipe.write_all(b"\n"))
-            .and_then(|_| pipe.flush())
-            .map_err(|error| format!("could not write to the playback engine: {error}"))
+    fn write_line(&self, line: String) -> Result<(u64, oneshot::Receiver<Result<(), String>>), String> {
+        let stdin = self.stdin.lock();
+        let input = stdin.as_ref().ok_or_else(|| "the playback engine is not running".to_owned())?;
+        let (written, completion) = oneshot::channel();
+        input.sender.try_send(InputLine { line, written })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => "engine input queue is full".to_owned(),
+                TrySendError::Disconnected(_) => "engine input writer stopped".to_owned(),
+            })?;
+        Ok((input.generation, completion))
+    }
+
+    fn retire_process(&self, generation: u64) {
+        let mut process = self.process.lock();
+        if self.process_generation.load(Ordering::Acquire) != generation { return; }
+        if let Some(child) = process.as_mut() { let _ = child.kill(); }
     }
 
     // ------------------------------------------------------------------
@@ -1149,6 +1203,10 @@ impl EngineClient {
 
     pub async fn status(&self) -> Result<(), String> {
         self.request("status", Value::Null).await.map(|_| ())
+    }
+
+    pub async fn clear_audio_cache(&self) -> Result<(), String> {
+        self.request("clear_audio_cache", Value::Null).await.map(|_| ())
     }
 
     pub async fn play(&self) -> Result<(), String> {
@@ -1474,6 +1532,8 @@ impl EngineClient {
     }
 
     fn clear_session_restore(&self) {
+        self.account_generation.fetch_add(1, Ordering::AcqRel);
+        *self.account_identity.lock() = None;
         {
             let mut pending = self.restore_pending.lock();
             let mut last_state = self.last_state.lock();
@@ -1910,8 +1970,9 @@ impl EngineClient {
         log::info("engine shutdown requested");
 
         let line = build_line(&self.next_request_id(), "shutdown", Value::Null);
-        let _ = self.write_line(&line);
-        if let Some(mut child) = self.process.lock().take() {
+        let _ = self.write_line(line);
+        let child = self.process.lock().take();
+        if let Some(mut child) = child {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 match child.try_wait() {
@@ -2055,9 +2116,17 @@ impl EngineClient {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
-        if state.uncached_ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
-            self.cache_generation.fetch_add(1, Ordering::AcqRel);
-        }
+        let account_changed = {
+            let mut identity = self.account_identity.lock();
+            let next = if state.auth_state == "ready" { Some(state.username.clone()) }
+                else if matches!(state.auth_state.as_str(), "logged_out" | "needs_login") { None }
+                else { identity.clone() };
+            let changed = identity.is_some() && *identity != next;
+            if changed { self.account_generation.fetch_add(1, Ordering::AcqRel); }
+            *identity = next;
+            changed
+        };
+        if account_changed { self.clear_cache_marks(); }
         // A false state only reconciles a lease after this client has
         // observed the engine in preview mode. An unrelated false state
         // arriving before activation must not clear a freshly claimed lease.
@@ -2155,7 +2224,7 @@ impl EngineClient {
             return;
         }
         let line = build_line(&self.next_request_id(), "status", Value::Null);
-        if let Err(error) = self.write_line(&line) {
+        if let Err(error) = self.write_line(line) {
             log::warn(&format!(
                 "could not ask the engine to re-send the state of revision {revision}: {error}"
             ));
@@ -2216,11 +2285,12 @@ impl EngineClient {
     }
 
     fn on_eof(&self) {
+        let _lifecycle = self.shutdown_lock.lock();
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
         log::warn("engine process exited (stdout closed)");
-        let mut pending = self.pending.blocking_lock();
+        let mut pending = self.pending.lock();
         for (_, request) in pending.drain() {
             let _ = request.sender.send(EngineReply {
                 ok: false,
@@ -2257,13 +2327,30 @@ impl EngineClient {
         *self.delta_base.lock() = DeltaBase::default();
         let _ = self.state_tx.send(StateLine::Disconnected);
         *self.stdin.lock() = None;
-        *self.process.lock() = None;
+        let child = self.process.lock().take();
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         self.exit_tx.send_replace(true);
     }
 
     fn deliver(&self, request_id: &str, mut reply: EngineReply) {
-        let mut pending = self.pending.blocking_lock();
+        let mut pending = self.pending.lock();
         if let Some(request) = pending.remove(request_id) {
+            if request.account_generation != self.account_generation.load(Ordering::Acquire) {
+                let _ = request.sender.send(EngineReply {
+                    ok: false,
+                    error: Some("the engine account changed while the request was running".to_owned()),
+                    data: None,
+                });
+                return;
+            }
+            if reply.ok && request.resets_cache_marks {
+                // The wire ACK is the reset boundary. The caller may wake
+                // after new positive lines, so it must never reset again.
+                self.clear_cache_marks();
+            }
             if request.cache_generation != self.cache_generation() {
                 if let Some(data) = &mut reply.data { discard_cached_claims(data); }
             }
@@ -2276,6 +2363,24 @@ impl EngineClient {
             let _ = request.sender.send(reply);
         }
     }
+}
+
+/// One ordered owner of each child's blocking pipe; killing the child
+/// releases a stalled write without occupying an async runtime worker.
+fn spawn_input_writer(mut pipe: ChildStdin, generation: u64) -> EngineInput {
+    let (sender, receiver) = mpsc::sync_channel::<InputLine>(64);
+    std::thread::Builder::new().name("engine-writer".to_owned()).spawn(move || {
+        for input in receiver {
+            let result = pipe.write_all(input.line.as_bytes())
+                .and_then(|_| pipe.write_all(b"\n"))
+                .and_then(|_| pipe.flush())
+                .map_err(|error| format!("could not write to the playback engine: {error}"));
+            let failed = result.is_err();
+            let _ = input.written.send(result);
+            if failed { break; }
+        }
+    }).expect("could not start engine input writer thread");
+    EngineInput { generation, sender }
 }
 
 fn spawn_persistence_writer(
@@ -2570,9 +2675,10 @@ fn parse_data<T: serde::de::DeserializeOwned>(reply: EngineReply, kind: &str) ->
     serde_json::from_value(data).map_err(|error| format!("unexpected {kind} payload: {error}"))
 }
 
-/// Locates the engine executable: `SPOTIFY_ENGINE_PATH`, the app's bundled
-/// resource (or Windows sibling), or the workspace's release build.
+/// Release builds use only the bundled resource (or Windows sibling).
+/// Development builds may override it or use the workspace release binary.
 fn locate_engine() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os("SPOTIFY_ENGINE_PATH") {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -2595,8 +2701,12 @@ fn locate_engine() -> Option<PathBuf> {
     }
     // In development the shell runs from target/debug, but the bundler builds
     // its engine resource into the shared workspace target/release directory.
-    let workspace_release = exe_dir.parent()?.join("release").join(ENGINE_BINARY);
-    workspace_release.is_file().then_some(workspace_release)
+    #[cfg(debug_assertions)]
+    {
+        let workspace_release = exe_dir.parent()?.join("release").join(ENGINE_BINARY);
+        if workspace_release.is_file() { return Some(workspace_release); }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2735,7 +2845,7 @@ mod tests {
         delta_base.adopt(&state, PayloadRows::Sent);
         Arc::new(EngineClient {
             state_dir: PathBuf::new(),
-            pending: tokio::sync::Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             stdin: Mutex::new(None),
             process: Mutex::new(None),
             state_tx,
@@ -2743,6 +2853,8 @@ mod tests {
             observed_state: Mutex::new(Some(state.clone())),
             has_authenticated_state: AtomicBool::new(state.auth_state == "ready"),
             cache_generation: AtomicU64::new(0),
+            account_generation: AtomicU64::new(0),
+            account_identity: Mutex::new((state.auth_state == "ready").then(|| state.username.clone())),
             last_state: Mutex::new(Some(state)),
             delta_base: Mutex::new(delta_base),
             preview_active: AtomicBool::new(false),
@@ -2753,6 +2865,7 @@ mod tests {
             queue_generation: AtomicU64::new(0),
             persist_thread: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
+            process_generation: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             shutdown_lock: Mutex::new(()),
         })
@@ -2871,7 +2984,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             // hide its window without detaching it from those handles.
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .spawn().unwrap();
-        *client.stdin.lock() = child.stdin.take();
+        *client.stdin.lock() = child.stdin.take().map(|pipe| spawn_input_writer(pipe, 0));
         spawn_reader(child.stdout.take().unwrap(), &client);
         let reply = client.request("browse_playlist", json!({"id": "temporary"})).await.unwrap();
         assert_eq!(reply.data.unwrap()["tracks"][0]["cached"], false);
@@ -2883,6 +2996,238 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             if matches!(lines.recv().await.unwrap(), StateLine::CacheMarksReset) { break; }
         }
         assert!(!client.current_state().unwrap().queue[0].cached);
+    }
+
+    #[cfg(windows)]
+    fn start_fake_child(client: &Arc<EngineClient>, script: &str) {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+            .creation_flags(0x0800_0000);
+        client.exit_tx.send_replace(false);
+        client.spawn_child(&mut command).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_racing_real_child_admission_never_leaves_a_late_process_alive() {
+        use std::os::windows::process::CommandExt;
+        for _ in 0..4 {
+            let client = client_with_last_state(boundary_state());
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let launched = {
+                let client = client.clone();
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    let mut command = Command::new("powershell.exe");
+                    command.args(["-NoProfile", "-NonInteractive", "-Command",
+                        "[Console]::ReadLine() | Out-Null"])
+                        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+                        .creation_flags(0x0800_0000);
+                    gate.wait();
+                    client.spawn_child(&mut command)
+                })
+            };
+            gate.wait();
+            client.shutdown_engine();
+            if let Ok(pid) = launched.join().unwrap() {
+                // Observe the OS process boundary, not merely the cached handle.
+                let query = format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }}");
+                assert!(Command::new("powershell.exe")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+                    .creation_flags(0x0800_0000).status().unwrap().success(),
+                    "a child published after shutdown survived");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reader_account_departure_rejects_old_browse_before_shell_consumes_state() {
+        for auth in ["ready", "logged_out", "needs_login", "authenticating"] {
+            let state = PlaybackState { username: "account-one".into(), ..boundary_state() };
+            let client = client_with_last_state(state);
+            let identity = if auth == "ready" { "account-two" } else { "account-one" };
+            let line = json!({"type": "state", "auth_state": auth, "username": identity,
+                "queue_revision": 7, "order_revision": 7}).to_string();
+            let script = format!(r#"
+$request = [Console]::ReadLine() | ConvertFrom-Json
+[Console]::WriteLine('{line}')
+[Console]::WriteLine((@{{request_id=$request.request_id; ok=$true; data=@{{tracks=@(@{{id='old-account-row'}})}}}} | ConvertTo-Json -Depth 5 -Compress))
+[Console]::ReadLine() | Out-Null
+"#);
+            start_fake_child(&client, &script);
+            // No shell consumer subscribes: the reader itself owns this fence.
+            let result = client.request("browse_playlist", json!({"id": "temporary"})).await;
+            if auth == "authenticating" {
+                assert!(result.is_ok(), "same-account reconnect keeps its namespace");
+            } else {
+                assert!(result.unwrap_err().contains("account changed"));
+            }
+            client.retire_process(client.process_generation.load(Ordering::Acquire));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_ack_resets_before_fresh_cache_evidence_and_failed_clear_keeps_marks() {
+        for ok in [true, false] {
+            let client = client_with_last_state(boundary_state());
+            let mut lines = client.subscribe_lines();
+            let script = format!(r#"
+$request = [Console]::ReadLine() | ConvertFrom-Json
+[Console]::WriteLine((@{{request_id=$request.request_id; ok=${ok}; error='clear failed'}} | ConvertTo-Json -Compress))
+[Console]::WriteLine('{{"type":"state","auth_state":"ready","queue_revision":7,"order_revision":7,"cached_ids":["b"]}}')
+[Console]::WriteLine('{{"type":"volume","volume":52}}')
+[Console]::ReadLine() | Out-Null
+"#);
+            start_fake_child(&client, &script);
+            let clear = {
+                let client = client.clone();
+                tokio::spawn(async move { client.clear_audio_cache().await })
+            };
+            // Deliberately observe the immediate post-ACK positives before
+            // resuming the caller's continuation.
+            let mut reset_seen = false;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match lines.recv().await.unwrap() {
+                        StateLine::CacheMarksReset => reset_seen = true,
+                        StateLine::Volume(52) => break,
+                        _ => {}
+                    }
+                }
+            }).await.unwrap();
+            assert_eq!(clear.await.unwrap().is_ok(), ok);
+            assert_eq!(reset_seen, ok, "failed clears must not erase valid badges");
+            let mut browsed = vec![Track { id: "b".into(), ..Default::default() }];
+            client.reconcile_cached_rows(&mut browsed, client.cache_generation());
+            assert!(browsed[0].cached, "a fresh post-clear download survives the late awaiter");
+            assert_eq!(client.current_state().unwrap().queue[0].cached, !ok,
+                "only acknowledged clear retires earlier queue badges");
+            client.retire_process(client.process_generation.load(Ordering::Acquire));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_clear_awaiter_cannot_suppress_its_later_successful_reset() {
+        let client = client_with_last_state(boundary_state());
+        let mut lines = client.subscribe_lines();
+        start_fake_child(&client, r#"
+$request = [Console]::ReadLine() | ConvertFrom-Json
+[Console]::WriteLine('{"type":"volume","volume":53}')
+[Console]::ReadLine() | Out-Null
+[Console]::WriteLine((@{request_id=$request.request_id; ok=$true} | ConvertTo-Json -Compress))
+[Console]::WriteLine('{"type":"volume","volume":54}')
+[Console]::ReadLine() | Out-Null
+"#);
+        let clear = {
+            let client = client.clone();
+            tokio::spawn(async move { client.clear_audio_cache().await })
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(lines.recv().await.unwrap(), StateLine::Volume(53)) { break; }
+            }
+        }).await.unwrap();
+        clear.abort();
+        assert!(clear.await.unwrap_err().is_cancelled());
+        let release = build_line(&client.next_request_id(), "status", Value::Null);
+        client.write_line(release).unwrap().1.await.unwrap().unwrap();
+        let mut reset_seen = false;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match lines.recv().await.unwrap() {
+                    StateLine::CacheMarksReset => reset_seen = true,
+                    StateLine::Volume(54) => break,
+                    _ => {}
+                }
+            }
+        }).await.unwrap();
+        assert!(reset_seen);
+        assert!(!client.current_state().unwrap().queue[0].cached);
+        client.retire_process(client.process_generation.load(Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrelated_eviction_preserves_browse_badges_and_positive_then_reset_precedence() {
+        let client = client_with_last_state(boundary_state());
+        let mut lines = client.subscribe_lines();
+        start_fake_child(&client, r#"
+$ErrorActionPreference = 'Stop'
+$request = [Console]::ReadLine() | ConvertFrom-Json
+[Console]::WriteLine('{"type":"state","auth_state":"ready","queue_revision":7,"order_revision":7,"uncached_ids":["a"]}')
+[Console]::WriteLine((@{request_id=$request.request_id; ok=$true; data=@{tracks=@(@{id='a'; cached=$true}, @{id='b'; cached=$true})}} | ConvertTo-Json -Depth 5 -Compress))
+$request = [Console]::ReadLine() | ConvertFrom-Json
+[Console]::WriteLine('{"type":"state","auth_state":"ready","queue_revision":7,"order_revision":7,"cached_ids":["a"]}')
+[Console]::WriteLine((@{request_id=$request.request_id; ok=$true; data=@{tracks=@(@{id='a'; cached=$true}, @{id='b'; cached=$true})}} | ConvertTo-Json -Depth 5 -Compress))
+$request = [Console]::ReadLine() | ConvertFrom-Json
+    [Console]::WriteLine('{"type":"volume","volume":51}')
+    [Console]::ReadLine() | Out-Null
+[Console]::WriteLine((@{request_id=$request.request_id; ok=$true; data=@{tracks=@(@{id='a'; cached=$true}, @{id='b'; cached=$true})}} | ConvertTo-Json -Depth 5 -Compress))
+[Console]::ReadLine() | Out-Null
+"#);
+        let reply = client.request("browse_playlist", json!({"id": "temporary"})).await.unwrap();
+        let mut tracks: Vec<Track> = serde_json::from_value(reply.data.unwrap()["tracks"].clone()).unwrap();
+        client.reconcile_cached_rows(&mut tracks, client.cache_generation());
+        assert!(!tracks[0].cached);
+        assert!(tracks[1].cached, "unrelated file is still cached");
+        let reply = client.request("browse_playlist", json!({"id": "temporary"})).await.unwrap();
+        assert_eq!(reply.data.unwrap()["tracks"][0]["cached"], true, "new positive wins");
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move { client.request("browse_playlist", json!({"id": "temporary"})).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(lines.recv().await.unwrap(), StateLine::Volume(51)) { break; }
+            }
+        }).await.unwrap();
+        client.clear_cache_marks();
+        let release = build_line(&client.next_request_id(), "status", Value::Null);
+        client.write_line(release).unwrap().1.await.unwrap().unwrap();
+        let data = request.await.unwrap().unwrap().data.unwrap();
+        assert_eq!(data["tracks"][0]["cached"], false);
+        assert_eq!(data["tracks"][1]["cached"], false, "reset fences every row");
+        let generation = client.process_generation.load(Ordering::Acquire);
+        client.retire_process(generation);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_child_input_times_out_without_blocking_runtime_and_replacement_answers() {
+        let client = client_with_last_state(boundary_state());
+        let mut exited = client.exit_tx.subscribe();
+        start_fake_child(&client, "Start-Sleep -Seconds 60");
+        let started = Instant::now();
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move { client.request("play_queue", json!({"queue": "x".repeat(4 * 1024 * 1024)})).await })
+        };
+        // On two workers this also catches a second command blocked on the
+        // old stdin mutex: both timers must still get runtime time.
+        let second = {
+            let client = client.clone();
+            tokio::spawn(async move { client.status().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), tokio::time::sleep(Duration::from_millis(100))).await.unwrap();
+        let error = request.await.unwrap().unwrap_err();
+        assert!(error.contains("within 10s") || error.contains("exited"), "{error}");
+        assert!(second.await.unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(15));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !*exited.borrow() { exited.changed().await.unwrap(); }
+        }).await.unwrap();
+        start_fake_child(&client, r#"
+$request = [Console]::ReadLine() | ConvertFrom-Json
+[Console]::WriteLine((@{request_id=$request.request_id; ok=$true} | ConvertTo-Json -Compress))
+[Console]::ReadLine() | Out-Null
+"#);
+        client.status().await.unwrap();
+        client.retire_process(client.process_generation.load(Ordering::Acquire));
     }
 
     fn persisted(snapshot: PlaybackSnapshot, queue_generation: u64) -> PersistedSnapshot {

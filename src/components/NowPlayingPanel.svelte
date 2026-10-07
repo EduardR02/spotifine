@@ -14,13 +14,15 @@
   import ArtistLinks from "./ArtistLinks.svelte";
   import Icon from "./Icon.svelte";
   import WindowControls from "./WindowControls.svelte";
-  import { drawsWindowControls } from "../lib/window-frame.svelte.js";
+  import { drawsWindowControls, frame } from "../lib/window-frame.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { haze } from "../lib/ambient.svelte.js";
   import { panel as panelState } from "../lib/panel.svelte.js";
   import { formatTime } from "../lib/time.js";
   import { scrollbar } from "../lib/scrollbar.js";
   import { createCanvasOwner } from "../lib/canvas.js";
+
+  let { open } = $props();
 
   const current = $derived(
     playback.current_index >= 0 ? (playback.queue[playback.current_index] ?? null) : null,
@@ -30,43 +32,56 @@
 
   /* ---- The picture -----------------------------------------------------
      One layout. The picture is the Canvas when this record has one and it
-     has decoded, filling the panel; otherwise — no Canvas, not yet, or the
-     cover asked for — it is the cover, in the hero. Changing between them
+     has decoded, filling the panel; otherwise — no Canvas or the cover
+     asked for — it is the cover in the hero. Changing between them
      is a crossfade of two elements that never move; so is changing from
-     one record's Canvas to the next one's. */
+     one record's Canvas to the next one's.
+
+     It changes once per record, with the haze (canvas.js): while what the
+     record is lit from is being decided, the picture is the last record's,
+     loop or cover, and the copy under it is already the new record's. */
   /** A Spotify track's id: what its Canvas is asked and kept by. */
   const trackId = (uri) => (uri?.startsWith("spotify:track:") ? uri.slice("spotify:track:".length) : "");
   const canvasTrackKey = $derived(trackId(current?.uri));
   /** The record the engine is fetching ahead, near the end of this one. */
   const aheadKey = $derived(trackId(playback.preload_uri));
+  /** This record's cover, as the hero draws it. */
+  const recordCover = $derived(current && {
+    src: current.cover_url,
+    id: current.album_id || current.uri,
+    name: current.album_name || current.name,
+  });
   /** This record's Canvas: the source of its loop. */
   let canvasUrl = $state("");
-  /** THIS record's Canvas has decoded. Cleared the moment the track changes:
-      the loop on screen is the previous record's. */
-  let canvasReady = $state(false);
   /** What the haze is lit from for this record (canvas.js). */
   let hazeSource = $state("cover");
   /** The loop loaded ahead, for the record the engine is fetching ahead. */
   let warmUrl = $state("");
-  /** A look at this record's cover; the next record arrives on its Canvas. */
-  let preferCover = $state(false);
+  /** What the panel shows (canvas.js): { loop, cover, swap }. */
+  let shown = $state.raw({ loop: "", cover: null, swap: false });
+  /** The outgoing cover stays intact until its fade finishes. */
+  let leavingCover = $state.raw(null);
+  const artCover = $derived(leavingCover ?? (videoShown ? null : shown.cover));
+  const heroCover = $derived(artCover ?? shown.cover ?? recordCover);
   /** The hero's copy has scrolled up under the head. */
   let headOver = $state(false);
-  let pageVisible = $state(!document.hidden);
+  let documentVisible = $state(!document.hidden);
+  const pageVisible = $derived(documentVisible && !frame.minimized);
   let reducedMotion = $state(false);
 
   /** Every loop the panel holds, by source. */
   let loops = $state.raw({});
-  /** This record's loop. */
-  const videoEl = $derived(loops[canvasUrl] ?? null);
+  /** The loop on screen; this record's, or the last one's while it is held. */
+  const frontEl = $derived(loops[shown.loop] ?? null);
   let panelEl = $state(null);
   let scrollEl = $state(null);
   let detailsEl = $state(null);
   let headSentinel = $state(null);
 
-  const videoShown = $derived(Boolean(canvasUrl) && canvasReady && !preferCover);
+  /** A loop is the picture. */
+  const videoShown = $derived(Boolean(shown.loop));
   /** The cover-or-Canvas choice, there only while there is one. */
-  const canSwap = $derived(Boolean(current) && canvasReady);
+  const canSwap = $derived(Boolean(current) && shown.swap);
   /** The head holds that choice and, on Windows, the window's controls. */
   const hasHead = $derived(canSwap || drawsWindowControls);
 
@@ -74,7 +89,7 @@
      under it is never seen. Written from an effect so every path in and out
      — unmounting included — lands here once. */
   $effect(() => {
-    ui.immersive = videoShown;
+    ui.immersive = open && videoShown;
   });
   $effect(() => () => {
     ui.immersive = false;
@@ -86,7 +101,7 @@
   $effect(() => {
     const media = window.matchMedia("(prefers-reduced-motion: reduce)");
     const updateMotion = () => (reducedMotion = media.matches);
-    const updateVisibility = () => (pageVisible = !document.hidden);
+    const updateVisibility = () => (documentVisible = !document.hidden);
     updateMotion();
     updateVisibility();
     media.addEventListener?.("change", updateMotion);
@@ -115,52 +130,52 @@
     decoded: (source) => (loops[source]?.readyState ?? 0) >= 2,
     changed: (picture) => {
       canvasUrl = picture.url;
-      canvasReady = picture.ready;
       hazeSource = picture.haze;
       warmUrl = picture.warm;
-      haze.awaiting = picture.haze === "hold";
-      if (picture.resetPreference) preferCover = false;
+      const next = picture.shown;
+      if (next.loop !== shown.loop) {
+        clearTimeout(leaveTimer);
+        leaving = shown.loop;
+        leavingUnder = Boolean(next.loop);
+        leavingCover = next.loop && !shown.loop ? shown.cover : null;
+        leaveTimer = leaving || leavingCover ? setTimeout(() => {
+          leaving = "";
+          leavingCover = null;
+          leaveTimer = 0;
+        }, CROSSFADE_MS) : 0;
+      }
+      shown = next;
+      haze.awaiting = open && picture.haze === "hold";
     },
   });
   $effect(() => {
-    const key = canvasTrackKey;
-    const allowed = appSettings.animated_canvas && !reducedMotion;
-    const visible = pageVisible;
-    const ahead = aheadKey;
-    untrack(() => canvasOwner.update(key, allowed, visible, ahead));
+    const update = {
+      key: canvasTrackKey,
+      cover: recordCover,
+      enabled: appSettings.animated_canvas && !reducedMotion,
+      visible: open && pageVisible,
+      ahead: aheadKey,
+    };
+    untrack(() => canvasOwner.update(update));
   });
   $effect(() => () => canvasOwner.dispose());
 
   /* ---- The loops ---------------------------------------------------------
-     One <video> per source: this record's, the one warmed ahead, and for
-     the length of a crossfade the one it replaced. A loop warmed ahead that
-     becomes this record's is the same element, already decoded. The loop
-     that leaves stays whole under the one that arrives while it fades in
+     One <video> per source: the one on screen, this record's (loading under
+     a held picture), the one warmed ahead, and for the length of a
+     crossfade the one it replaced. A loop warmed ahead that becomes this
+     record's is the same element, already decoded. The loop that leaves
+     stays whole under the one that arrives while it fades in
      (.np-video.under) — two loops fading against each other would let the
-     haze show through halfway — and fades out itself only to the cover. */
+     haze show through halfway — and fades out itself only to the cover;
+     then its element goes, and its decoder with it. */
   /** .np-video's crossfade (app.css). */
   const CROSSFADE_MS = 600;
-  /** The loop on screen. */
-  const front = $derived(videoShown ? canvasUrl : "");
   let leaving = $state("");
   let leavingUnder = $state(false);
-  let lastFront = "";
   let leaveTimer = 0;
-  $effect(() => {
-    const shown = front;
-    untrack(() => {
-      if (shown === lastFront) return;
-      if (lastFront) {
-        leaving = lastFront;
-        leavingUnder = Boolean(shown);
-        clearTimeout(leaveTimer);
-        leaveTimer = setTimeout(() => (leaving = ""), CROSSFADE_MS);
-      }
-      lastFront = shown;
-    });
-  });
   $effect(() => () => clearTimeout(leaveTimer));
-  const sources = $derived([...new Set([leaving, canvasUrl, warmUrl])].filter(Boolean));
+  const sources = $derived([...new Set([leaving, shown.loop, canvasUrl, warmUrl])].filter(Boolean));
 
   /** Files a loop's element under its source. One let go is unloaded at
       once, rather than holding its decoder until some collection. */
@@ -189,7 +204,7 @@
 
   /** Cover or Canvas: a crossfade, nothing else. */
   function swapSurface() {
-    if (canvasReady) preferCover = !preferCover;
+    canvasOwner.swap();
   }
 
   function openAlbum(event) {
@@ -206,24 +221,32 @@
    * also what Spotify does. Whatever lies over it — the details' glass, a
    * dialog — frosts it without stopping it. Beyond that it stops only where
    * nobody can see it at all: the window blurred or hidden, or the cover
-   * shown instead. The panel closing unmounts it.
+   * shown instead. Closing the panel pauses and retains its last picture,
+   * so reopening can hold it while the next Canvas loads.
    */
-  const canvasPlaying = $derived(videoShown && pageVisible && ui.windowFocused && playback.playing);
+  const canvasPlaying = $derived(open && videoShown && pageVisible && ui.windowFocused && playback.playing);
 
-  /* Only this record's loop plays: one warmed ahead waits on its first
-     frame, and the one leaving is gone in a moment. */
+  /* Only the loop on screen plays: one loading or warmed waits on its first
+     frame, and the one leaving is gone in a moment. A held loop plays on
+     while it is held, as it did before the change. */
   $effect(() => {
-    const video = videoEl;
-    if (!video) return;
-    if (canvasPlaying) video.play().catch(() => {});
-    else video.pause();
+    const front = frontEl;
+    const playing = canvasPlaying;
+    for (const video of Object.values(loops)) {
+      if (video === front && playing) {
+        if (video.paused) video.play().catch(() => {});
+      } else if (!video.paused) {
+        video.pause();
+      }
+    }
   });
 
-  /* The haze is drawn from the video while it is the picture here, paused
-     or not (a paused frame is simply a still haze) — unless the haze was
-     lit from the cover before the loop arrived, which it then keeps. */
+  /* The haze is drawn from this record's loop while it is the picture
+     here, paused or not (a paused frame is simply a still haze) — unless
+     the haze was lit from the cover before the loop arrived, which it then
+     keeps. */
   $effect(() => {
-    haze.video = videoShown && hazeSource === "video" && videoEl ? videoEl : null;
+    haze.video = open && hazeSource === "video" && canvasUrl && shown.loop === canvasUrl ? frontEl : null;
   });
 
   /* ---- Where the Canvas sits -------------------------------------------
@@ -261,27 +284,47 @@
 
   const round = (v) => Math.round(v * 100) / 100;
 
+  /** Sizes and centres one loop in the panel's box; where it went, or null
+      before its size is known. */
+  function fitLoop(el, box) {
+    const nw = el.videoWidth;
+    const nh = el.videoHeight;
+    if (!nw || !nh) return null;
+    const scale = Math.min(CANVAS_LIMIT / pixelRatio, Math.max(box.width / nw, box.height / nh));
+    const w = nw * scale;
+    const h = nh * scale;
+    const sx = (box.width - w) / 2;
+    const sy = (box.height - h) / 2;
+    Object.assign(el.style, {
+      left: `${round(sx)}px`,
+      top: `${round(sy)}px`,
+      width: `${round(w)}px`,
+      height: `${round(h)}px`,
+    });
+    return { sx, sy, w, h };
+  }
+
+  /* Every loop the panel holds is placed, so the next one is already where
+     it will be; the one on screen also sets the edge dissolve and is what
+     the haze carries on from. */
   function placeCanvas() {
+    if (!open) {
+      haze.anchor = null;
+      return;
+    }
     const panel = panelEl;
     const stage = stageEl;
     if (!panel || !stage) return;
     const box = panel.getBoundingClientRect();
     const left = box.left / window.innerWidth;
-    const nw = videoEl?.videoWidth;
-    const nh = videoEl?.videoHeight;
+    let fit = null;
+    for (const [source, el] of Object.entries(loops)) {
+      const placed = fitLoop(el, box);
+      if (source === shown.loop) fit = placed;
+    }
     let visible = null;
-    if (nw && nh) {
-      const scale = Math.min(CANVAS_LIMIT / pixelRatio, Math.max(box.width / nw, box.height / nh));
-      const w = nw * scale;
-      const h = nh * scale;
-      const sx = (box.width - w) / 2;
-      const sy = (box.height - h) / 2;
-      Object.assign(videoEl.style, {
-        left: `${round(sx)}px`,
-        top: `${round(sy)}px`,
-        width: `${round(w)}px`,
-        height: `${round(h)}px`,
-      });
+    if (fit) {
+      const { sx, sy, w, h } = fit;
       const floatX = sx > 0.5;
       const floatY = sy > 0.5;
       stage.classList.toggle("float", floatX || floatY);
@@ -305,10 +348,10 @@
         h: round(Math.min(h, box.height)),
       };
     }
-    /* Only a video on screen has colour to carry on. And while the edge is
-       being dragged the haze is slid, not redrawn: the anchor is published
-       once, when it is let go (ambient.svelte.js, THE FROST, 5). */
-    if (!videoShown) visible = null;
+    /* Only a video on screen has colour to carry on (`fit` is the one on
+       screen). And while the edge is being dragged the haze is slid, not
+       redrawn: the anchor is published once, when it is let go
+       (ambient.svelte.js, THE FROST, 5). */
     if (panelState.resizing) return;
     const last = haze.anchor;
     const moved =
@@ -325,7 +368,7 @@
      arrives with its metadata (onloadedmetadata). */
   $effect(() => {
     const panel = panelEl;
-    if (!panel || !stageEl) return;
+    if (!open || !panel || !stageEl) return;
     const place = () => untrack(placeCanvas);
     const observer = new ResizeObserver(place);
     observer.observe(panel);
@@ -336,9 +379,10 @@
     };
   });
   $effect(() => {
+    open;
     pixelRatio;
-    videoEl;
-    videoShown;
+    loops;
+    shown.loop;
     panelState.resizing;
     untrack(placeCanvas);
   });
@@ -370,11 +414,10 @@
     scrollEl?.scrollTo({ top, behavior: reducedMotion ? "instant" : "smooth" });
   }
 
-  /* Credits are content in this panel, not a destination, so they load with
-     the track — only while the panel is mounted, cached per track id. */
+  /* Credits load only while the panel is open, cached per track id. */
   $effect(() => {
     const track = current;
-    if (track?.uri?.startsWith("spotify:track:")) untrack(() => loadTrackCredits(track));
+    if (open && pageVisible && track?.uri?.startsWith("spotify:track:")) untrack(() => loadTrackCredits(track));
   });
 
   /** Groups worth showing inline; the rest live behind "all credits". */
@@ -387,8 +430,8 @@
   /** How many names each group shows before it starts counting the remainder. */
   const PANEL_NAMES = 4;
 
-  /** The record's colour: the light the cover casts. */
-  const tone = $derived(coverTone(current?.cover_url ?? "", current?.album_id || current?.uri || ""));
+  /** The record's colour: the light the cover in the hero casts. */
+  const tone = $derived(coverTone(heroCover?.src ?? "", heroCover?.id ?? ""));
 
   /* How much help the type needs, from the light the haze measured under
      it (1 until measured: unknown is white). The hero's glyph shadow grows
@@ -405,7 +448,8 @@
   class:video={videoShown}
   bind:this={panelEl}
   aria-label="Now playing details"
-  style:--tone-glow={tone.glow}
+  hidden={!open}
+  style:--tone-glow={open && pageVisible ? tone.glow : undefined}
   style:--np-shade={shade}
   style:--plate-a={plateAlpha}
 >
@@ -415,7 +459,7 @@
       {#each sources as source (source)}
         <video
           class="np-video"
-          class:shown={source === front}
+          class:shown={source === shown.loop}
           class:under={source === leaving && leavingUnder}
           use:holdLoop={source}
           src={source}
@@ -434,25 +478,24 @@
 
     <div class="np-scroll" bind:this={scrollEl} use:scrollbar={{ top: hasHead ? 56 : 0 }}>
       <section class="np-hero">
-        <div class="np-art" class:away={videoShown}>
-          <div class="np-art-tile">
-            <Cover
-              src={current.cover_url}
-              id={current.album_id || current.uri}
-              name={current.album_name || current.name}
-              fill
-              lg
-            />
-          </div>
+        <div class="np-art" class:away={videoShown || !artCover}>
+          {#if artCover}
+            <div class="np-art-tile">
+              <Cover src={artCover.src} id={artCover.id} name={artCover.name} fill lg />
+            </div>
+          {/if}
         </div>
-        {#key current.id}
-          <div class="np-hero-copy">
-            <span class="np-sentinel np-head-line" bind:this={headSentinel} aria-hidden="true"></span>
-            {@render identity()}
-          </div>
-        {/key}
+        {#if open}
+          {#key current.id}
+            <div class="np-hero-copy">
+              <span class="np-sentinel np-head-line" bind:this={headSentinel} aria-hidden="true"></span>
+              {@render identity()}
+            </div>
+          {/key}
+        {/if}
       </section>
 
+      {#if open}
       {#key current.id}
         <div class="np-details" bind:this={detailsEl}>
           {#if current.album_id || current.album_name}
@@ -529,6 +572,7 @@
           {/if}
         </div>
       {/key}
+      {/if}
     </div>
   {:else}
     <div class="np-empty">

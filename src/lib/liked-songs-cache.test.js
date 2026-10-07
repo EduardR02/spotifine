@@ -38,6 +38,7 @@ const idsOf = (detail) => detail.tracks.map((row) => row.id);
 test("an account change during a walk is not answered by that walk", async () => {
   applyPlayback({ auth_state: "ready", username: "alice" });
   const alice = api.browseLikedSongs(null);
+  const stale = alice.then(() => ({ rejected: false }), (error) => ({ rejected: true, error }));
   expect(calls.length).toBe(1, "alice's first page is walked once");
 
   // The account changes while that walk is still in the air.
@@ -45,13 +46,14 @@ test("an account change during a walk is not answered by that walk", async () =>
   const bob = api.browseLikedSongs(null);
   expect(calls.length).toBe(2, "bob asks for a walk of his own");
 
-  /* alice's answer lands after the switch. It is her page, and it can neither
-     be handed to bob's caller nor be left where bob's next reader would find
-     it. */
+  /* A's private page cannot be returned after the account boundary. B has
+     an independent walk, and only B's answer remains cached. */
   walks[0].resolve(page(["alice"]));
   walks[1].resolve(page(["bob"]));
   expect(idsOf(await bob)).toEqual(["bob"]);
-  expect(idsOf(await alice)).toEqual(["alice"]);
+  const outcome = await stale;
+  expect(outcome.rejected).toBe(true);
+  expect(outcome.error).toBeInstanceOf(Error);
   expect(idsOf(await api.browseLikedSongs(null))).toEqual(["bob"]);
   expect(calls.length).toBe(2, "and bob's own page is what the cache holds");
 });

@@ -155,6 +155,8 @@ pub struct Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     Status,
+    /// Retires audio/cache producers before the shell removes cached files.
+    ClearAudioCache,
     PlayQueue {
         queue: Vec<TrackRef>,
         index: usize,
