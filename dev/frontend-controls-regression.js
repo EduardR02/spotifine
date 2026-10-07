@@ -1,5 +1,5 @@
 import { tick } from "svelte";
-import { api, applyPlayback, playback, ui, setNowPlayingOpen } from "../src/lib/state.svelte.js";
+import { api, applyPlayback, canvasLookups, playback, ui, setNowPlayingOpen } from "../src/lib/state.svelte.js";
 import { haze } from "../src/lib/ambient.svelte.js";
 import { personal } from "../src/lib/personal.svelte.js";
 
@@ -13,7 +13,6 @@ export async function frontendControlRegressions() {
   if (!document.body.dataset.harnessReady || new URLSearchParams(location.search).has("real")) {
     throw new Error("These regressions require the synthetic UI harness.");
   }
-  const oldCanvas = api.browseCanvas;
   const oldSelect = api.selectOutput;
   const oldInvoke = window.__TAURI_INTERNALS__.invoke;
   const oldPersonal = personal.status;
@@ -31,7 +30,11 @@ export async function frontendControlRegressions() {
   try {
     setNowPlayingOpen(false);
     await settle();
-    api.browseCanvas = (key) => new Promise((resolve, reject) => requests.push({ key, resolve, reject }));
+    // Lookups are kept for the session: start from none, and keep none of these.
+    canvasLookups.forget();
+    window.__TAURI_INTERNALS__.invoke = (command, args) => command === "browse_canvas"
+      ? new Promise((resolve, reject) => requests.push({ key: args.id, resolve, reject }))
+      : oldInvoke(command, args);
     current("canvas-a");
     setNowPlayingOpen(true);
     await settle();
@@ -145,7 +148,7 @@ export async function frontendControlRegressions() {
     results.push("Native, handled and background Space ownership");
     return results;
   } finally {
-    api.browseCanvas = oldCanvas;
+    canvasLookups.forget();
     api.selectOutput = oldSelect;
     window.__TAURI_INTERNALS__.invoke = oldInvoke;
     personal.status = oldPersonal;

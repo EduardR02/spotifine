@@ -9,6 +9,7 @@ import { normalizeCanonicalPlaylistDescription } from "./artist.js";
 import { parseSpotifyLink } from "./spotify-link.js";
 import { applyCacheMarks } from "./cache-marks.js";
 import { findFolder, insertFirst, moveItem, removeFolder, removePlaylist, renameFolder } from "./library-tree.js";
+import { createCanvasLookups } from "./canvas.js";
 
 /* ---------------- Navigation ---------------- */
 
@@ -310,6 +311,11 @@ export const playback = $state({
      current row excluded. Only the engine knows this: it holds the live
      shuffle bag and the per-playlist exclusions, so index order is a guess. */
   upcoming: [],
+  /* The row the engine is fetching ahead for a gapless start, from about
+     thirty seconds before the end until the next load; "" otherwise. The
+     only time the app does anything for a track before it plays: the panel
+     warms its Canvas (NowPlayingPanel). */
+  preload_uri: "",
   error: null,
 });
 
@@ -1139,6 +1145,7 @@ function observeSearchSession(payload) {
       resetSearchForSession();
       resetPersonalizedDiscoveryForSession();
       invalidateLikedFirstPage();
+      canvasLookups.forget();
       libraryCoverRequests.clear();
       for (const request of libraryCoverQueue) request.resolve(null);
       libraryCoverQueue = [];
@@ -2393,6 +2400,10 @@ function requestVolume(percent) {
   });
 }
 
+/** Every Canvas lookup made this session, by track id (canvas.js): asked
+    for the playing track, or for the one the engine is fetching ahead, and
+    never otherwise. Forgotten with the account it was asked as. */
+export const canvasLookups = createCanvasLookups((id) => invoke("browse_canvas", { id }));
 
 export const api = {
   selectOutput: (deviceId = null) => {
@@ -2543,7 +2554,6 @@ export const api = {
   /** Containers of the user that hold `uri` — the saved mark's data. */
   getTrackPlaylists: (uri) => invoke("get_track_playlists", { uri }),
   browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
-  browseCanvas: (id) => invoke("browse_canvas", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
   /** Explicit Settings-only cache wipe; returns fresh audio/covers stats. */
   clearCache: (kind) => invoke("clear_cache", { kind }),
@@ -2559,8 +2569,12 @@ export const api = {
   setDevicesEnabled: (enabled) =>
     mutateAppSettings("set_devices_enabled", { enabled: !!enabled }),
   /* Canvas is an account preference on Spotify's side; this turns it on there
-     when it is off. Resolves to whether anything was written. */
-  enableAccountCanvas: () => invoke("enable_account_canvas"),
+     when it is off. Resolves to whether anything was written — and a write
+     changes the answers, so the ones kept here go with the engine's. */
+  enableAccountCanvas: () => invoke("enable_account_canvas").then((wrote) => {
+    if (wrote) canvasLookups.forget();
+    return wrote;
+  }),
   browseShow: (id) => cacheMarkedRead("browse_show", { id }),
   browseEpisode: (id) => cacheMarkedRead("browse_episode", { id }),
   browseProfile: (username) => invoke("browse_profile", { username }),

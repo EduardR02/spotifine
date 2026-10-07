@@ -928,7 +928,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   opacity: 0; visibility: hidden;
   transition: opacity 600ms var(--ease), visibility 0s linear 600ms;
 }
-.np-video.shown { opacity: 1; visibility: visible; transition: opacity 600ms var(--ease), visibility 0s; }
+.np-video.shown { z-index: 1; opacity: 1; visibility: visible; transition: opacity 600ms var(--ease), visibility 0s; }
+/* The loop one record's Canvas replaces stays whole under it while it fades
+   in: two loops fading against each other would let the haze show through
+   halfway. Its element goes once the crossfade is over (NowPlayingPanel). */
+.np-video.under { opacity: 1; visibility: visible; transition: none; }
 
 .np-scroll {
   position: absolute; inset: 0; z-index: 1;
@@ -2252,29 +2256,39 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   height: var(--player-h);
   border-radius: var(--r-panel);
 }
-/* Track identity keeps a stable share of the bar while its text is shown,
-   at most 300px. Hiding the text reduces it to the remaining icons; hiding
-   every identity control removes the column. The right cluster takes only
-   its own width, and the seek rail takes the rest. */
+/* Track identity. While its text is shown, the text keeps one stable share:
+   what it has beside the cover and the library mark in a block of at most
+   300px / 26% of the bar. The cover and the mark take only their own width,
+   so hiding either — or a track having no mark — hands exactly that width
+   and its gap to the seek rail. Hiding the text reduces the block to the
+   remaining icons; hiding every identity control removes the column. The
+   right cluster takes only its own width, and the seek rail takes the rest. */
 .p-body {
+  --now-art: calc(48px + var(--s3));
+  --now-mark: calc(32px + var(--s3));
   display: grid;
-  grid-template-columns: minmax(0, min(300px, 26%)) minmax(240px, 1fr) max-content;
+  grid-template-columns:
+    minmax(0, calc(min(300px, 26%) - var(--now-art-gone, 0px) - var(--now-mark-gone, 0px)))
+    minmax(240px, 1fr) max-content;
   align-items: center; gap: var(--s5);
   height: 100%; padding: 0 var(--s5);
 }
+.p-body.no-art { --now-art-gone: var(--now-art); }
+.p-body.no-mark { --now-mark-gone: var(--now-mark); }
 .p-body.compact-now { grid-template-columns: max-content minmax(0, 1fr) max-content; }
 .p-body.no-now { grid-template-columns: minmax(0, 1fr) max-content; }
 /* A narrower bar shortens the volume rail first; a genuinely narrow one
    folds the identity to its cover and the volume to its mute button, and
-   draws the transport in. */
+   draws the transport in. The fold outranks the marks' own component rules
+   by specificity, not by which stylesheet happens to load last. */
 @container player (max-width: 900px) {
   .p-body .vol { width: 64px; }
 }
 @container player (max-width: 680px) {
   .p-body { grid-template-columns: max-content minmax(0, 1fr) max-content; }
-  .p-now :is(.p-meta, .p-saved, .p-edit-indicator) { display: none; }
-  .p-body:not(.has-now-icons) { grid-template-columns: minmax(0, 1fr) max-content; }
-  .p-body:not(.has-now-icons) .p-now { display: none; }
+  .p-body > .p-now > :is(.p-meta, .p-saved, .p-heart, .p-edit-indicator) { display: none; }
+  .p-body.no-art { grid-template-columns: minmax(0, 1fr) max-content; }
+  .p-body.no-art .p-now { display: none; }
   .p-body .vol { display: none; }
   .p-body .p-volume.no-mute { display: none; }
   .p-body .transport { gap: var(--s3); }

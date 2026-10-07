@@ -1433,6 +1433,13 @@ pub struct StateEvent<'a> {
     /// carries this list and not the rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upcoming: Option<Vec<usize>>,
+    /// The row librespot has been asked to fetch ahead for a gapless start:
+    /// from the preload watermark until the next load, and `null` the rest of
+    /// the time, so a seek back leaves it named and a skip or a pick clears
+    /// it. Always sent, `null` included, because it is the only moment the
+    /// webview does any work for a track before it plays (the Now playing
+    /// panel warms that row's Canvas).
+    pub preload_uri: Option<&'a str>,
     /// Track ids the engine found in the audio cache since it last sent
     /// `queue` — at track changes, never on a clock. Present when the list
     /// grew; the rows the next `queue` carries are marked themselves. An id
@@ -1753,6 +1760,7 @@ mod tests {
             queue_revision: 7,
             order_revision: 9,
             upcoming: Some(vec![2, 1]),
+            preload_uri: Some("spotify:track:NEXT"),
             cached_ids: Some(&cached),
             uncached_ids: None,
             error: None,
@@ -1770,6 +1778,8 @@ mod tests {
         assert_eq!(state["order_revision"], 9);
         // The plan is queue indexes in play order, not a second copy of rows.
         assert_eq!(state["upcoming"], json!([2, 1]));
+        // The row being fetched ahead travels by its uri, for the panel.
+        assert_eq!(state["preload_uri"], "spotify:track:NEXT");
         assert_eq!(state["cached_ids"], json!(["track-id"]));
         assert!(state["error"].is_null());
         // The authorize URL is only present while a login attempt is pending.
@@ -1807,6 +1817,7 @@ mod tests {
             queue_revision: 7,
             order_revision: 9,
             upcoming: None,
+            preload_uri: None,
             cached_ids: None,
             uncached_ids: None,
             error: None,
@@ -1817,6 +1828,8 @@ mod tests {
         assert!(!state.as_object().unwrap().contains_key("upcoming"));
         assert!(!state.as_object().unwrap().contains_key("cached_ids"));
         assert_eq!(state["queue_revision"], 7);
+        // No preload is sent as null, never omitted: a cleared one must reach the webview.
+        assert_eq!(state.as_object().unwrap().get("preload_uri"), Some(&serde_json::Value::Null));
         assert_eq!(state["order_revision"], 9);
         assert_eq!(state["current_index"], 3);
     }
@@ -1848,6 +1861,7 @@ mod tests {
             queue_revision: 1,
             order_revision: 1,
             upcoming: Some(Vec::new()),
+            preload_uri: None,
             cached_ids: None,
             uncached_ids: None,
             error: None,
@@ -2398,6 +2412,7 @@ mod tests {
             queue_revision: 1,
             order_revision: 1,
             upcoming: Some(Vec::new()),
+            preload_uri: None,
             cached_ids: None,
             uncached_ids: None,
             error: None,
@@ -2429,6 +2444,7 @@ mod tests {
             queue_revision: 2,
             order_revision: 2,
             upcoming: Some(Vec::new()),
+            preload_uri: None,
             cached_ids: None,
             uncached_ids: None,
             error: None,

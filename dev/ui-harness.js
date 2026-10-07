@@ -644,6 +644,8 @@ function setCurrent(index, resetPosition = true) {
   const length = playback.queue.length;
   playback.current_index = ((index % length) + length) % length;
   const current = playback.queue[playback.current_index];
+  // As the engine does: a load disarms the gapless preload (preloadNext).
+  if (current.uri !== playback.current_uri) playback.preload_uri = "";
   playback.current_uri = current.uri;
   const source = findTrack(current.uri);
   playback.duration_ms = source?.duration_ms ?? current.duration_ms ?? 0;
@@ -681,6 +683,7 @@ const playback = {
   current_index: 0,
   current_uri: fixtures.playlistDetail.tracks[0].uri,
   queue: queueWithEdits(fixtures.playlistDetail.tracks),
+  preload_uri: "",
   error: "",
 };
 
@@ -1060,10 +1063,21 @@ const mock = {
       }
       case "browse_playlist":
         return clone(detailFor(args.id ?? args.playlistId));
-      case "browse_canvas":
-        return {
-          url: "https://res.cloudinary.com/demo/video/upload/ar_9:16,c_fill,w_720/samples/sea-turtle.mp4",
-        };
+      /* The demo loop for every track, unless setCanvasFixtures has given
+         the tracks loops of their own (or none), answered after a delay. */
+      case "browse_canvas": {
+        if (!canvasFixtures) {
+          return {
+            url: "https://res.cloudinary.com/demo/video/upload/ar_9:16,c_fill,w_720/samples/sea-turtle.mp4",
+          };
+        }
+        // A source of its own per track, as Spotify's are, even when two
+        // tracks share a fixture file.
+        const id = String(args.id ?? "").replace("spotify:track:", "");
+        const name = canvasFixtures.loops[id];
+        const answer = name ? { url: `${location.origin}/dev/canvas/${name}.mp4?track=${id}`, type: "video_looping" } : null;
+        return new Promise((resolve) => setTimeout(() => resolve(answer), canvasFixtures.delayMs));
+      }
       case "set_app_settings":
       case "set_settings":
         Object.assign(settings, args.settings ?? args);
@@ -1361,6 +1375,8 @@ window.__TAURI_INTERNALS__ = {
 };
 
 const settings = { animated_canvas: true, devices_enabled: true };
+/** Per-track Canvas loops, set by setCanvasFixtures; null for the demo loop. */
+let canvasFixtures = null;
 window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
   unregisterListener: (event, eventId, handlerId) => unregisterListener(event, eventId, handlerId),
 };
@@ -1398,6 +1414,32 @@ window.__harness = {
     return [...(exclusionsFor(playlistId) ?? [])];
   },
   getExcluded: (playlistId = "p1") => [...(exclusionsFor(playlistId) ?? [])],
+  /**
+   * Give tracks Canvas loops of their own, { trackId: "amber" | "teal" |
+   * "violet" | "rose" } from dev/canvas/, each lookup answered after
+   * `delayMs` as one over the network is; tracks not named have none. null
+   * goes back to the demo loop for every track.
+   */
+  setCanvasFixtures: (loops, { delayMs = 250 } = {}) => {
+    canvasFixtures = loops ? { loops: { ...loops }, delayMs } : null;
+  },
+  /** What the engine does about thirty seconds from the end of a track:
+      fetch the next row ahead for a gapless start (`preload_uri`). */
+  preloadNext: () => {
+    const next = upcomingIndices()[0];
+    playback.preload_uri = next == null ? "" : playback.queue[next].uri;
+    emitState();
+    return playback.preload_uri;
+  },
+  /** The track ends and the next one starts by itself, as one state. */
+  endTrack: () => {
+    const next = upcomingIndices()[0];
+    if (next == null) return null;
+    setCurrent(next);
+    playback.playing = true;
+    emitState();
+    return playback.current_uri;
+  },
 };
 
 await import("../src/styles/app.css");

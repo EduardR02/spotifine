@@ -1307,6 +1307,11 @@ pub struct PlaybackState {
     /// is never restored or persisted — only forwarded. It may be omitted
     /// independently of `queue` when `order_revision` is unchanged.
     pub upcoming: Vec<usize>,
+    /// The row the engine is fetching ahead for a gapless start, empty when
+    /// none. Only forwarded: the Now playing panel warms that row's Canvas
+    /// then, and at no other time.
+    #[serde(deserialize_with = "string_or_default")]
+    pub preload_uri: String,
     /// Additive cache marks, independent of queue/order revisions. Omission
     /// retains known marks; these IDs can refer to visible off-queue rows.
     #[serde(deserialize_with = "cache_ids_or_none", skip_serializing_if = "Option::is_none")]
@@ -1348,6 +1353,7 @@ impl Default for PlaybackState {
             queue_revision: 0,
             order_revision: 0,
             upcoming: Vec::new(),
+            preload_uri: String::new(),
             cached_ids: None,
             uncached_ids: None,
             error: String::new(),
@@ -1382,7 +1388,7 @@ impl Serialize for PlaybackEvent<'_> {
         fields!(ready, auth_state, auth_url, playing, buffering, output_device_id,
             output_device_name, preview, username, position_ms, duration_ms, volume,
             shuffle, repeat, playback_speed, audible_playback_speed, current_index,
-            current_uri, context, queue_revision, order_revision, error);
+            current_uri, context, queue_revision, order_revision, preload_uri, error);
         if self.include_queue {
             map.serialize_entry("queue", &state.queue)?;
         }
@@ -1438,9 +1444,10 @@ mod tests {
     fn compact_events_preserve_plan_and_current_context_without_queue_rows() {
         let state = PlaybackState { queue: vec![Track { id: "song".into(), ..Track::default() }].into(),
             current_index: Some(0), context: "playlist:p".into(), queue_revision: 17,
-            upcoming: vec![3, 2], playing: true, ..PlaybackState::default() };
+            upcoming: vec![3, 2], playing: true, preload_uri: "spotify:track:next".into(), ..PlaybackState::default() };
         let compact = serde_json::to_value(PlaybackEvent::new(&state, false, true)).unwrap();
         assert!(compact.get("queue").is_none());
+        assert_eq!(compact["preload_uri"], "spotify:track:next");
         assert_eq!(compact["queue_revision"], 17);
         assert_eq!(compact["context"], "playlist:p");
         assert_eq!(compact["upcoming"], serde_json::json!([3, 2]));

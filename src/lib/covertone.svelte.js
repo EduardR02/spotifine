@@ -406,6 +406,13 @@ export function coverTone(covers, seed = "") {
   return identityTone(seed || key);
 }
 
+/** Whether coverTone's answer for these covers is final: measured (or
+    failed to be), or there is no cover to measure. Reactive, like it. */
+export function toneSettled(covers) {
+  const pool = coverPool(covers);
+  return !pool.length || Boolean(tones[pool.join("|")]);
+}
+
 /** Lazy card colour: pointer/focus, or visibility for an always-coloured pick. */
 export function cardTone(node, initial) {
   let source = $state(initial);

@@ -210,7 +210,6 @@
 
 <section class="view page">
   <div style="padding:var(--s4) 0 var(--s6)">
-    <span class="tag">Up next</span>
     <h1 class="page-title">Queue</h1>
     {#if rows.length}
       <p class="detail-meta" style="margin-top:var(--s3)">

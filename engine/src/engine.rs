@@ -762,6 +762,7 @@ impl Engine {
         let upcoming = sending_order.then(|| self.upcoming_indices());
         let cached_ids = sending_marks.then_some(self.cached_marks.as_slice());
         let uncached_ids = (!self.uncached_marks.is_empty()).then_some(self.uncached_marks.as_slice());
+        let preload_uri = self.preload_row().map(|row| row.uri.as_str());
         self.writer.send(&StateEvent {
             kind: "state",
             ready: self.state.ready,
@@ -796,6 +797,7 @@ impl Engine {
             queue_revision,
             order_revision,
             upcoming,
+            preload_uri,
             cached_ids,
             uncached_ids,
             error: self.state.error.as_deref(),
@@ -3722,16 +3724,23 @@ impl Engine {
     /// not ask at all. Split out from [`Engine::preload_next`] so both gates
     /// are answerable without a live player.
     fn preload_target(&self) -> Option<SpotifyUri> {
+        playable_track_uri(self.preload_row()?).ok()
+    }
+
+    /// The row [`Engine::preload_target`] names. Every state carries its uri
+    /// (`preload_uri`), so the webview's one piece of ahead-of-time work, the
+    /// next Canvas, starts and ends with the audio's.
+    fn preload_row(&self) -> Option<&TrackRef> {
         // A preserved player sounding through a reconnect sits on the session
         // being replaced; no load may reach it, a preload included.
         if !self.state.ready || !self.preload_armed || !self.recent_unavailable.is_empty() {
             return None;
         }
-        let next = self.peek_next_index()?;
+        let row = self.state.queue.get(self.peek_next_index()?)?;
         // `playable_track_uri`, not the bare parse: a row already known to be
         // permanently unavailable is not worth an audio key, and this is the
         // path that used to be two — one that checked and one that did not.
-        playable_track_uri(&self.state.queue[next]).ok()
+        playable_track_uri(row).is_ok().then_some(row)
     }
 
     /// Whether the current track is close enough to its end to arm the
@@ -3860,7 +3869,8 @@ impl Engine {
     /// Called from the work timer when its preload or retry deadline is due, so
     /// no extra timer exists; both checks are a comparison on engine-local state.
     ///
-    /// Returns whether the engine's state changed and should be emitted.
+    /// Returns whether the engine's state changed and should be emitted: a
+    /// fired retry, or an armed preload, which every state names (`preload_uri`).
     pub fn tick_playback_health(&mut self) -> bool {
         // Audio is out: whatever the run of failures was, it is over.
         // Preloading and corrupt-cache cleanup come back with it.
@@ -3876,7 +3886,8 @@ impl Engine {
         // watermark must not buy the same key twice. A load is what re-arms
         // it, so resuming a track paused past the watermark reaches this on
         // the next tick.
-        if !self.preload_armed && self.state.playing && self.at_preload_watermark() {
+        let armed = !self.preload_armed && self.state.playing && self.at_preload_watermark();
+        if armed {
             self.preload_armed = true;
             self.preload_next();
         }
@@ -3890,7 +3901,7 @@ impl Engine {
             .retry_current_at
             .is_some_and(|at| Instant::now() >= at && self.state.playing);
         if !due {
-            return false;
+            return armed;
         }
         // `load_current` clears both fields, so the flag is set afterwards:
         // it marks the load now in flight as the one that has already had its
@@ -8035,6 +8046,33 @@ mod tests {
         engine.update_position(1_000);
         engine.tick_playback_health();
         assert!(engine.preload_armed);
+    }
+
+    /// The webview warms the next Canvas when, and only when, the audio is
+    /// fetched ahead, so arming the preload is a state of its own and every
+    /// state names the row. A seek back keeps librespot's preload, and the
+    /// name with it.
+    #[test]
+    fn an_armed_preload_is_published_with_the_row_it_fetches() {
+        let (mut engine, buffer) = test_engine();
+        engine.state = two_track_state();
+        engine.state.playing = true;
+        engine.update_position(1_000);
+        assert!(!engine.tick_playback_health(), "a track a second in has nothing to say");
+        engine.emit_state().expect("early state emits");
+
+        engine.update_position(239_000);
+        assert!(engine.tick_playback_health(), "arming is a state change");
+        assert!(!engine.tick_playback_health(), "and happens once per load");
+        engine.emit_state().expect("armed state emits");
+        engine.update_position(1_000);
+        engine.emit_state().expect("sought state emits");
+
+        let values = captured_messages(&buffer);
+        let next = engine.state.queue[1].uri.as_str();
+        assert!(values[0]["preload_uri"].is_null());
+        assert_eq!(values[1]["preload_uri"], next);
+        assert_eq!(values[2]["preload_uri"], next);
     }
 
     #[test]

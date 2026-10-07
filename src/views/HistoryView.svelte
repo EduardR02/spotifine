@@ -214,6 +214,16 @@
   const pane = $derived(ui.paneWidth || 1200);
   const colSource = $derived(pane >= NEEDS.source);
   const colPlayed = $derived(pane >= NEEDS.played);
+  /* The instrument row answers to the same measure and stays ONE line at
+     every width: a second line would grow the sticky block under the reader.
+     What gives way is ordered. First the word on "Clear history" — the
+     glyph is the same act behind the same confirmation — then the count,
+     whose room the filter takes over. Each threshold is where its item
+     stops fitting: a ~130px count, the 300px filter, the 140px sort, the
+     103px pill or 32px glyph, three 16px gaps and the pane's two 24px pads. */
+  const TOOLS_NEED = { clearLabel: 770, summary: 700 };
+  const clearLabelled = $derived(pane >= TOOLS_NEED.clearLabel);
+  const showSummary = $derived(pane >= TOOLS_NEED.summary);
   const dense = $derived(pane < 760);
   const cols = $derived(
     ["88px", "36px", "minmax(0, 1fr)", colSource && "minmax(0, 0.58fr)", colPlayed && "108px"]
@@ -474,7 +484,6 @@
 
 <section class="view page history-page" class:dense style:--hi-cols={cols}>
   <header class="page-head history-head">
-    <span class="tag">Local</span>
     <h1 class="page-title">Listening history</h1>
     <p class="sub">Every song you actually listened to, kept only on this computer.</p>
   </header>
@@ -483,25 +492,28 @@
   <!-- The instrument row and the column head, as one sticky object.
 
        Every control in the row has a FIXED width and the summary takes
-       whatever is left. It used to be the other way round, and the count's own
+       whatever is left (the filter does, once the summary has given way).
+       It used to be the other way round, and the count's own
        text width drove the layout: typing in the filter moved the filter — up
        to 45px, on every keystroke, while the caret was in it. -->
   <div class="history-block" class:stuck={blockStuck} class:solo={!hasList} bind:this={blockEl}>
-    <div class="history-tools">
-      <p class="detail-meta history-summary" aria-live="polite">
-        {#if error}
-          History unavailable
-        {:else if !loaded}
-          Reading the archive…
-        {:else if filtering}
-          <span class="num">{countFormatter.format(total)}</span> of
-          <span class="num">{countFormatter.format(recorded)}</span>
-          {recorded === 1 ? "play" : "plays"}
-        {:else}
-          <span class="num">{countFormatter.format(recorded)}</span>
-          {recorded === 1 ? "play" : "plays"} recorded
-        {/if}
-      </p>
+    <div class="history-tools" class:no-summary={!showSummary}>
+      {#if showSummary}
+        <p class="detail-meta history-summary" aria-live="polite">
+          {#if error}
+            History unavailable
+          {:else if !loaded}
+            Reading the archive…
+          {:else if filtering}
+            <span class="num">{countFormatter.format(total)}</span> of
+            <span class="num">{countFormatter.format(recorded)}</span>
+            {recorded === 1 ? "play" : "plays"}
+          {:else}
+            <span class="num">{countFormatter.format(recorded)}</span>
+            {recorded === 1 ? "play" : "plays"} recorded
+          {/if}
+        </p>
+      {/if}
       <!-- THE FIELD, the topbar's own object: same class, same pill, same
            focus behaviour. -->
       <div class="history-control history-filter-control">
@@ -532,17 +544,29 @@
         />
       </div>
       <!-- A quiet pill that opens a destructive confirmation: neutral at rest,
-           love under the pointer. -->
-      <button
-        class="pill warn"
-        type="button"
-        aria-label="Clear listening history"
-        disabled={!loaded || !recorded}
-        onclick={() => (confirmClear = true)}
-      >
-        Clear history
-      </button>
-
+           love under the pointer. Short of room it keeps only its glyph. -->
+      {#if clearLabelled}
+        <button
+          class="pill warn"
+          type="button"
+          aria-label="Clear listening history"
+          disabled={!loaded || !recorded}
+          onclick={() => (confirmClear = true)}
+        >
+          Clear history
+        </button>
+      {:else}
+        <button
+          class="btn-round danger"
+          type="button"
+          title="Clear listening history"
+          aria-label="Clear listening history"
+          disabled={!loaded || !recorded}
+          onclick={() => (confirmClear = true)}
+        >
+          <Icon name="trash" size={16} />
+        </button>
+      {/if}
     </div>
 
     {#if hasList}
@@ -683,11 +707,11 @@
      in the middle of the pane with 200px of dead ground either side, under a
      topbar whose search field ran on to the real edge. Nothing else here does
      that, which is most of why the page read as belonging to a different
-     application. */
-  .history-page { padding-top: var(--s5); --hi-gap: var(--s4); }
+     application. The title stands at the same height as Queue's and
+     Settings'. */
+  .history-page { padding-top: var(--s3); --hi-gap: var(--s4); }
   /* At a narrow pane the gaps are a bigger share of the row than any column. */
   .history-page.dense { --hi-gap: var(--s3); }
-  .history-head .page-title { margin-top: var(--s2); }
   .history-head .sub {
     max-width: 520px;
     color: var(--fg-2); font-size: var(--t-13); line-height: 1.45;
@@ -716,7 +740,7 @@
   }
   .history-tools {
     display: flex; align-items: center; gap: var(--s4);
-    min-height: 56px; padding: var(--s2) 0;
+    height: 56px;
   }
   /* With no table under it — empty archive, no match, an error — the block
      ends at the controls, so the closing hairline has to move up to them. */
@@ -729,14 +753,18 @@
      puts under its title; it used to be a clock glyph, a tracked-caps word and
      a bold number, which is three treatments for one short sentence. */
   .history-summary {
-    flex: 1 1 auto; min-width: 0;
+    flex: 1 1 0; min-width: 0;
     overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
     color: var(--fg-2);
   }
   .history-summary .num { color: var(--count); font-weight: var(--w-med); }
 
   .history-control { display: flex; align-items: center; min-width: 0; }
+  /* Once the count has given way, the filter is the elastic thing instead:
+     the row stays full rather than holding a hole where the count was. */
   .history-filter-control { flex: 0 0 300px; }
+  .history-tools.no-summary .history-filter-control { flex: 1 1 0; }
+  .history-filter-control .field { flex: 1; }
   /* 140px because that is `.sel-btn`'s own min-width, and min-width beats
      width: at 138 the button stood 2px proud of the box that was supposed to
      be sizing it. The width is fixed rather than automatic so that choosing a
@@ -951,22 +979,4 @@
     transition: color var(--d1) var(--ease);
   }
   .hi-main:hover .hi-heard { color: var(--fg-1); }
-
-  /* The instrument row is the one thing here still keyed to the window: it
-     holds no columns, only controls that wrap when they run out of room. The
-     column head below is unaffected — it is measured against the pane. */
-  /* 1020, not 900. The controls need 588px between them and the summary needs
-     about 160 before it starts eating its own words; below roughly this the
-     line cannot hold both, and at 900 the summary spent a hundred pixels of
-     the range rendering "1,123 play…". Once it wraps it has its own line and
-     is no longer competing with anything. */
-  @media (max-width: 1020px) {
-    .history-tools { flex-wrap: wrap; gap: var(--s3); align-content: center; }
-    .history-summary { flex: 1 0 100%; }
-    .history-filter-control { flex: 1 1 200px; }
-  }
-  @media (max-width: 520px) {
-    .history-sort-control { flex: 1 0 100%; }
-    .history-sort-control :global(.sel) { width: 100%; }
-  }
 </style>

@@ -7,8 +7,8 @@
     openCredits,
     trackCredits,
     loadTrackCredits,
-    api,
     appSettings,
+    canvasLookups,
   } from "../lib/state.svelte.js";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
@@ -32,13 +32,22 @@
      One layout. The picture is the Canvas when this record has one and it
      has decoded, filling the panel; otherwise — no Canvas, not yet, or the
      cover asked for — it is the cover, in the hero. Changing between them
-     is a crossfade of two elements that never move. */
-  const canvasTrackKey = $derived(current?.uri?.startsWith("spotify:track:") ? (current.id || current.uri) : "");
-  /** The source the <video> holds. */
+     is a crossfade of two elements that never move; so is changing from
+     one record's Canvas to the next one's. */
+  /** A Spotify track's id: what its Canvas is asked and kept by. */
+  const trackId = (uri) => (uri?.startsWith("spotify:track:") ? uri.slice("spotify:track:".length) : "");
+  const canvasTrackKey = $derived(trackId(current?.uri));
+  /** The record the engine is fetching ahead, near the end of this one. */
+  const aheadKey = $derived(trackId(playback.preload_uri));
+  /** This record's Canvas: the source of its loop. */
   let canvasUrl = $state("");
   /** THIS record's Canvas has decoded. Cleared the moment the track changes:
       the loop on screen is the previous record's. */
   let canvasReady = $state(false);
+  /** What the haze is lit from for this record (canvas.js). */
+  let hazeSource = $state("cover");
+  /** The loop loaded ahead, for the record the engine is fetching ahead. */
+  let warmUrl = $state("");
   /** A look at this record's cover; the next record arrives on its Canvas. */
   let preferCover = $state(false);
   /** The hero's copy has scrolled up under the head. */
@@ -46,7 +55,10 @@
   let pageVisible = $state(!document.hidden);
   let reducedMotion = $state(false);
 
-  let videoEl = $state(null);
+  /** Every loop the panel holds, by source. */
+  let loops = $state.raw({});
+  /** This record's loop. */
+  const videoEl = $derived(loops[canvasUrl] ?? null);
   let panelEl = $state(null);
   let scrollEl = $state(null);
   let detailsEl = $state(null);
@@ -90,30 +102,81 @@
   /* Canvas is an opt-in decoder, so it is asked for only while someone can
      see the answer: never with the setting off or reduced motion asked for,
      and not while the window is backgrounded — a track that changed while
-     hidden is asked about when the window comes back. The generation makes a
-     late reply for an earlier track harmless.
+     hidden is asked about when the window comes back. The one record asked
+     about ahead is the one the engine itself is fetching ahead, in the last
+     seconds of a track; its loop is loaded then too, so the advance goes
+     straight from this Canvas to that one.
 
-     `haze.awaiting` holds from the question until the answer is on screen
-     (or is "none"), so the haze waits for the Canvas instead of lighting
-     the window from the cover for a second and then changing again. */
-  const canvasOwner = createCanvasOwner((key) => api.browseCanvas(key), (picture) => {
-    canvasUrl = picture.url;
-    canvasReady = picture.ready;
-    haze.awaiting = picture.waiting;
-    if (picture.resetPreference) preferCover = false;
-    // A confirmed shared loop may already be decoded; no reload is needed.
-    if (picture.accepted && !picture.ready && videoEl?.readyState >= 2
-      && videoEl.getAttribute("src") === picture.url) {
-      canvasOwner.arrive(picture.url);
-    }
+     `haze.awaiting` holds the haze on the last record's light while this
+     record's source is decided, briefly and once (canvas.js), so a change
+     of record is one change of the window's light. */
+  const canvasOwner = createCanvasOwner({
+    lookups: canvasLookups,
+    decoded: (source) => (loops[source]?.readyState ?? 0) >= 2,
+    changed: (picture) => {
+      canvasUrl = picture.url;
+      canvasReady = picture.ready;
+      hazeSource = picture.haze;
+      warmUrl = picture.warm;
+      haze.awaiting = picture.haze === "hold";
+      if (picture.resetPreference) preferCover = false;
+    },
   });
   $effect(() => {
     const key = canvasTrackKey;
-    const allowed = Boolean(key) && appSettings.animated_canvas && !reducedMotion;
+    const allowed = appSettings.animated_canvas && !reducedMotion;
     const visible = pageVisible;
-    untrack(() => canvasOwner.update(key, allowed, visible));
+    const ahead = aheadKey;
+    untrack(() => canvasOwner.update(key, allowed, visible, ahead));
   });
   $effect(() => () => canvasOwner.dispose());
+
+  /* ---- The loops ---------------------------------------------------------
+     One <video> per source: this record's, the one warmed ahead, and for
+     the length of a crossfade the one it replaced. A loop warmed ahead that
+     becomes this record's is the same element, already decoded. The loop
+     that leaves stays whole under the one that arrives while it fades in
+     (.np-video.under) — two loops fading against each other would let the
+     haze show through halfway — and fades out itself only to the cover. */
+  /** .np-video's crossfade (app.css). */
+  const CROSSFADE_MS = 600;
+  /** The loop on screen. */
+  const front = $derived(videoShown ? canvasUrl : "");
+  let leaving = $state("");
+  let leavingUnder = $state(false);
+  let lastFront = "";
+  let leaveTimer = 0;
+  $effect(() => {
+    const shown = front;
+    untrack(() => {
+      if (shown === lastFront) return;
+      if (lastFront) {
+        leaving = lastFront;
+        leavingUnder = Boolean(shown);
+        clearTimeout(leaveTimer);
+        leaveTimer = setTimeout(() => (leaving = ""), CROSSFADE_MS);
+      }
+      lastFront = shown;
+    });
+  });
+  $effect(() => () => clearTimeout(leaveTimer));
+  const sources = $derived([...new Set([leaving, canvasUrl, warmUrl])].filter(Boolean));
+
+  /** Files a loop's element under its source. One let go is unloaded at
+      once, rather than holding its decoder until some collection. */
+  function holdLoop(node, source) {
+    loops = { ...loops, [source]: node };
+    return {
+      destroy() {
+        if (loops[source] === node) {
+          const { [source]: _, ...rest } = loops;
+          loops = rest;
+        }
+        node.removeAttribute("src");
+        node.load();
+      },
+    };
+  }
 
   function handleCanvasReady(event) {
     canvasOwner.arrive(event.currentTarget.getAttribute("src"));
@@ -147,20 +210,20 @@
    */
   const canvasPlaying = $derived(videoShown && pageVisible && ui.windowFocused && playback.playing);
 
+  /* Only this record's loop plays: one warmed ahead waits on its first
+     frame, and the one leaving is gone in a moment. */
   $effect(() => {
-    /* Keyed on the source too: a replaced src parks the element, so the
-       replacement has to be started again explicitly. */
-    const url = canvasUrl;
     const video = videoEl;
-    if (!video || !url) return;
+    if (!video) return;
     if (canvasPlaying) video.play().catch(() => {});
     else video.pause();
   });
 
-  /* The haze is drawn from the video while it is the picture here — paused
-     or not; a paused frame is simply a still haze. */
+  /* The haze is drawn from the video while it is the picture here, paused
+     or not (a paused frame is simply a still haze) — unless the haze was
+     lit from the cover before the loop arrived, which it then keeps. */
   $effect(() => {
-    haze.video = videoShown && videoEl ? videoEl : null;
+    haze.video = videoShown && hazeSource === "video" && videoEl ? videoEl : null;
   });
 
   /* ---- Where the Canvas sits -------------------------------------------
@@ -349,13 +412,13 @@
   {#if current}
     <!-- The picture layer, pinned under the scrolling column. -->
     <div class="np-stage" bind:this={stageEl} aria-hidden="true">
-      {#if canvasUrl}
-        {#key canvasUrl}
+      {#each sources as source (source)}
         <video
           class="np-video"
-          class:shown={videoShown}
-          bind:this={videoEl}
-          src={canvasUrl}
+          class:shown={source === front}
+          class:under={source === leaving && leavingUnder}
+          use:holdLoop={source}
+          src={source}
           crossorigin="anonymous"
           muted
           loop
@@ -366,8 +429,7 @@
           oncanplay={handleCanvasReady}
           onerror={handleCanvasError}
         ></video>
-        {/key}
-      {/if}
+      {/each}
     </div>
 
     <div class="np-scroll" bind:this={scrollEl} use:scrollbar={{ top: hasHead ? 56 : 0 }}>

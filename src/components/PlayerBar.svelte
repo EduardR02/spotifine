@@ -55,10 +55,10 @@
   const controls = $state(readControls());
   let playerBar = $state(null);
   let barMenu = $state(null);
-  const hasNowIcons = $derived(controls.artwork
-    || (controls.library && !!current
-      && (nowSaved.refs.length > 0 || current.uri?.startsWith("spotify:track:"))));
-  const hasNow = $derived(controls.metadata || hasNowIcons);
+  // The library mark: the check for anything saved, the heart for any other song.
+  const hasMark = $derived(controls.library && !!current
+    && (nowSaved.refs.length > 0 || current.uri?.startsWith("spotify:track:")));
+  const hasNow = $derived(controls.metadata || controls.artwork || hasMark);
 
   function openBarMenu(event) {
     const keyboard = event.type === "keydown";
@@ -529,6 +529,13 @@
     return (percent / 100).toFixed(2).replace(/0$/, "");
   }
 
+  /* The widest label the readout can show, whose width it reserves. Its
+     figures are tabular, so the longest label on the grid is the widest. */
+  const SPEED_WIDEST = Array.from(
+    { length: (SPEED_MAX - SPEED_MIN) / SPEED_STEP + 1 },
+    (_, i) => formatSpeed(SPEED_MIN + i * SPEED_STEP),
+  ).reduce((widest, label) => (label.length > widest.length ? label : widest));
+
   /** One in-flight command, with only the newest intent waiting behind it. */
   async function flushSpeed() {
     clearTimeout(speedTimer);
@@ -652,7 +659,8 @@
 <div class="player glass-chrome" use:frost bind:this={playerBar}
   role="toolbar" aria-label="Playback controls" tabindex="0"
   oncontextmenu={openBarMenu} onkeydown={openBarMenu}>
-  <div class="p-body" class:compact-now={!controls.metadata} class:no-now={!hasNow} class:has-now-icons={hasNowIcons}>
+  <div class="p-body" class:compact-now={!controls.metadata} class:no-now={!hasNow}
+    class:no-art={!controls.artwork} class:no-mark={!hasMark}>
     {#if hasNow}
     <div class="p-now" class:idle={!current}>
       {#if current}
@@ -878,8 +886,9 @@
         aria-expanded={speedOpen}
         onclick={toggleSpeedMenu}
         ondblclick={() => commitSpeed(100, true)}
+        data-widest="{SPEED_WIDEST}×"
       >
-        {speedLabel}×
+        <span>{speedLabel}×</span>
       </button>
       <div
         class="speed-menu glass-overlay"
@@ -1001,10 +1010,12 @@
      same 32px round target, the same bare glyph-weight at rest and the same
      plate under the pointer as the icon buttons — only its glyph is a
      number. Off 1.0 it takes the foam and the dot every other "on" control
-     in the bar wears. */
+     in the bar wears. The widest label stands invisible under the live one,
+     so the control's width never follows the value. */
   .p-speed {
     position: relative;
-    min-width: 40px;
+    display: inline-grid;
+    place-items: center;
     height: 32px;
     padding: 0 var(--s2);
     border-radius: var(--rf);
@@ -1019,6 +1030,8 @@
       color var(--d1) var(--ease),
       background-color var(--d1) var(--ease);
   }
+  .p-speed::before, .p-speed > span { grid-area: 1 / 1; }
+  .p-speed::before { content: attr(data-widest); visibility: hidden; }
   .p-speed:hover:not(:disabled) { color: var(--fg); background: var(--hover-2); }
   .p-speed[aria-expanded="true"] { color: var(--fg); background: var(--hover-2); }
   .p-speed.on, .p-speed.on:hover:not(:disabled) { color: var(--accent); }

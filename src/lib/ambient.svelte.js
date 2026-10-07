@@ -22,7 +22,11 @@
 
    haze.video        written by the panel.
                      The Canvas <video> while it is the picture in the
-                     panel, else null. The haze is drawn from it.
+                     panel and this record's light is taken from it, else
+                     null. The haze is drawn from it, and laid out around
+                     it (anchor.video) only then: a Canvas that arrived
+                     after the record was lit from its cover is shown in
+                     the panel, and the haze keeps the cover's light.
 
    haze.anchor       written by the panel (placeCanvas, NowPlayingPanel).
                      { left, video }, or null while the panel is closed.
@@ -42,11 +46,12 @@
                      the player bar (RESTRAINED).
 
    haze.awaiting     written by the panel.
-                     true from a record change until the panel knows
-                     whether that record has a Canvas and, if it has, until
-                     the video is shown (or has failed); false otherwise.
-                     While it is true the haze holds the previous record's
-                     light (at most 2.5 s) instead of lighting from the
+                     true from a record change until the panel has decided
+                     what that record's light comes from (lib/canvas.js):
+                     its Canvas's first frame, or its cover — at once when
+                     it is known to have none, and at most 1.5 s after the
+                     change otherwise. While it is true the haze holds the
+                     previous record's light instead of lighting from the
                      cover and then changing again for the Canvas, so a
                      change of record is one crossfade.
 
@@ -64,8 +69,9 @@
                      - Otherwise: measured on the haze itself under the
                        panel, so it is at most 0.10.
                      1 until measured, and 1 while the panel shows a Canvas
-                     whose frames cannot be read: unknown is treated as
-                     white. White type's contrast over the band is at worst
+                     the haze is not drawn from (its frames cannot be read,
+                     or it arrived after the cover lit the record): unknown
+                     is treated as white. White type's contrast over the band is at worst
                      1.05 / (light + 0.05): 4.5:1 up to 0.183, 3:1 up to
                      0.30. Published only on a change of more than 0.01.
 

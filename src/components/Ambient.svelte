@@ -1,7 +1,7 @@
 <script>
   import { untrack } from "svelte";
   import { playback, ui, coverUrl as imageUrl } from "../lib/state.svelte.js";
-  import { coverTone } from "../lib/covertone.svelte.js";
+  import { coverTone, toneSettled } from "../lib/covertone.svelte.js";
   import { haze, publishLight, frost, watchFrost, watchShift } from "../lib/ambient.svelte.js";
   import { rgbOf, parseFrost, RESTRAINED } from "../lib/haze.js";
 
@@ -22,7 +22,11 @@
      A change of record is one change with the art: the worker draws on the
      GPU in a few milliseconds, the picture is asked for as soon as the new
      cover (or Canvas) is there — which is when the art changes too — and it
-     crossfades as the panel's picture does.
+     crossfades as the panel's picture does. It is one change, too: the
+     panel decides once whether a record's light comes from its Canvas or
+     its cover (lib/canvas.js) and holds this layer until it has, and the
+     record's colour is waited for as briefly, so neither arrives a moment
+     later to light the window a second time.
 
      A playing Canvas's first loop is looked at a few more times, about a
      second apart, and then never again: the type's light is the brightest
@@ -47,9 +51,11 @@
     layout: { ms: 900, easing: "cubic-bezier(0.4, 0, 0.2, 1)" },
     settle: { ms: 10000, easing: "cubic-bezier(0.45, 0, 0.55, 1)" },
   };
-  /** How long a record's Canvas is waited for (haze.awaiting) before the
-      cover lights the haze instead. */
-  const CANVAS_WAIT_MS = 2500;
+  /** How long after a change of record its colour (coverTone, the tint) is
+      waited for, so a picture is not drawn again for it a moment later. */
+  const TONE_WAIT_MS = 500;
+  /** The type's light over a picture it cannot measure: the brightest. */
+  const UNKNOWN_LIGHT = { top: 1, bottom: 1 };
   /** A black first frame (a Canvas fading up) is skipped this many times. */
   const BLANK_TRIES = 6;
   /** Window pixels per haze pixel, and the most haze pixels across. The
@@ -72,6 +78,7 @@
   const coverUrl = $derived(current?.cover_url ?? "");
   const tone = $derived(coverTone(coverUrl, current?.album_id || current?.uri || ""));
   const tint = $derived(rgbOf(tone.glow));
+  const toneFinal = $derived(toneSettled(coverUrl));
 
   let enabled = $state(true);
   let pageVisible = $state(!document.hidden);
@@ -253,9 +260,8 @@
   let lit = false;
   let blankTries = 0;
   let timer = 0;
-  let waitUntil = 0;
+  let toneUntil = 0;
   let lastTrack = "";
-  let lastAwaiting = false;
   let lastDiscrete = "";
   /** The source the type's light was last measured on. */
   let lightKey = "";
@@ -307,7 +313,7 @@
         grey = m.grey;
         blankTries = 0;
         lightKey = m.key;
-        if (!unreadableShown()) publishLight(m.light);
+        measured(m.light);
         if (m.fade !== "settle" && m.fade !== "layout" && asked?.kind === "video" && asked.key === m.key) {
           startPass(asked.el, m.key);
         }
@@ -321,11 +327,11 @@
         schedule(150);
         return;
       case "light":
-        if (m.key === lightKey && !unreadableShown()) publishLight(m.light);
+        if (m.key === lightKey) measured(m.light);
         return;
       case "done":
         if (stats && m.distance !== undefined) stats.settles.push(+m.distance.toFixed(3));
-        if (m.key === lightKey && !unreadableShown()) publishLight(m.light);
+        if (m.key === lightKey) measured(m.light);
         return;
     }
   }
@@ -371,11 +377,24 @@
     return () => (cancelled = true);
   });
 
-  /** The Canvas while the panel shows it and its frames can be read. */
+  /** The Canvas while the panel shows it, the haze is lit from it, and its
+      frames can be read. */
   const video = $derived(haze.video && haze.video.currentSrc !== unreadable ? haze.video : null);
-  /** The panel shows a Canvas whose frames cannot be read: its brightness
-      is unknown, and nothing measured on the cover speaks for it. */
-  const unreadableShown = () => Boolean(haze.video && haze.video.currentSrc === unreadable);
+  /** The panel shows a Canvas this haze is not drawn from — one whose
+      frames cannot be read, or one that arrived after the record's light
+      was taken from the cover: its brightness is unknown, and nothing
+      measured on the haze speaks for it. */
+  const foreign = $derived(ui.immersive && !video);
+  /** The type's light as last measured on the picture shown. */
+  let lastLight = null;
+  function measured(light) {
+    if (light) lastLight = light;
+    if (!foreign) publishLight(light);
+  }
+  $effect(() => {
+    const unknown = foreign;
+    untrack(() => publishLight(unknown ? UNKNOWN_LIGHT : lastLight));
+  });
 
   /* ---- When to render -------------------------------------------------- */
 
@@ -387,10 +406,13 @@
     const px = vw / w;
     const left = haze.anchor ? haze.anchor.left : null;
     /* The video's rect on screen, in haze pixels: the haze carries the
-       picture on from exactly where the video shows it. */
-    const v = left != null ? haze.anchor.video : null;
-    const video = v ? { x: v.x / px, y: v.y / px, w: v.w / px, h: v.h / px } : null;
-    return { w, h, px, left, video, immersive: left != null && ui.immersive };
+       picture on from exactly where the video shows it. Only while it is
+       drawn from the video: a haze lit from the cover keeps the cover's
+       layout under a Canvas that arrived later, rather than being laid out
+       again around a picture it was not made of. */
+    const v = left != null && video ? haze.anchor.video : null;
+    const rect = v ? { x: v.x / px, y: v.y / px, w: v.w / px, h: v.h / px } : null;
+    return { w, h, px, left, video: rect, immersive: Boolean(rect) };
   }
 
   function sameGeo(a, b) {
@@ -407,14 +429,14 @@
 
   /** What the haze should be made of now, or that it should wait. */
   function desired(geo) {
+    /* The record's colour tints the picture, so the first one waits for it
+       (briefly) rather than being drawn again when it lands. */
+    if (!toneFinal && performance.now() < toneUntil) return { kind: "wait", until: toneUntil };
     const el = video;
     if (el && el.readyState >= 2) return { kind: "video", key: `video:${el.currentSrc}`, el };
-    /* While the panel finds out whether this record has a Canvas, and loads
-       it, the haze holds rather than lighting from the cover for a second
-       and then changing again. */
-    if (haze.awaiting && geo.left != null && performance.now() < waitUntil) {
-      return { kind: "wait", until: waitUntil };
-    }
+    /* While the panel decides what this record's light comes from (a
+       bounded wait, lib/canvas.js), the haze holds the last record's. */
+    if (haze.awaiting && geo.left != null) return { kind: "wait" };
     if (still && still.for === coverUrl) return { kind: "still", key: still.key, bitmap: still.bitmap };
     return { kind: "wait" };
   }
@@ -437,23 +459,21 @@
       resized,
       tint.join(","),
       pageVisible,
+      toneFinal,
     ];
     if (!deps[0]) return;
     untrack(() => {
-      /* The wait for a Canvas is bounded from the moment it starts: a new
-         record, or the panel starting to look for one. */
-      if (trackKey !== lastTrack || (haze.awaiting && !lastAwaiting)) {
-        waitUntil = performance.now() + CANVAS_WAIT_MS;
+      if (trackKey !== lastTrack) {
+        toneUntil = performance.now() + TONE_WAIT_MS;
+        blankTries = 0;
       }
-      if (trackKey !== lastTrack) blankTries = 0;
       lastTrack = trackKey;
-      lastAwaiting = haze.awaiting;
       if (!pageVisible) {
         haltPass();
         return;
       }
       armPass();
-      const discrete = [deps[1], deps[2], deps[3], deps[4] == null, deps[5] == null, deps[6], deps[7], deps[9]].join("|");
+      const discrete = [deps[1], deps[2], deps[3], deps[4] == null, deps[5] == null, deps[6], deps[7], deps[9], deps[11]].join("|");
       schedule(discrete !== lastDiscrete ? 0 : 250);
       lastDiscrete = discrete;
     });
@@ -505,9 +525,9 @@
           asked = null;
           if (error?.name === "SecurityError") {
             /* A cross-origin Canvas without CORS: its light comes from the
-               cover, and the type assumes the brightest picture there is. */
+               cover, and the type assumes the brightest picture there is
+               (`foreign`). */
             unreadable = want.el.currentSrc;
-            publishLight({ top: 1, bottom: 1 });
           } else {
             schedule(150);
           }
