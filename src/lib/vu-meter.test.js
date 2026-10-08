@@ -17,19 +17,19 @@ function clock() {
   };
 }
 function meter() {
-  const bars = Array.from({ length: 4 }, () => ({ style: { transform: "" } }));
-  return { bars, picture: () => bars.map((bar) => bar.style.transform) };
+  let drawn = null;
+  return { draw: (values) => (drawn = [...values]), picture: () => drawn };
 }
 
 test("hidden meters do no work and all visible meters share one clock", () => {
   const time = clock();
   const ticker = createMeterTicker(time);
   const a = meter(), b = meter();
-  const first = ticker.add(a.bars), second = ticker.add(b.bars);
+  const first = ticker.add(a.draw), second = ticker.add(b.draw);
   ticker.running(true);
   time.advance(200);
   expect(time.pending).toBe(0);
-  expect(a.picture()).toEqual(["", "", "", ""]);
+  expect(a.picture()).toBe(null);
   ticker.visible(first, true);
   ticker.visible(second, true);
   expect(time.pending).toBe(1);
@@ -47,7 +47,7 @@ test("pause freezes the picture and resume continues without replaying hidden ti
   const time = clock();
   const ticker = createMeterTicker(time);
   const a = meter();
-  const first = ticker.add(a.bars);
+  const first = ticker.add(a.draw);
   ticker.visible(first, true);
   expect(time.pending).toBe(0);
   ticker.running(true);
@@ -69,7 +69,7 @@ test("removing the last visible meter cancels work and a later mount may animate
   const time = clock();
   const ticker = createMeterTicker(time);
   const a = meter(), b = meter();
-  const first = ticker.add(a.bars);
+  const first = ticker.add(a.draw);
   ticker.running(true);
   ticker.visible(first, true);
   ticker.remove(first);
@@ -77,7 +77,7 @@ test("removing the last visible meter cancels work and a later mount may animate
   time.advance(2000);
   expect(time.pending).toBe(0);
   expect(a.picture()).toEqual(removed);
-  const second = ticker.add(b.bars);
+  const second = ticker.add(b.draw);
   ticker.visible(second, true);
   expect(time.pending).toBe(1);
   const mounted = b.picture();
@@ -100,7 +100,7 @@ test("a delayed real clock skips catch-up work and cancellation cannot restart i
   const cancel = spyOn(globalThis, "clearTimeout").mockImplementation((job) => jobs.delete(job));
   const ticker = createMeterTicker();
   const a = meter(), b = meter();
-  const first = ticker.add(a.bars), second = ticker.add(b.bars);
+  const first = ticker.add(a.draw), second = ticker.add(b.draw);
   try {
     ticker.running(true);
     ticker.visible(first, true);

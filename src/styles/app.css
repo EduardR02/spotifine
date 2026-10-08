@@ -1098,6 +1098,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
     rgb(0 0 0 / 0.64) calc(var(--melt) * 0.62), #000 var(--melt));
   -webkit-mask-image: var(--melted);
           mask-image: var(--melted);
+  /* Its own box, exactly. The mask's layer reaches 2px past it, so with the
+     details just below the fold that fully transparent sliver sat inside the
+     panel, and its backdrop was re-frosted with every frame of the Canvas. */
+  clip-path: inset(0);
 }
 .np-panel.video .np-details::before {
   background: var(--tint-video);
@@ -1961,23 +1965,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   margin: -6px -6px; padding: 6px;
 }
 .tl-row.current .n { display: none; }
-.tl-row.current .eq { display: flex; }
+.tl-row.current .eq { display: block; }
 .tl-row.current:hover .eq { display: none; }
 
-/* The decorative meter's curves share a visible-only nominal 60 Hz clock
-   (lib/vu-meter.js), not perpetual compositor animations at display refresh.
-   Each bar is its own compositor layer, so a tick re-scales a texture rather
-   than repainting the row. Repainted in the row, the GPU's anti-aliasing of a
-   squashed round cap reaches the pixel left of the bar, outside what Chromium
-   invalidates, and those stale pixels piled up into a smudge. */
-.eq { align-items: flex-end; gap: 2px; height: 13px; flex: none; }
-.eq i {
-  width: 2px; height: 100%; flex: none; background: var(--accent); border-radius: 1px;
-  transform-origin: bottom; transform: scaleY(0.3); will-change: transform;
-}
-@media (prefers-reduced-motion: reduce) {
-  .eq i { transform: scaleY(0.7); will-change: auto; }
-}
+/* The decorative meter: four accent bars a visible-only nominal 60 Hz clock
+   draws into this canvas (lib/vu-meter.js), whose frames reach the compositor
+   on their own: a tick never touches the row, so no paint of the page and no
+   stale anti-aliasing left beside a bar. The bars' colour is read from here. */
+.eq { width: 14px; height: 13px; flex: none; color: var(--accent); }
 
 .c-art { width: 36px; height: 36px; --tile: 36px; }
 .c-title { display: flex; flex-direction: column; min-width: 0; gap: 1px; }

@@ -908,7 +908,7 @@
       <span class="c-idx">
         <span class="n">{i + 1}</span>
         {#if i === currentRow}
-          <span class="eq" use:vuMeter><i></i><i></i><i></i><i></i></span>
+          <canvas class="eq" use:vuMeter></canvas>
         {/if}
         <button
           class="go"

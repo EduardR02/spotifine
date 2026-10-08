@@ -265,7 +265,7 @@
               <span class="c-idx">
                 <span class="n">{k + 1}</span>
                 {#if k === 0}
-                  <span class="eq" use:vuMeter><i></i><i></i><i></i><i></i></span>
+                  <canvas class="eq" use:vuMeter></canvas>
                 {/if}
                 <button
                   class="go"
