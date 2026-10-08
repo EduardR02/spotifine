@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -277,7 +277,33 @@ pub struct AppState {
     /// [`library_refresh_queued`](AppState::library_refresh_queued).
     #[serde(skip)]
     pub membership_refresh_queued: bool,
+    /// A session came up and asked for a full Liked Songs walk that has not
+    /// landed yet. Library edits never ask: they cannot change likes.
+    #[serde(skip)]
+    pub(crate) liked_walk_wanted: bool,
+    /// When this account's last full Liked Songs walk landed.
+    #[serde(skip)]
+    liked_walked_at: Option<Instant>,
+    /// The native window is minimized, so playhead heartbeats are not sent to
+    /// a webview nobody can see.
+    #[serde(skip)]
+    pub(crate) window_minimized: bool,
+    /// A heartbeat was withheld since the last full state; restoring the
+    /// window then asks the engine for its exact playhead once.
+    #[serde(skip)]
+    pub(crate) position_withheld: bool,
 }
+
+/// The shortest gap between two full Liked Songs walks of one account.
+///
+/// A session coming up re-walks the collection to learn likes made in other
+/// clients; likes made here land in the index at once. Sessions come up in
+/// clusters — sleep and resume, a flapping network, an engine respawn — and
+/// each walk pages through the whole collection, dozens of requests for a
+/// large one. Ten minutes collapses such a cluster into one walk, while a like
+/// made on the phone still shows here within minutes of the next reconnect,
+/// which is the only moment this walk could have learned it anyway.
+pub const LIKED_WALK_MIN_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 impl AppState {
     pub fn new(data_dir: PathBuf) -> Self {
@@ -305,7 +331,58 @@ impl AppState {
             memberships: Vec::new(),
             membership_fetching: false,
             membership_refresh_queued: false,
+            liked_walk_wanted: false,
+            liked_walked_at: None,
+            window_minimized: false,
+            position_withheld: false,
         }
+    }
+
+    /// Cold start: selects the namespace of the account that last signed in
+    /// here and shows it at once, not fresh, before the session is up — and
+    /// offline, where it never comes up.
+    ///
+    /// The engine reports no username until it has a session, so the window
+    /// is told this is the account signing in (see
+    /// [`present_account`](Self::present_account)). A different account at
+    /// `ready` is then an ordinary account switch, which the shell and the
+    /// window already reset for.
+    pub(crate) fn select_last_account(&mut self) -> bool {
+        let Some(account) = load_last_account(&self.data_dir) else { return false };
+        self.select_library_account(&account);
+        self.playback.auth_state = "authenticating".to_owned();
+        self.playback.username = account;
+        true
+    }
+
+    /// Names the selected account on a state that has no username of its own:
+    /// one from an engine still (re)authenticating. A logged-out state never
+    /// borrows it, and an authenticated one always carries its own.
+    pub(crate) fn present_account(&self, state: &mut PlaybackState) {
+        if state.username.is_empty()
+            && !matches!(state.auth_state.as_str(), "ready" | "logged_out" | "needs_login")
+        {
+            state.username.clone_from(&self.me_id);
+        }
+    }
+
+    /// Whether the selected library may be shown: it belongs to the identity
+    /// the window currently holds. A namespace selected while another
+    /// account's transport is still published stays hidden until its own is.
+    pub(crate) fn library_visible(&self) -> bool {
+        !self.me_id.is_empty()
+            && self.playback.username == self.me_id
+            && !matches!(self.playback.auth_state.as_str(), "logged_out" | "needs_login")
+    }
+
+    /// Asks for a full Liked Songs walk unless one landed within
+    /// [`LIKED_WALK_MIN_INTERVAL`].
+    pub(crate) fn request_liked_walk(&mut self, now: Instant) -> bool {
+        if self.liked_walked_at.is_some_and(|at| now.saturating_duration_since(at) < LIKED_WALK_MIN_INTERVAL) {
+            return false;
+        }
+        self.liked_walk_wanted = true;
+        true
     }
 
     pub(crate) fn library_dir(&self) -> PathBuf {
@@ -330,6 +407,8 @@ impl AppState {
         self.tracks_cache.clear();
         self.memberships.clear();
         self.playlist_generations.clear();
+        self.liked_walk_wanted = false;
+        self.liked_walked_at = None;
         if account.is_empty() { return true; }
         let dir = self.library_dir();
         self.library_import_pending = true;
@@ -402,12 +481,15 @@ impl AppState {
     }
 
     /// Returns no result for a read overtaken by a landed like/unlike, and
-    /// coalesces a fresh walk into the running reconciliation chain.
-    pub(crate) fn commit_liked_read(&mut self, generation: u64, uris: HashSet<String>) -> Option<bool> {
+    /// coalesces a fresh walk into the running reconciliation chain: the walk
+    /// stays wanted until one lands.
+    pub(crate) fn commit_liked_read(&mut self, generation: u64, uris: HashSet<String>, now: Instant) -> Option<bool> {
         if self.liked_generation != generation {
             self.membership_refresh_queued = true;
             return None;
         }
+        self.liked_walk_wanted = false;
+        self.liked_walked_at = Some(now);
         Some(upsert_membership(&mut self.memberships, MembershipEntry {
             id: LIKED_MEMBERSHIP_ID.to_owned(),
             revision: String::new(),
@@ -707,8 +789,17 @@ pub fn save_playlist_list(dir: &Path, cache: &PlaylistListCache) {
 }
 
 /// One-time transfer of identity-stamped durable activity, never a fallback
-/// read path. Unstamped tracks and memberships are deliberately not imported.
+/// read path. Unstamped tracks and memberships are deliberately not imported:
+/// nothing says whose they are, so they are deleted here instead of lingering.
 fn import_owned_library_list(root: &Path, destination: &Path, account: &str) -> Result<(), String> {
+    for unstamped in ["playlist_tracks_cache.json", "playlist_membership.json"] {
+        match std::fs::remove_file(root.join(unstamped)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // Rebuildable caches: a file that will not go is retried next time.
+            Err(error) => eprintln!("Spotifine: could not remove the previous {unstamped}: {error}"),
+        }
+    }
     let target = destination.join("playlist_list.json");
     if target.exists() { return Ok(()); }
     let Some(cache) = load_playlist_list(root).filter(|cache| cache.me_id == account && !account.is_empty()) else {
@@ -717,6 +808,42 @@ fn import_owned_library_list(root: &Path, destination: &Path, account: &str) -> 
     write_json_atomic_result(target, &cache)?;
     std::fs::remove_file(root.join("playlist_list.json"))
         .map_err(|error| format!("could not retire the previous library file: {error}"))
+}
+
+// ---------------------------------------------------------------------------
+// library/account.json
+// ---------------------------------------------------------------------------
+
+/// The account that last signed in here, so the next launch can open its
+/// library namespace before the session is up. Cleared when the engine has no
+/// account any more (logout, or credentials it can no longer use).
+#[derive(Serialize, Deserialize)]
+struct LastAccount {
+    account: String,
+}
+
+fn last_account_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("library").join("account.json")
+}
+
+fn load_last_account(data_dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(last_account_path(data_dir)).ok()?;
+    serde_json::from_slice::<LastAccount>(&bytes)
+        .ok()
+        .map(|last| last.account)
+        .filter(|account| !account.is_empty())
+}
+
+pub fn remember_last_account(data_dir: &Path, account: &str) -> Result<(), String> {
+    let path = last_account_path(data_dir);
+    if !account.is_empty() {
+        return write_json_atomic_result(path, &LastAccount { account: account.to_owned() });
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not forget the last account: {error}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,6 +1491,8 @@ mod tests {
         assert!(matches!(&state.playlist_tree[0], LibraryNodeDetail::Folder { last_activity: Some(456), .. }));
         assert!(state.tracks_cache.is_empty() && state.memberships.is_empty());
         assert!(!root.join("playlist_list.json").exists());
+        assert!(!root.join("playlist_tracks_cache.json").exists() && !root.join("playlist_membership.json").exists(),
+            "unstamped caches nobody reads any more are deleted, not left behind");
         assert_eq!(load_playlist_list(&state.library_dir()).unwrap().playlists[0].last_activity, Some(456));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1532,15 +1661,140 @@ mod tests {
         let mut state = AppState::new(PathBuf::new());
         let a = "spotify:track:a".to_owned();
         let b = "spotify:track:b".to_owned();
-        state.commit_liked_read(0, HashSet::from([a.clone()]));
+        let now = Instant::now();
+        state.commit_liked_read(0, HashSet::from([a.clone()]), now);
         let read_generation = state.liked_generation;
         assert!(state.record_liked_write(&[a.clone()], false));
         assert!(state.record_liked_write(&[b.clone()], true));
-        assert_eq!(state.commit_liked_read(read_generation, HashSet::from([a])), None);
+        state.liked_walk_wanted = true;
+        assert_eq!(state.commit_liked_read(read_generation, HashSet::from([a]), now), None);
         assert!(state.membership_refresh_queued);
+        assert!(state.liked_walk_wanted, "an overtaken walk is still owed");
         assert_eq!(state.memberships[0].uris, HashSet::from([b.clone()]));
-        assert_eq!(state.commit_liked_read(state.liked_generation, HashSet::from([b.clone()])), Some(false));
+        assert_eq!(state.commit_liked_read(state.liked_generation, HashSet::from([b.clone()]), now), Some(false));
+        assert!(!state.liked_walk_wanted);
         assert_eq!(state.memberships[0].uris, HashSet::from([b]));
+    }
+
+    #[test]
+    fn sessions_coming_up_in_a_cluster_share_one_liked_walk_per_account() {
+        let root = std::env::temp_dir().join(format!("spotifine-liked-walk-{}-{}", std::process::id(), now_secs()));
+        let mut state = AppState::new(root.clone());
+        let start = Instant::now();
+        assert!(!state.liked_walk_wanted, "nothing asks for a walk but a session");
+        assert!(state.request_liked_walk(start), "the first session walks");
+        assert_eq!(state.commit_liked_read(state.liked_generation, HashSet::new(), start), Some(true));
+        assert!(!state.liked_walk_wanted);
+        // A reconnect, a respawn, a resume: all inside the interval.
+        assert!(!state.request_liked_walk(start + Duration::from_secs(5)));
+        assert!(!state.request_liked_walk(start + LIKED_WALK_MIN_INTERVAL - Duration::from_secs(1)));
+        assert!(!state.liked_walk_wanted);
+        assert!(state.request_liked_walk(start + LIKED_WALK_MIN_INTERVAL));
+        // A failed or overtaken walk never counts as one that landed.
+        let mut failed = AppState::new(PathBuf::new());
+        assert!(failed.request_liked_walk(start));
+        assert!(failed.request_liked_walk(start + Duration::from_secs(5)));
+        // Another account has its own collection and its own interval.
+        state.liked_walk_wanted = false;
+        state.commit_liked_read(state.liked_generation, HashSet::new(), start + LIKED_WALK_MIN_INTERVAL);
+        state.select_library_account("someone-else");
+        assert!(state.request_liked_walk(start + LIKED_WALK_MIN_INTERVAL + Duration::from_secs(1)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn library_fixture(root: &Path, account: &str, playlist_id: &str) {
+        let mut state = AppState::new(root.to_path_buf());
+        state.me_id = account.into();
+        let dir = state.library_dir();
+        save_playlist_list(&dir, &PlaylistListCache { version: 1, fetched_at: Some(10), me_id: account.into(),
+            playlists: vec![playlist(playlist_id)], playlist_tree: vec![LibraryNodeDetail::Playlist { id: playlist_id.into() }] });
+        save_tracks_cache(&dir, &[PlaylistTracksEntry { id: playlist_id.into(), fetched_at: Some(10),
+            revision: "r".into(), tracks: vec![track(playlist_id)], excluded_track_ids: Vec::new() }]);
+        save_membership(&dir, &[membership(LIKED_MEMBERSHIP_ID, "", &["spotify:track:liked"])]);
+    }
+
+    fn state_line(auth_state: &str, username: &str) -> PlaybackState {
+        PlaybackState { auth_state: auth_state.into(), username: username.into(), ..PlaybackState::default() }
+    }
+
+    #[test]
+    fn a_cold_start_shows_the_last_signed_in_library_at_once_and_offline_it_stays() {
+        let root = std::env::temp_dir().join(format!("spotifine-cold-start-{}-{}", std::process::id(), now_secs()));
+        library_fixture(&root, "account-a", "a-mix");
+        assert!(!AppState::new(root.clone()).select_last_account(), "nobody has signed in here yet");
+        remember_last_account(&root, "account-a").unwrap();
+
+        let mut state = AppState::new(root.clone());
+        assert!(state.select_last_account());
+        assert_eq!(state.me_id, "account-a");
+        assert!(state.library_visible(), "shown before the engine says a word");
+        assert!(!state.library_fresh, "a disk snapshot is never the fresh rootlist");
+        assert_eq!(state.playlists[0].id, "a-mix");
+        assert_eq!(state.tracks_cache[0].tracks[0].id, "a-mix");
+        assert!(state.memberships[0].contains("spotify:track:liked"), "saved marks work offline too");
+        assert_eq!((state.playback.auth_state.as_str(), state.playback.username.as_str()), ("authenticating", "account-a"));
+
+        // Offline: the engine authenticates for ever, with no username and an error.
+        let mut offline = PlaybackState { error: "Spotify is unreachable".into(), ..state_line("authenticating", "") };
+        state.present_account(&mut offline);
+        state.playback = offline;
+        assert_eq!(state.playback.username, "account-a");
+        assert!(state.library_visible());
+        assert_eq!(state.playlists.len(), 1);
+
+        // The same account comes up: the selection is kept, nothing reloads.
+        let mut ready = state_line("ready", "account-a");
+        state.present_account(&mut ready);
+        assert!(!state.select_library_account(&ready.username));
+        state.playback = ready;
+        assert!(state.library_visible());
+        assert_eq!(state.playlists[0].id, "a-mix");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_different_account_at_ready_switches_namespaces_and_never_shows_the_previous_one() {
+        let root = std::env::temp_dir().join(format!("spotifine-account-switch-{}-{}", std::process::id(), now_secs()));
+        library_fixture(&root, "account-a", "a-mix");
+        library_fixture(&root, "account-b", "b-mix");
+        remember_last_account(&root, "account-a").unwrap();
+        let mut state = AppState::new(root.clone());
+        state.select_last_account();
+        assert_eq!(state.playlists[0].id, "a-mix");
+
+        // B is signed in. The namespace switches before B's state is published,
+        // and while A's identity is still the published one nothing is shown.
+        assert!(state.select_library_account("account-b"));
+        assert_eq!(state.playlists[0].id, "b-mix");
+        assert_eq!(state.tracks_cache[0].tracks[0].id, "b-mix");
+        assert!(!state.library_visible(), "B's rows never pair with A's identity");
+        let mut ready = state_line("ready", "account-b");
+        state.present_account(&mut ready);
+        state.playback = ready;
+        assert!(state.library_visible());
+        assert!(state.playlists.iter().all(|playlist| playlist.id != "a-mix"));
+        remember_last_account(&root, "account-b").unwrap();
+        // B reconnecting is presented as B, never as the account before it.
+        let mut reconnecting = state_line("authenticating", "");
+        state.present_account(&mut reconnecting);
+        assert_eq!(reconnecting.username, "account-b");
+
+        let mut restarted = AppState::new(root.clone());
+        restarted.select_last_account();
+        assert_eq!(restarted.me_id, "account-b", "the next cold start opens the last account");
+        assert_eq!(restarted.playlists[0].id, "b-mix");
+
+        // Signing out forgets the account: the next start shows no library.
+        let mut logged_out = state_line("needs_login", "");
+        restarted.present_account(&mut logged_out);
+        assert!(logged_out.username.is_empty(), "a logged-out state never borrows an identity");
+        restarted.select_library_account("");
+        remember_last_account(&root, "").unwrap();
+        remember_last_account(&root, "").unwrap();
+        let mut after_logout = AppState::new(root.clone());
+        assert!(!after_logout.select_last_account());
+        assert!(!after_logout.library_visible() && after_logout.playlists.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

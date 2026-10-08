@@ -144,6 +144,11 @@ impl Default for TrackRef {
     }
 }
 
+/// Longest request line the engine reads, its newline included. A longer one
+/// is answered with an error that carries no request id, so the sender must
+/// refuse it before writing: nothing would ever answer its pending request.
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 pub struct Request {
     pub request_id: String,

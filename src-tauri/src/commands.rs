@@ -9,7 +9,8 @@ use crate::app::{
     carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir,
     insert_created_playlist, is_followed_playlist, load_app_settings, now_secs,
     order_by_last_activity, playlist_detail_from_cache, playlist_qualifies, remove_membership,
-    update_app_settings, save_membership, save_playlist_list, save_tracks_cache,
+    remember_last_account, update_app_settings, save_membership, save_playlist_list,
+    save_tracks_cache,
     touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, tracks_cache_bytes,
     upsert_membership, upsert_playlist, upsert_tracks_cache, write_tracks_cache_bytes, AppSettings,
     AppState, MembershipEntry, PlaylistListCache, PlaylistTracksEntry, RefreshCause,
@@ -1081,9 +1082,7 @@ pub async fn get_state(state: State<'_, Mutex<AppState>>, router: State<'_, Arc<
     let guard = state.lock();
     // A cache selected during held playback restoration must not be paired
     // with the previous account's still-published transport identity.
-    let library_visible = !guard.me_id.is_empty()
-        && guard.playback.username == guard.me_id
-        && !matches!(guard.playback.auth_state.as_str(), "logged_out" | "needs_login");
+    let library_visible = guard.library_visible();
     Ok(AppStateSnapshot {
         playback: router.snapshot().filter(|remote| remote.username == guard.playback.username
             && !matches!(guard.playback.auth_state.as_str(), "logged_out" | "needs_login"))
@@ -1570,7 +1569,10 @@ pub async fn consume_states(app: AppHandle) {
                 continue;
             }
         } {
-            Ok(StateLine::State(state)) => state,
+            Ok(StateLine::State(mut state)) => {
+                app.state::<Mutex<AppState>>().lock().present_account(&mut state);
+                state
+            }
             Ok(StateLine::CacheMarksReset) => {
                 reset_cache_marks(&mut app.state::<Mutex<AppState>>().lock());
                 app.state::<Arc<PlaybackRouter>>().apply_cache_marks(true, &[], &[]);
@@ -1594,14 +1596,17 @@ pub async fn consume_states(app: AppHandle) {
                 if client.restore_is_pending() || settled_restore.is_some() { continue; }
                 // A heartbeat only moved the playhead: freshen the snapshot
                 // scalars in place and forward the existing scalar `position`
-                // event unchanged (a number, no queue payload).
-                let managed = app.state::<Mutex<AppState>>();
-                let mut guard = managed.lock();
-                apply_position_heartbeat(&mut guard, heartbeat);
-                drop(guard);
+                // event unchanged (a number, no queue payload) — unless the
+                // window is minimized, which hears it once on restore.
                 if !app.state::<Arc<PlaybackRouter>>().is_remote() {
-                    let _ = app.emit("position", heartbeat.position_ms);
+                    let managed = app.state::<Mutex<AppState>>();
+                    let forward = forward_position_heartbeat(&mut managed.lock(), heartbeat);
+                    if forward {
+                        let _ = app.emit("position", heartbeat.position_ms);
+                    }
                     media_keys::update_position(heartbeat.position_ms);
+                } else {
+                    apply_position_heartbeat(&mut app.state::<Mutex<AppState>>().lock(), heartbeat);
                 }
                 continue;
             }
@@ -1682,7 +1687,9 @@ pub async fn consume_states(app: AppHandle) {
             state.cached_ids.as_deref().unwrap_or_default());
         if let Some(ids) = &state.uncached_ids {
             apply_uncached_ids(&mut app.state::<Mutex<AppState>>().lock(), ids);
-            // Invalidations also reach off-queue pages while transport is hidden.
+            // The one delivery of these invalidations: they reach off-queue
+            // pages while transport is hidden, and the full state below leaves
+            // them out. Its rows already carry the cleared marks.
             let _ = app.emit("state", json!({"uncached_ids": ids}));
         }
         if let Some(ids) = &state.cached_ids {
@@ -1728,7 +1735,7 @@ pub async fn consume_states(app: AppHandle) {
             if !library_refresh_during_restore {
                 // Playback restoration hides intermediate transport states,
                 // but rootlist browse can run beside those sequential setters.
-                spawn_refresh_library(app.clone());
+                spawn_session_refresh(&app);
                 library_refresh_during_restore = true;
                 restore_started_at = Some(std::time::Instant::now());
             }
@@ -1784,7 +1791,11 @@ pub async fn consume_states(app: AppHandle) {
         {
             let guard = app.state::<Mutex<AppState>>();
             let mut guard = guard.lock();
-            guard.playback = state.clone();
+            // The mark lanes are one-shot: forwarded with this line, never
+            // replayed from the snapshot by `get_state` or a later publish.
+            guard.playback = PlaybackState { cached_ids: None, uncached_ids: None, ..state.clone() };
+            // A full state carries the exact playhead.
+            guard.position_withheld = false;
         }
         if session_changed && (state.auth_state == "ready" || state.auth_state == "logged_out") {
             let router = app.state::<Arc<PlaybackRouter>>();
@@ -1837,7 +1848,7 @@ pub async fn consume_states(app: AppHandle) {
                 ));
             }
             if !std::mem::take(&mut library_refresh_during_restore) {
-                spawn_refresh_library(app.clone());
+                spawn_session_refresh(&app);
             }
         }
 
@@ -1860,14 +1871,69 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) -> 
     Ok(())
 }
 
-/// Switches only after an authenticated identity is known. Disk data from a
-/// different account is never exposed during startup or a failed login.
+/// Follows the engine's authenticated identity (or its absence) and remembers
+/// it for the next cold start, which opens that namespace before the session
+/// is up. Once another account is known to be signed in, the previous one's
+/// disk data is never exposed again.
 fn select_library_account(app: &AppHandle, account: &str) {
     let managed = app.state::<Mutex<AppState>>();
     if managed.lock().me_id == account { return; }
     let persistence = managed.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
-    managed.lock().select_library_account(account);
+    let data_dir = {
+        let mut guard = managed.lock();
+        guard.select_library_account(account);
+        guard.data_dir.clone()
+    };
+    if let Err(error) = remember_last_account(&data_dir, account) {
+        log::warn(&format!("could not remember the signed-in account: {error}"));
+    }
+}
+
+/// A session came up: refresh the library, and walk Liked Songs for likes
+/// made elsewhere unless that walk ran within the last few minutes.
+fn spawn_session_refresh(app: &AppHandle) {
+    let wanted = app.state::<Mutex<AppState>>().lock().request_liked_walk(std::time::Instant::now());
+    if !wanted {
+        log::info("liked songs were walked moments ago; this session reuses that walk");
+    }
+    spawn_refresh_library(app.clone());
+}
+
+/// Freshens the snapshot's playhead and says whether the window should hear
+/// the heartbeat: not while the native window is minimized.
+fn forward_position_heartbeat(snapshot: &mut AppState, heartbeat: PositionHeartbeat) -> bool {
+    apply_position_heartbeat(snapshot, heartbeat);
+    if snapshot.window_minimized {
+        snapshot.position_withheld = true;
+        return false;
+    }
+    true
+}
+
+/// Records the native minimized state; true when the window has come back
+/// after heartbeats were withheld from it. Only Windows reports the state
+/// (see `report_window_state`); elsewhere the window is never minimized here.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn record_window_minimized(snapshot: &mut AppState, minimized: bool) -> bool {
+    snapshot.window_minimized = minimized;
+    !minimized && std::mem::take(&mut snapshot.position_withheld)
+}
+
+/// Called from the native window-state watcher. A restored window whose
+/// heartbeats were withheld gets one exact playhead: the engine re-sends its
+/// state, which carries no rows the window already holds.
+#[cfg(windows)]
+pub(crate) fn window_minimized_changed(app: &AppHandle, minimized: bool) {
+    let Some(state) = app.try_state::<Mutex<AppState>>() else { return };
+    if !record_window_minimized(&mut state.lock(), minimized) { return; }
+    let Some(client) = app.try_state::<Arc<EngineClient>>() else { return };
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = client.status().await {
+            log::warn(&format!("could not resync the playhead after restore: {error}"));
+        }
+    });
 }
 
 /// Restore may fetch the library before its first ready state is publishable.
@@ -1976,9 +2042,9 @@ fn membership_refresh_work(qualifying: Vec<(String, String)>, memberships: &[Mem
 
 /// Brings the membership index in line with the current library: drops
 /// containers that no longer qualify (deleted, unfollowed, or no longer
-/// owned), refetches stale ones sequentially, and re-walks Liked Songs —
-/// which has no revision and must always be re-asked to see external
-/// likes and unlikes. Failures keep the previous entry rather than
+/// owned), refetches stale ones sequentially, and — when a session asked for
+/// it — re-walks Liked Songs, which has no revision and must be re-asked to
+/// see external likes and unlikes. Failures keep the previous entry rather than
 /// corrupting a good index with an empty one. Whatever the pass changed is
 /// saved and announced once, when it ends.
 async fn reconcile_memberships(app: &AppHandle, state: &Mutex<AppState>, client: &EngineClient) {
@@ -2063,20 +2129,27 @@ async fn refresh_memberships(state: &Mutex<AppState>, client: &EngineClient, pla
         }
         tokio::time::sleep(MEMBERSHIP_RECONCILE_GAP).await;
     }
-    // Liked Songs: one context walk per pass. A page failure mid-walk keeps
-    // the previously indexed set — a partial liked list would silently
-    // unmark tracks that are still saved.
-    if !library_generation_is_current(&state.lock(), generation) {
-        return;
-    }
-    let liked_generation = state.lock().liked_generation;
+    // Liked Songs: one context walk, only when a session asked for it. Library
+    // edits reconcile playlists but cannot change likes, and likes made here
+    // are already in the index. A page failure mid-walk keeps the previously
+    // indexed set — a partial liked list would silently unmark tracks that
+    // are still saved — and leaves the walk wanted for the next pass.
+    let liked_generation = {
+        let guard = state.lock();
+        if !library_generation_is_current(&guard, generation) || !guard.liked_walk_wanted {
+            return;
+        }
+        guard.liked_generation
+    };
     match browse_all_liked_uris(client).await {
         Ok(uris) => {
             let mut guard = state.lock();
             if !library_generation_is_current(&guard, generation) {
                 return;
             }
-            *liked = guard.commit_liked_read(liked_generation, uris).unwrap_or(false);
+            *liked = guard
+                .commit_liked_read(liked_generation, uris, std::time::Instant::now())
+                .unwrap_or(false);
         }
         Err(error) => log::warn(&format!(
             "membership reconcile of liked songs failed: {error}"
@@ -2604,6 +2677,29 @@ mod tests {
         assert_eq!(snapshot.playback.current_uri, "spotify:track:a");
         assert_eq!(snapshot.playback.volume, 50);
         assert_eq!(snapshot.playback.queue, vec![Track::default()].into());
+    }
+
+    #[test]
+    fn a_minimized_window_hears_no_heartbeats_and_one_resync_on_restore() {
+        let mut snapshot = AppState::new(std::path::PathBuf::new());
+        snapshot.playback = playing_state(1_000);
+        let beat = |position_ms| PositionHeartbeat { position_ms, duration_ms: 200_000 };
+        assert!(forward_position_heartbeat(&mut snapshot, beat(3_000)));
+        assert!(!record_window_minimized(&mut snapshot, true), "minimizing needs no resync");
+        assert!(!forward_position_heartbeat(&mut snapshot, beat(5_000)));
+        assert!(!forward_position_heartbeat(&mut snapshot, beat(7_000)));
+        assert_eq!(snapshot.playback.position_ms, 7_000, "the shell's own snapshot stays current");
+        assert!(record_window_minimized(&mut snapshot, false), "restoring after withheld beats resyncs");
+        assert!(!record_window_minimized(&mut snapshot, false), "once");
+        assert!(forward_position_heartbeat(&mut snapshot, beat(9_000)));
+        // Paused while minimized: nothing was withheld, so nothing to resync.
+        record_window_minimized(&mut snapshot, true);
+        assert!(!record_window_minimized(&mut snapshot, false));
+        // A full state after the withheld beat already carried the exact playhead.
+        record_window_minimized(&mut snapshot, true);
+        forward_position_heartbeat(&mut snapshot, beat(11_000));
+        snapshot.position_withheld = false; // what storing a full state does
+        assert!(!record_window_minimized(&mut snapshot, false));
     }
 
     /// A volume step reaches the window as a partial `state`: the one key that

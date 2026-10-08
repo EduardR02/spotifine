@@ -7,6 +7,7 @@
 //! pipe closes and re-requests `status` so the session re-syncs after a
 //! restart.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -20,7 +21,11 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use serde_json::{json, Map, Value};
+use renderer_engine::protocol::MAX_REQUEST_BYTES;
+use serde::de::value::{CowStrDeserializer, MapAccessDeserializer};
+use serde::de::{DeserializeSeed, IntoDeserializer, MapAccess, Visitor};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch};
 
 use crate::app::{
@@ -39,6 +44,24 @@ const WAVEFORM_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Engine respawn backoff bounds.
 const RESPAWN_BACKOFF_START: Duration = Duration::from_secs(2);
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// A child that stayed up this long was healthy, so its exit starts the
+/// backoff over. A spawn that succeeds proves nothing: a crash-looping engine
+/// spawns fine and dies again within seconds, and resetting on the spawn kept
+/// it respawning every two seconds for ever. Thirty seconds is past any
+/// startup crash (authentication, device open, restore) and equal to the
+/// longest wait, so a loop never respawns faster than its last delay.
+const RESPAWN_STABLE_UPTIME: Duration = Duration::from_secs(30);
+
+/// The wait before respawning a child that exited after `uptime`, given the
+/// `backoff` its predecessor's exit left behind.
+fn respawn_delay(backoff: Duration, uptime: Duration) -> Duration {
+    if uptime >= RESPAWN_STABLE_UPTIME { RESPAWN_BACKOFF_START } else { backoff }
+}
+
+fn next_respawn_backoff(delay: Duration) -> Duration {
+    (delay * 2).min(RESPAWN_BACKOFF_MAX)
+}
 
 /// Crash-restore retries use the same shape as the shell's library refresh:
 /// at most [`RESTORE_RETRY_ATTEMPTS`] total attempts, with 5s backoff
@@ -128,7 +151,7 @@ struct EngineInput {
 /// [`PlaybackState`]: a heartbeat carries only the playhead scalars the
 /// frontend projects and clamps against, so parsing and forwarding it never
 /// touches (or clones) the queue.
-#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
 pub struct PositionHeartbeat {
     pub position_ms: u32,
     pub duration_ms: u32,
@@ -975,9 +998,12 @@ impl EngineClient {
 
     /// Respawn loop: waits for the reader thread to signal EOF, sleeps with
     /// exponential backoff, then starts a fresh engine and re-requests
-    /// `status` so the engine re-emits its current state.
+    /// `status` so the engine re-emits its current state. The backoff starts
+    /// over only after a child stayed up for [`RESPAWN_STABLE_UPTIME`].
     pub async fn supervise(self: Arc<Self>) {
         let mut backoff = RESPAWN_BACKOFF_START;
+        // The startup child was spawned by `start` just before this runs.
+        let mut spawned_at = Instant::now();
         loop {
             if self.shutting_down.load(Ordering::SeqCst) {
                 return;
@@ -986,7 +1012,7 @@ impl EngineClient {
                 // Startup spawn failed or the engine died; (re)start it.
                 match self.spawn_engine() {
                     Ok(()) => {
-                        backoff = RESPAWN_BACKOFF_START;
+                        spawned_at = Instant::now();
                         // Clear the exit latch for the fresh process.
                         self.exit_tx.send_replace(false);
                     }
@@ -996,7 +1022,7 @@ impl EngineClient {
                             backoff.as_secs()
                         ));
                         tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(RESPAWN_BACKOFF_MAX);
+                        backoff = next_respawn_backoff(backoff);
                         continue;
                     }
                 }
@@ -1022,12 +1048,15 @@ impl EngineClient {
             if self.shutting_down.load(Ordering::SeqCst) {
                 return;
             }
+            let uptime = spawned_at.elapsed();
+            let delay = respawn_delay(backoff, uptime);
             log::warn(&format!(
-                "engine exited; respawning in {}s",
-                backoff.as_secs()
+                "engine exited after {}s; respawning in {}s",
+                uptime.as_secs(),
+                delay.as_secs()
             ));
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(RESPAWN_BACKOFF_MAX);
+            tokio::time::sleep(delay).await;
+            backoff = next_respawn_backoff(delay);
         }
     }
 
@@ -1124,12 +1153,26 @@ impl EngineClient {
         )
     }
 
-    /// Writes one request line and awaits its reply.
-    pub async fn request(&self, kind: &str, args: Value) -> Result<EngineReply, String> {
+    /// Writes one request line and awaits its reply. `args` are the command's
+    /// own fields, serialized straight into the line.
+    pub async fn request(&self, kind: &str, args: impl Serialize) -> Result<EngineReply, String> {
+        self.request_cancelling(kind, args, None).await
+    }
+
+    /// [`Self::request`], telling the engine to stop work on `cancellation_track_id`
+    /// when the caller stops waiting for a request the engine did receive.
+    async fn request_cancelling(
+        &self,
+        kind: &str,
+        args: impl Serialize,
+        cancellation_track_id: Option<&str>,
+    ) -> Result<EngineReply, String> {
         let timeout = request_timeout(kind);
         let deadline = tokio::time::Instant::now() + timeout;
         let request_id = self.next_request_id();
-        let cancellation_track_id = waveform_timeout_cancellation(kind, &args);
+        // Encoded and measured before any bookkeeping: an oversized line is
+        // refused here with its reason, never sent to time out unanswered.
+        let line = request_line(&request_id, kind, args)?;
         let (sender, receiver) = oneshot::channel();
         {
             let mut pending = self.pending.lock();
@@ -1141,7 +1184,6 @@ impl EngineClient {
             });
         }
         let _pending = RequestGuard { pending: &self.pending, id: &request_id };
-        let line = build_line(&request_id, kind, args);
         let (generation, written) = match self.write_line(line) {
             Ok(queued) => queued,
             Err(error) => {
@@ -1165,10 +1207,12 @@ impl EngineClient {
             Err(_) => {
                 if write_complete {
                     if let Some(track_id) = cancellation_track_id {
-                        let cancel = build_line(&self.next_request_id(), "cancel_track_waveform",
+                        let cancel = request_line(&self.next_request_id(), "cancel_track_waveform",
                             json!({"track_id": track_id}));
                         let input = self.stdin.lock();
-                        if let Some(input) = input.as_ref().filter(|input| input.generation == generation) {
+                        if let (Ok(cancel), Some(input)) =
+                            (cancel, input.as_ref().filter(|input| input.generation == generation))
+                        {
                             let (written, _) = oneshot::channel();
                             let _ = input.sender.try_send(InputLine { line: cancel, written });
                         }
@@ -1296,13 +1340,14 @@ impl EngineClient {
         let result = self
             .request(
                 "play_queue",
-                json!({
-                    "queue": queue,
-                    "index": index,
-                    "position_ms": position_ms,
-                    "context": context,
-                    "automatic_start": automatic_start,
-                }),
+                QueueRequest {
+                    queue,
+                    index,
+                    position_ms,
+                    context,
+                    automatic_start,
+                    ..QueueRequest::default()
+                },
             )
             .await
             .map(|_| ());
@@ -1361,15 +1406,15 @@ impl EngineClient {
         let result = self
             .request(
                 "restore_queue",
-                json!({
-                    "queue": snapshot.queue,
-                    "index": snapshot.current_index.unwrap_or(0),
-                    "position_ms": snapshot.position_ms,
-                    "context": "",
-                    "only_if_preview": true,
-                    "preview_lease_id": preview_lease_id,
-                    "resume_playing": snapshot.resume_playing,
-                }),
+                QueueRequest {
+                    queue: &snapshot.queue,
+                    index: snapshot.current_index.unwrap_or(0),
+                    position_ms: snapshot.position_ms,
+                    only_if_preview: true,
+                    preview_lease_id: Some(preview_lease_id),
+                    resume_playing: Some(snapshot.resume_playing),
+                    ..QueueRequest::default()
+                },
             )
             .await
             .map(|_| ());
@@ -1392,14 +1437,15 @@ impl EngineClient {
         let result = self
             .request(
                 "restore_queue",
-                json!({
-                    "queue": queue,
-                    "index": index,
-                    "position_ms": position_ms,
-                    "context": context,
-                    "automatic_start": automatic_start,
-                    "resume_playing": resume_playing,
-                }),
+                QueueRequest {
+                    queue,
+                    index,
+                    position_ms,
+                    context,
+                    automatic_start,
+                    resume_playing: Some(resume_playing),
+                    ..QueueRequest::default()
+                },
             )
             .await
             .map(|_| ());
@@ -1439,10 +1485,7 @@ impl EngineClient {
 
     pub async fn add_queue_batch(&self, tracks: &[Track], context: &str) -> Result<(), String> {
         let result = self
-            .request(
-                "add_queue_batch",
-                json!({"tracks": tracks, "context": context}),
-            )
+            .request("add_queue_batch", TracksRequest { tracks, context })
             .await
             .map(|_| ());
         if result.is_ok() {
@@ -1498,7 +1541,7 @@ impl EngineClient {
         track_id: &str,
     ) -> Result<renderer_engine::protocol::TrackWaveform, String> {
         let reply = self
-            .request("get_track_waveform", json!({"track_id": track_id}))
+            .request_cancelling("get_track_waveform", json!({"track_id": track_id}), Some(track_id))
             .await?;
         parse_data(reply, "get_track_waveform")
     }
@@ -1528,7 +1571,7 @@ impl EngineClient {
         // on_eof and on_state so a pre-logout real queue can never be
         // installed after logout has invalidated it.
         self.clear_session_restore();
-        self.clear_persisted_playback_state()
+        self.clear_persisted_playback_state().await
     }
 
     fn clear_session_restore(&self) {
@@ -1547,25 +1590,32 @@ impl EngineClient {
         self.clear_cache_marks();
     }
 
-    fn clear_persisted_playback_state(&self) -> Result<(), String> {
+    /// The writer may be mid-write (an fsync) and its queue holds one command,
+    /// so both handing it the clear and hearing back can block: the whole
+    /// round trip runs on the blocking pool, never on an async worker.
+    async fn clear_persisted_playback_state(&self) -> Result<(), String> {
         // Invalidates any snapshot an in-flight attempt captured before logout.
         self.persist_generation.fetch_add(1, Ordering::AcqRel);
-        let (result_tx, result_rx) = mpsc::channel();
-        let result = self
-            .persist_tx
-            .send(PersistCommand::Clear(result_tx))
-            .map_err(|_| "playback-state writer is unavailable".to_owned())
-            .and_then(|_| {
-                result_rx.recv().map_err(|error| {
-                    format!("playback-state writer stopped during clear: {error}")
-                })?
-            });
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => clear_playback_snapshot().map_err(|fallback| {
-                format!("{error}; direct playback-state clear failed: {fallback}")
-            }),
-        }
+        let persist_tx = self.persist_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let (result_tx, result_rx) = mpsc::channel();
+            let result = persist_tx
+                .send(PersistCommand::Clear(result_tx))
+                .map_err(|_| "playback-state writer is unavailable".to_owned())
+                .and_then(|_| {
+                    result_rx.recv().map_err(|error| {
+                        format!("playback-state writer stopped during clear: {error}")
+                    })?
+                });
+            match result {
+                Ok(()) => Ok(()),
+                Err(error) => clear_playback_snapshot().map_err(|fallback| {
+                    format!("{error}; direct playback-state clear failed: {fallback}")
+                }),
+            }
+        })
+        .await
+        .map_err(|error| format!("playback-state clear did not finish: {error}"))?
     }
 
     // ------------------------------------------------------------------
@@ -1969,8 +2019,9 @@ impl EngineClient {
         }
         log::info("engine shutdown requested");
 
-        let line = build_line(&self.next_request_id(), "shutdown", Value::Null);
-        let _ = self.write_line(line);
+        if let Ok(line) = request_line(&self.next_request_id(), "shutdown", ()) {
+            let _ = self.write_line(line);
+        }
         let child = self.process.lock().take();
         if let Some(mut child) = child {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -2223,8 +2274,8 @@ impl EngineClient {
         if !self.delta_base.lock().mark_resynced(revision) {
             return;
         }
-        let line = build_line(&self.next_request_id(), "status", Value::Null);
-        if let Err(error) = self.write_line(line) {
+        let line = request_line(&self.next_request_id(), "status", ());
+        if let Err(error) = line.and_then(|line| self.write_line(line)) {
             log::warn(&format!(
                 "could not ask the engine to re-send the state of revision {revision}: {error}"
             ));
@@ -2519,12 +2570,7 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
                         if trimmed.is_empty() {
                             continue;
                         }
-                        let value: Value = match serde_json::from_str(trimmed) {
-                            Ok(value) => value,
-                            // Never produced by the engine; be tolerant.
-                            Err(_) => continue,
-                        };
-                        match parse_line(value) {
+                        match parse_line(trimmed) {
                             Some(Line::State { state, rows }) => client.on_state(&state, rows),
                             Some(Line::Position(heartbeat)) => client.on_position(heartbeat),
                             Some(Line::Volume(volume)) => client.on_volume(volume),
@@ -2549,7 +2595,7 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
 
 /// What one engine output line means. `state`, `position` and `volume` lines
 /// are fanned out; every other line is a reply to a pending request.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Line {
     State {
         state: PlaybackState,
@@ -2573,67 +2619,200 @@ struct VolumeLine {
     volume: u8,
 }
 
-/// Classifies and parses one protocol line. Scalar lanes are parsed into
-/// their own shapes only — never into a [`PlaybackState`], so a heartbeat or a
-/// volume step can never cost a queue parse. Malformed scalar lines are logged
-/// and dropped (`None`), matching the reader's old tolerance; unknown lines
-/// fall through to reply routing.
-fn parse_line(value: Value) -> Option<Line> {
-    match value.get("type").and_then(Value::as_str) {
-        Some("state") => {
-            let rows = match (value.get("queue").is_some(), value.get("upcoming").is_some()) {
-                (true, true) => PayloadRows::Sent,
-                (true, false) => PayloadRows::QueueOnly,
-                (false, true) => PayloadRows::OrderOnly,
-                (false, false) => PayloadRows::Omitted,
-            };
-            match serde_json::from_value::<PlaybackState>(value) {
-                Ok(state) => Some(Line::State { state, rows }),
-                Err(error) => {
-                    log::error(&format!("could not parse engine state line: {error}"));
-                    None
-                }
+/// A reply's routing fields, as tolerant as routing has always been: a
+/// request id or error that is not a string reads as none, and only a literal
+/// `true` is success. `data` is kept whenever the key is present, `null`
+/// included, because that is a payload some browses answer with.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct ReplyFields {
+    request_id: Value,
+    ok: Value,
+    error: Value,
+    #[serde(deserialize_with = "present_value")]
+    data: Option<Value>,
+}
+
+fn present_value<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+/// Classifies and parses one protocol line in a single pass over its text.
+///
+/// The engine writes `type` first, so the rest of the line streams straight
+/// into its typed shape: a ten-thousand-row state is read once, into tracks,
+/// never into a `Value` tree that is then walked a second time. Keys that
+/// arrive ahead of `type` are held as values and replayed, so key order can
+/// change the cost but never the result. Scalar lanes are parsed into their
+/// own shapes only — never into a [`PlaybackState`], so a heartbeat or a
+/// volume step can never cost a queue parse. A malformed state, position or
+/// volume line is logged and dropped (`None`); text that is not a JSON object
+/// was never routable and is dropped silently.
+fn parse_line(line: &str) -> Option<Line> {
+    let mut lane = None;
+    let mut deserializer = serde_json::Deserializer::from_str(line);
+    let parsed = LineSeed { lane: &mut lane }
+        .deserialize(&mut deserializer)
+        .and_then(|parsed| deserializer.end().map(|()| parsed));
+    match parsed {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            if let Some(lane) = lane {
+                log::error(&format!("could not parse engine {lane} line: {error}"));
+            }
+            None
+        }
+    }
+}
+
+/// Parses one line, recording which lane it turned out to be so a failure
+/// can be reported against it.
+struct LineSeed<'a> {
+    lane: &'a mut Option<&'static str>,
+}
+
+impl<'de> DeserializeSeed<'de> for LineSeed<'_> {
+    type Value = Line;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Line, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for LineSeed<'_> {
+    type Value = Line;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("an engine protocol object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Line, A::Error> {
+        let mut ahead = Vec::new();
+        let mut kind = Value::Null;
+        while let Some(WireKey(key)) = map.next_key()? {
+            if key == "type" {
+                kind = map.next_value()?;
+                break;
+            }
+            ahead.push((key, map.next_value::<Value>()?));
+        }
+        let mut fields = LineFields {
+            ahead: ahead.into_iter(),
+            pending: None,
+            map,
+            done: false,
+            queue: false,
+            upcoming: false,
+        };
+        match kind.as_str() {
+            Some("state") => {
+                *self.lane = Some("state");
+                let state = PlaybackState::deserialize(MapAccessDeserializer::new(&mut fields))?;
+                let rows = match (fields.queue, fields.upcoming) {
+                    (true, true) => PayloadRows::Sent,
+                    (true, false) => PayloadRows::QueueOnly,
+                    (false, true) => PayloadRows::OrderOnly,
+                    (false, false) => PayloadRows::Omitted,
+                };
+                Ok(Line::State { state, rows })
+            }
+            Some("position") => {
+                *self.lane = Some("position");
+                PositionHeartbeat::deserialize(MapAccessDeserializer::new(&mut fields)).map(Line::Position)
+            }
+            Some("volume") => {
+                *self.lane = Some("volume");
+                VolumeLine::deserialize(MapAccessDeserializer::new(&mut fields))
+                    .map(|line| Line::Volume(line.volume))
+            }
+            _ => {
+                *self.lane = Some("reply");
+                let reply = ReplyFields::deserialize(MapAccessDeserializer::new(&mut fields))?;
+                Ok(Line::Reply {
+                    request_id: match reply.request_id {
+                        Value::String(request_id) => request_id,
+                        _ => String::new(),
+                    },
+                    ok: reply.ok == Value::Bool(true),
+                    error: match reply.error {
+                        Value::String(error) => Some(error),
+                        _ => None,
+                    },
+                    data: reply.data,
+                })
             }
         }
-        Some("position") => match serde_json::from_value::<PositionHeartbeat>(value) {
-            Ok(heartbeat) => Some(Line::Position(heartbeat)),
-            Err(error) => {
-                log::error(&format!("could not parse engine position line: {error}"));
-                None
+    }
+}
+
+/// An object key, borrowed from the line unless it had to be unescaped.
+struct WireKey<'de>(Cow<'de, str>);
+
+impl<'de> Deserialize<'de> for WireKey<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = WireKey<'de>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an object key")
             }
-        },
-        Some("volume") => match serde_json::from_value::<VolumeLine>(value) {
-            Ok(volume) => Some(Line::Volume(volume.volume)),
-            Err(error) => {
-                log::error(&format!("could not parse engine volume line: {error}"));
-                None
+            fn visit_borrowed_str<E>(self, key: &'de str) -> Result<Self::Value, E> {
+                Ok(WireKey(Cow::Borrowed(key)))
             }
-        },
-        _ => {
-            let Value::Object(mut object) = value else {
-                return Some(Line::Reply {
-                    request_id: String::new(),
-                    ok: false,
-                    error: None,
-                    data: None,
-                });
-            };
-            let request_id = match object.remove("request_id") {
-                Some(Value::String(request_id)) => request_id,
-                _ => String::new(),
-            };
-            let ok = matches!(object.remove("ok"), Some(Value::Bool(true)));
-            let error = match object.remove("error") {
-                Some(Value::String(error)) => Some(error),
-                _ => None,
-            };
-            let data = object.remove("data");
-            Some(Line::Reply {
-                request_id,
-                ok,
-                error,
-                data,
-            })
+            fn visit_str<E>(self, key: &str) -> Result<Self::Value, E> {
+                Ok(WireKey(Cow::Owned(key.to_owned())))
+            }
+            fn visit_string<E>(self, key: String) -> Result<Self::Value, E> {
+                Ok(WireKey(Cow::Owned(key)))
+            }
+        }
+        deserializer.deserialize_str(KeyVisitor)
+    }
+}
+
+/// The fields after `type`: any held ahead of it first, then the rest of the
+/// line as it streams. Notes whether the `queue` and `upcoming` keys were
+/// present at all — omission is a delta, an empty array is data.
+struct LineFields<'de, A> {
+    ahead: std::vec::IntoIter<(Cow<'de, str>, Value)>,
+    pending: Option<Value>,
+    map: A,
+    done: bool,
+    queue: bool,
+    upcoming: bool,
+}
+
+impl<'de, A: MapAccess<'de>> MapAccess<'de> for LineFields<'de, A> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>, A::Error> {
+        let key = match self.ahead.next() {
+            Some((key, value)) => {
+                self.pending = Some(value);
+                key
+            }
+            None if self.done => return Ok(None),
+            None => match self.map.next_key::<WireKey<'de>>()? {
+                Some(WireKey(key)) => key,
+                None => {
+                    self.done = true;
+                    return Ok(None);
+                }
+            },
+        };
+        match &*key {
+            "queue" => self.queue = true,
+            "upcoming" => self.upcoming = true,
+            _ => {}
+        }
+        let key: CowStrDeserializer<'_, A::Error> = key.into_deserializer();
+        seed.deserialize(key).map(Some)
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, A::Error> {
+        match self.pending.take() {
+            Some(value) => seed.deserialize(value).map_err(serde::de::Error::custom),
+            None => self.map.next_value_seed(seed),
         }
     }
 }
@@ -2648,24 +2827,68 @@ fn request_timeout(kind: &str) -> Duration {
     }
 }
 
-fn waveform_timeout_cancellation(kind: &str, args: &Value) -> Option<String> {
-    if kind != "get_track_waveform" {
-        return None;
-    }
-    args.get("track_id")?.as_str().map(str::to_owned)
+/// One request line: the id and the command, then the command's own fields
+/// at the same level.
+#[derive(Serialize)]
+struct RequestLine<'a, A> {
+    request_id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    #[serde(flatten)]
+    args: A,
 }
 
-fn build_line(request_id: &str, kind: &str, args: Value) -> String {
-    let mut object = Map::new();
-    object.insert(
-        "request_id".to_owned(),
-        Value::String(request_id.to_owned()),
-    );
-    object.insert("type".to_owned(), Value::String(kind.to_owned()));
-    if let Value::Object(fields) = args {
-        object.extend(fields);
+/// A queue replacement, `play_queue` or `restore_queue`, serialized straight
+/// from the borrowed rows rather than through a `Value` copy of all of them.
+/// The optional fields are the restore-only ones and stay off the line when
+/// unset, exactly as the engine defaults them.
+#[derive(Default, Serialize)]
+struct QueueRequest<'a> {
+    queue: &'a [Track],
+    index: usize,
+    position_ms: u32,
+    context: &'a str,
+    automatic_start: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    only_if_preview: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_lease_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_playing: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct TracksRequest<'a> {
+    tracks: &'a [Track],
+    context: &'a str,
+}
+
+/// Encodes one request line, refusing one the engine would not read. The
+/// engine's answer to an oversized line carries no request id, so sending it
+/// would only leave the caller waiting out its timeout with nothing to say.
+fn request_line(request_id: &str, kind: &str, args: impl Serialize) -> Result<String, String> {
+    let line = serde_json::to_string(&RequestLine { request_id, kind, args })
+        .map_err(|error| format!("could not encode the {kind} request: {error}"))?;
+    // The writer appends a newline, and the engine counts it.
+    let bytes = line.len() + 1;
+    if bytes > MAX_REQUEST_BYTES {
+        return Err(oversized_request_error(kind, bytes));
     }
-    serde_json::to_string(&Value::Object(object)).expect("request serialization cannot fail")
+    Ok(line)
+}
+
+fn oversized_request_error(kind: &str, bytes: usize) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let what = match kind {
+        "play_queue" | "restore_queue" => "This queue is",
+        "add_queue_batch" => "These tracks are",
+        _ => "This request is",
+    };
+    format!(
+        "{what} too large for the playback engine: {:.1} MB, over its {} MB limit.",
+        bytes as f64 / MIB,
+        MAX_REQUEST_BYTES / (1024 * 1024),
+    )
 }
 
 fn parse_data<T: serde::de::DeserializeOwned>(reply: EngineReply, kind: &str) -> Result<T, String> {
@@ -2712,6 +2935,16 @@ fn locate_engine() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_line(request_id: &str, kind: &str, args: impl Serialize) -> String {
+        request_line(request_id, kind, args).expect("request encodes")
+    }
+
+    /// `json!` objects serialize with sorted keys, which puts `type` late:
+    /// these lines take the held-ahead path, the engine's own the streaming one.
+    fn parse_value(value: Value) -> Option<Line> {
+        parse_line(&value.to_string())
+    }
 
     #[test]
     fn exit_waits_for_final_flush_and_freezes_the_snapshot_before_writer_acknowledgement() {
@@ -2760,7 +2993,7 @@ mod tests {
         let initial = PlaybackState { auth_state: "ready".into(), queue_revision: 11, order_revision: 21,
             queue: vec![Track { id: "a".into(), ..Track::default() }].into(), ..PlaybackState::default() };
         let client = client_with_last_state(initial.clone());
-        let Some(Line::State { state: delta, rows }) = parse_line(json!({
+        let Some(Line::State { state: delta, rows }) = parse_value(json!({
             "type": "state", "auth_state": "ready", "queue_revision": 11, "order_revision": 21,
             "cached_ids": ["a", "detail-only"]
         })) else { panic!("cache delta did not parse") };
@@ -2774,7 +3007,7 @@ mod tests {
             PayloadRows::Omitted);
         assert!(client.current_state().unwrap().queue[0].cached);
         for raw in [Value::Null, json!(false), json!({})] {
-            let Some(Line::State { state, rows }) = parse_line(json!({
+            let Some(Line::State { state, rows }) = parse_value(json!({
                 "type": "state", "auth_state": "ready", "queue_revision": 11,
                 "order_revision": 21, "cached_ids": raw
             })) else { panic!("non-array marks must behave as omission") };
@@ -3246,19 +3479,6 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         );
         assert_eq!(request_timeout("cancel_track_waveform"), COMMAND_TIMEOUT);
         assert_eq!(request_timeout("browse_album"), BROWSE_TIMEOUT);
-        assert_eq!(
-            waveform_timeout_cancellation(
-                "get_track_waveform",
-                &json!({"track_id": "0123456789ABCDEFGHIJKL"}),
-            )
-            .as_deref(),
-            Some("0123456789ABCDEFGHIJKL"),
-        );
-        assert!(waveform_timeout_cancellation(
-            "cancel_track_waveform",
-            &json!({"track_id": "0123456789ABCDEFGHIJKL"}),
-        )
-        .is_none());
 
         let line = build_line(
             "waveform-1",
@@ -3986,7 +4206,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
 
     #[test]
     fn reply_lines_keep_error_and_data_fields() {
-        let reply = parse_line(serde_json::json!({
+        let reply = parse_value(serde_json::json!({
             "type": "browse_playlist",
             "request_id": "request-8",
             "ok": false,
@@ -4011,7 +4231,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
 
     #[test]
     fn position_lines_parse_as_scalar_heartbeats_not_states() {
-        let line = parse_line(serde_json::json!({
+        let line = parse_value(serde_json::json!({
             "type": "position",
             "position_ms": 12_345,
             "duration_ms": 240_000,
@@ -4025,7 +4245,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
 
     #[test]
     fn state_and_reply_lines_still_classify_as_before() {
-        let state = parse_line(serde_json::json!({
+        let state = parse_value(serde_json::json!({
             "type": "state",
             "ready": true,
             "auth_state": "ready",
@@ -4049,7 +4269,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         // leaves `queue` out is one whose generation this client already
         // holds, and the empty vector it parses into must never be read as the
         // queue itself.
-        let omitted = parse_line(serde_json::json!({
+        let omitted = parse_value(serde_json::json!({
             "type": "state",
             "ready": true,
             "auth_state": "ready",
@@ -4064,7 +4284,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             })
         ));
 
-        let reply = parse_line(serde_json::json!({
+        let reply = parse_value(serde_json::json!({
             "type": "response",
             "request_id": "request-7",
             "ok": true,
@@ -4142,7 +4362,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         // consume_states subscribes before the engine produces lines.
         let mut receiver = client.subscribe_lines();
 
-        let Some(Line::Volume(volume)) = parse_line(serde_json::json!({
+        let Some(Line::Volume(volume)) = parse_value(serde_json::json!({
             "type": "volume",
             "volume": 31,
         })) else {
@@ -4658,5 +4878,217 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
 
         client.shutdown_engine();
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn a_crash_loop_backs_off_and_only_a_stable_child_starts_the_backoff_over() {
+        let mut backoff = RESPAWN_BACKOFF_START;
+        let mut delays = Vec::new();
+        // Each child spawns fine and dies a second later.
+        for _ in 0..6 {
+            let delay = respawn_delay(backoff, Duration::from_secs(1));
+            delays.push(delay.as_secs());
+            backoff = next_respawn_backoff(delay);
+        }
+        assert_eq!(delays, [2, 4, 8, 16, 30, 30], "a spawn that succeeds must not reset the backoff");
+        // A child that stayed up long enough was healthy: its exit starts over.
+        let delay = respawn_delay(backoff, RESPAWN_STABLE_UPTIME);
+        assert_eq!(delay, RESPAWN_BACKOFF_START);
+        assert_eq!(next_respawn_backoff(delay), Duration::from_secs(4));
+        assert_eq!(respawn_delay(Duration::from_secs(16), RESPAWN_STABLE_UPTIME - Duration::from_millis(1)),
+            Duration::from_secs(16));
+    }
+
+    /// The reader's previous implementation, kept as the oracle the typed
+    /// single-pass parse must agree with.
+    fn value_tree_parse(value: Value) -> Option<Line> {
+        match value.get("type").and_then(Value::as_str) {
+            Some("state") => {
+                let rows = match (value.get("queue").is_some(), value.get("upcoming").is_some()) {
+                    (true, true) => PayloadRows::Sent,
+                    (true, false) => PayloadRows::QueueOnly,
+                    (false, true) => PayloadRows::OrderOnly,
+                    (false, false) => PayloadRows::Omitted,
+                };
+                serde_json::from_value::<PlaybackState>(value).ok().map(|state| Line::State { state, rows })
+            }
+            Some("position") => serde_json::from_value(value).ok().map(Line::Position),
+            Some("volume") => serde_json::from_value::<VolumeLine>(value).ok().map(|line| Line::Volume(line.volume)),
+            _ => {
+                let Value::Object(mut object) = value else {
+                    return Some(Line::Reply { request_id: String::new(), ok: false, error: None, data: None });
+                };
+                Some(Line::Reply {
+                    request_id: match object.remove("request_id") { Some(Value::String(id)) => id, _ => String::new() },
+                    ok: matches!(object.remove("ok"), Some(Value::Bool(true))),
+                    error: match object.remove("error") { Some(Value::String(error)) => Some(error), _ => None },
+                    data: object.remove("data"),
+                })
+            }
+        }
+    }
+
+    /// The same object with `type` first, the way the engine writes it.
+    fn type_first(kind: &str, value: &Value) -> String {
+        let mut line = format!("{{\"type\":{}", Value::String(kind.into()));
+        for (key, field) in value.as_object().unwrap() {
+            if key == "type" { continue; }
+            line.push_str(&format!(",{}:{}", Value::String(key.clone()), field));
+        }
+        line.push('}');
+        line
+    }
+
+    #[test]
+    fn typed_state_parse_keeps_every_presence_distinction_in_either_key_order() {
+        let row = json!({"id": "a", "uri": "spotify:track:a", "name": "A", "duration_ms": 1000, "cached": true});
+        let marks = [None, Some(Value::Null), Some(json!(false)), Some(json!({})), Some(json!([])), Some(json!(["a", "b"]))];
+        let mut checked = 0;
+        for queue in [None, Some(json!([])), Some(json!([row]))] {
+            for upcoming in [None, Some(json!([])), Some(json!([2, 1]))] {
+                for cached in &marks {
+                    for uncached in [&marks[0], &marks[2], &marks[5]] {
+                        let mut state = json!({"type": "state", "ready": true, "auth_state": "ready",
+                            "username": null, "error": null, "preload_uri": null, "queue_revision": 7, "order_revision": 9,
+                            "playing": true, "position_ms": 12, "duration_ms": 1000, "current_index": 0});
+                        let object = state.as_object_mut().unwrap();
+                        for (key, field) in [("queue", &queue), ("upcoming", &upcoming), ("cached_ids", cached),
+                            ("uncached_ids", uncached)] {
+                            if let Some(field) = field { object.insert(key.into(), field.clone()); }
+                        }
+                        let expected = value_tree_parse(state.clone()).expect("oracle parses");
+                        assert_eq!(parse_line(&type_first("state", &state)).as_ref(), Some(&expected), "{state}");
+                        assert_eq!(parse_value(state.clone()).as_ref(), Some(&expected), "{state}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 162);
+        let Some(Line::State { state, rows }) = parse_line(&type_first("state",
+            &json!({"queue": [], "cached_ids": [], "uncached_ids": false}))) else { panic!("state parses") };
+        assert_eq!(rows, PayloadRows::QueueOnly, "an empty queue is data, not omission");
+        assert_eq!(state.cached_ids, Some(Vec::new()), "an empty mark list is present");
+        assert_eq!(state.uncached_ids, None, "a non-array mark list reads as omission");
+    }
+
+    #[test]
+    fn the_engines_own_state_line_streams_into_the_typed_state() {
+        use renderer_engine::protocol::{AuthState, RepeatMode, StateEvent, TrackRef};
+        let rows = vec![TrackRef { id: "a".into(), uri: "spotify:track:a".into(), name: "Esc\"aped\n".into(),
+            duration_ms: 1_000, cached: true, ..TrackRef::default() }];
+        let marks = vec!["gone".to_owned()];
+        let event = |queue: Option<&[TrackRef]>, upcoming: Option<Vec<usize>>| serde_json::to_string(&StateEvent {
+            kind: "state", ready: true, auth_state: AuthState::Ready, auth_url: None, username: Some("me".into()),
+            playing: true, buffering: false, preview: false, position_ms: 500, duration_ms: 1_000, volume: 40,
+            shuffle: true, repeat: RepeatMode::Off, playback_speed: 1.5, track_speed: 1.5, episode_speed: 1.0,
+            audible_playback_speed: 1.5, current_index: Some(0), current_uri: Some("spotify:track:a"),
+            context: "playlist:p", queue, queue_revision: 3, order_revision: 4, upcoming, preload_uri: None,
+            cached_ids: None, uncached_ids: Some(&marks), error: None,
+        }).unwrap();
+        for (line, expected_rows) in [
+            (event(Some(&rows), Some(vec![])), PayloadRows::Sent),
+            (event(Some(&rows), None), PayloadRows::QueueOnly),
+            (event(None, Some(vec![0])), PayloadRows::OrderOnly),
+            (event(None, None), PayloadRows::Omitted),
+        ] {
+            assert!(line.starts_with("{\"type\":\"state\""), "the engine writes the lane first");
+            let expected = value_tree_parse(serde_json::from_str(&line).unwrap()).unwrap();
+            let parsed = parse_line(&line).expect("engine state parses");
+            assert_eq!(parsed, expected);
+            let Line::State { state, rows: parsed_rows } = parsed else { panic!("a state line is a state") };
+            assert_eq!(parsed_rows, expected_rows);
+            assert_eq!((state.username.as_str(), state.uncached_ids.as_deref()), ("me", Some(&marks[..])));
+            assert_eq!(state.cached_ids, None);
+        }
+    }
+
+    #[test]
+    fn typed_reply_and_scalar_parse_keep_the_tolerant_routing() {
+        let replies = [
+            json!({"type": "browse_playlist", "request_id": "r1", "ok": true, "data": {"tracks": [{"id": "t"}]}}),
+            json!({"type": "browse_x", "request_id": "r2", "ok": true, "data": null}),
+            json!({"type": "response", "request_id": 7, "ok": "true", "error": 5}),
+            json!({"type": "response", "request_id": "r3", "ok": false, "error": "refused"}),
+            json!({"type": 12, "request_id": "r4", "ok": true}),
+            json!({"request_id": "r5", "ok": true}),
+            json!({}),
+        ];
+        for reply in replies {
+            let expected = value_tree_parse(reply.clone());
+            assert_eq!(parse_value(reply.clone()), expected, "{reply}");
+            if let Some(kind) = reply.get("type").and_then(Value::as_str) {
+                assert_eq!(parse_line(&type_first(kind, &reply)), expected, "{reply}");
+            }
+        }
+        assert!(matches!(parse_line(r#"{"type":"browse_x","request_id":"r","ok":true,"data":null}"#),
+            Some(Line::Reply { data: Some(Value::Null), .. })), "a null payload is still a payload");
+        assert_eq!(parse_line(r#"{"type":"position","position_ms":5,"duration_ms":9}"#),
+            Some(Line::Position(PositionHeartbeat { position_ms: 5, duration_ms: 9 })));
+        assert_eq!(parse_line(r#"{"type":"volume","volume":33}"#), Some(Line::Volume(33)));
+        // Malformed lanes are logged and dropped; text that is not an object
+        // was never routable (the old path routed it to an empty request id).
+        for dropped in [r#"{"type":"state","queue":7}"#, r#"{"type":"volume","volume":300}"#,
+            r#"{"type":"position"}"#, "not json", "[1,2]", "\"text\"", r#"{"type":"state"} trailing"#] {
+            assert_eq!(parse_line(dropped), None, "{dropped}");
+        }
+    }
+
+    #[test]
+    fn typed_queue_requests_write_exactly_the_old_wire_fields() {
+        let queue = vec![Track { id: "a".into(), uri: "spotify:track:a".into(), duration_ms: 1_000,
+            artist_names: vec!["A".into()], ..Track::default() }; 3];
+        let line = |kind: &str, args: QueueRequest| serde_json::from_str::<Value>(&build_line("r", kind, args)).unwrap();
+        let old = |kind: &str, args: Value| {
+            let mut object = args.as_object().unwrap().clone();
+            object.insert("request_id".into(), json!("r"));
+            object.insert("type".into(), json!(kind));
+            Value::Object(object)
+        };
+        assert_eq!(
+            line("play_queue", QueueRequest { queue: &queue, index: 1, position_ms: 5, context: "album:x",
+                automatic_start: true, ..QueueRequest::default() }),
+            old("play_queue", json!({"queue": queue, "index": 1, "position_ms": 5, "context": "album:x",
+                "automatic_start": true})),
+        );
+        assert_eq!(
+            line("restore_queue", QueueRequest { queue: &queue, index: 2, position_ms: 7, context: "",
+                automatic_start: false, resume_playing: Some(true), ..QueueRequest::default() }),
+            old("restore_queue", json!({"queue": queue, "index": 2, "position_ms": 7, "context": "",
+                "automatic_start": false, "resume_playing": true})),
+        );
+        let preview = line("restore_queue", QueueRequest { queue: &queue, only_if_preview: true,
+            preview_lease_id: Some(17), resume_playing: Some(false), ..QueueRequest::default() });
+        let mut expected = old("restore_queue", json!({"queue": queue, "index": 0, "position_ms": 0, "context": "",
+            "only_if_preview": true, "preview_lease_id": 17, "resume_playing": false}));
+        // The engine defaults an omitted automatic start to false; it is now sent.
+        expected["automatic_start"] = json!(false);
+        assert_eq!(preview, expected);
+        let request: renderer_engine::protocol::Request = serde_json::from_str(
+            &build_line("r", "add_queue_batch", TracksRequest { tracks: &queue, context: "c" })).unwrap();
+        assert!(matches!(request.command,
+            renderer_engine::protocol::Command::AddQueueBatch { tracks, context } if tracks.len() == 3 && context == "c"));
+        assert_eq!(build_line("r", "status", ()), r#"{"request_id":"r","type":"status"}"#);
+        assert_eq!(build_line("r", "status", Value::Null), r#"{"request_id":"r","type":"status"}"#);
+    }
+
+    #[test]
+    fn a_request_the_engine_would_refuse_is_refused_before_it_is_sent() {
+        let line_for = |name_len: usize| request_line("request-1", "play_queue", QueueRequest {
+            queue: &[Track { name: "x".repeat(name_len), ..Track::default() }], ..QueueRequest::default() });
+        let overhead = line_for(0).unwrap().len();
+        // The engine reads up to MAX bytes including the newline the writer adds.
+        let largest = MAX_REQUEST_BYTES - 1 - overhead;
+        assert_eq!(line_for(largest).unwrap().len() + 1, MAX_REQUEST_BYTES);
+        let error = line_for(largest + 1).unwrap_err();
+        assert!(error.starts_with("This queue is too large for the playback engine: 16.0 MB, over its 16 MB limit"),
+            "{error}");
+
+        let client = client_with_last_state(PlaybackState::default());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let queue = vec![Track { name: "x".repeat(MAX_REQUEST_BYTES), ..Track::default() }];
+        let error = runtime.block_on(client.play_queue(&queue, 0, 0, "", false)).unwrap_err();
+        assert!(error.contains("too large for the playback engine"), "the reason reaches the caller: {error}");
+        assert!(client.pending.lock().is_empty(), "nothing waits for an answer that cannot come");
     }
 }

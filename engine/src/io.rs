@@ -5,9 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use renderer_engine::protocol::{BrowseResponse, Request};
-
-const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+use renderer_engine::protocol::{BrowseResponse, Request, MAX_REQUEST_BYTES};
 
 #[derive(Debug)]
 pub enum Input {

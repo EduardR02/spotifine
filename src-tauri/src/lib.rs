@@ -73,6 +73,11 @@ fn report_window_state(window: tauri::WebviewWindow) {
         minimized: bool,
     }
 
+    // The shell's own background work follows the same state: a window that
+    // starts minimized must not wait for its first resize to be known as one.
+    if let Ok(minimized) = window.is_minimized() {
+        commands::window_minimized_changed(window.app_handle(), minimized);
+    }
     let last = Cell::new(None);
     let handle = window.clone();
     window.on_window_event(move |event| {
@@ -86,8 +91,12 @@ fn report_window_state(window: tauri::WebviewWindow) {
             return;
         };
         let state = WindowState { maximized, minimized };
-        if last.replace(Some(state)) != Some(state) {
+        let previous: Option<WindowState> = last.replace(Some(state));
+        if previous != Some(state) {
             let _ = handle.emit("window-state", state);
+        }
+        if previous.map(|previous| previous.minimized) != Some(minimized) {
+            commands::window_minimized_changed(handle.app_handle(), minimized);
         }
     });
 }
@@ -213,14 +222,19 @@ pub fn run() {
                         "could not show the main window at startup: {error}"
                     ));
                 }
-                #[cfg(windows)]
-                report_window_state(window);
             } else {
                 log::warn("could not find the main window at startup");
             }
 
-            let state = Mutex::new(AppState::new(data_dir()));
-            app.manage(state);
+            // The last signed-in account's library is on screen from the first
+            // paint, offline included; the session confirms or replaces it.
+            let mut state = AppState::new(data_dir());
+            state.select_last_account();
+            app.manage(Mutex::new(state));
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                report_window_state(window);
+            }
             let personal = personal_api::PersonalApi::new().map_err(std::io::Error::other)?;
             app.manage(personal.clone());
 

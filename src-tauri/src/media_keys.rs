@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
@@ -34,14 +34,50 @@ static UPDATES: OnceLock<Sender<Update>> = OnceLock::new();
 enum Update {
     /// A full engine state: track identity plus transport status.
     State {
-        playing: bool,
-        position_ms: u32,
+        transport: Transport,
         metadata: Metadata,
     },
-    /// A scalar heartbeat: only the playhead moved.
-    Position(u32),
     /// Nothing playable (logged out, empty queue).
     Stopped,
+}
+
+/// A playhead and the clock it runs on, as the OS was told it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Transport {
+    playing: bool,
+    position_ms: u32,
+    /// The rate audio is reaching the output at.
+    rate: f32,
+}
+
+/// How far a reported playhead may sit from where the OS has extrapolated it
+/// before it is worth correcting. The flyout shows whole seconds; any real
+/// seek, skip or loop moves the playhead much further than this.
+const TIMELINE_TOLERANCE_MS: f64 = 1_000.0;
+
+/// What the media session was last told, and when.
+struct Published {
+    transport: Transport,
+    at: Instant,
+}
+
+/// Windows runs a playing timeline forward on its own, at the published
+/// rate, so the timeline is republished only on a real change: play or
+/// pause, a rate change, a new item, or a playhead that left the
+/// extrapolation (a seek, a skip, a loop, a stall). A full state that changed
+/// something else — a queue edit, a download mark — costs the OS nothing.
+fn timeline_changed(published: Option<&Published>, next: Transport, item_changed: bool, now: Instant) -> bool {
+    let Some(published) = published else { return true };
+    let last = published.transport;
+    if item_changed || last.playing != next.playing || last.rate != next.rate {
+        return true;
+    }
+    let expected = if last.playing {
+        f64::from(last.position_ms) + now.saturating_duration_since(published.at).as_secs_f64() * 1_000.0 * f64::from(last.rate)
+    } else {
+        f64::from(last.position_ms)
+    };
+    (f64::from(next.position_ms) - expected).abs() > TIMELINE_TOLERANCE_MS
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -158,15 +194,16 @@ fn run_controls(
 
     // Deduplicate the actual OS metadata tuple, not the URI: preview edits,
     // restores and refreshed titles/artwork can change it for the same song.
-    // Position heartbeats stay on the scalar transport-only lane.
+    // Position heartbeats never reach this thread: the OS runs the timeline.
     let mut last_metadata = None;
+    let mut last_transport: Option<Published> = None;
     for update in receiver {
         let result = match update {
             Update::State {
-                playing,
-                position_ms,
+                transport: next,
                 metadata,
             } => {
+                let item_changed = last_metadata.as_ref() != Some(&metadata);
                 #[cfg(windows)]
                 let publication = publish_windows_metadata(
                     hwnd.expect("Windows media controls require a window"),
@@ -178,14 +215,28 @@ fn run_controls(
                 if let Err(error) = publication {
                     log::warn(&format!("could not update media metadata: {error:?}"));
                 }
-                controls.set_playback(transport(playing, position_ms))
-            }
-            Update::Position(position_ms) => {
-                controls.set_playback(transport(PLAYING.load(Ordering::Relaxed), position_ms))
+                let now = Instant::now();
+                if timeline_changed(last_transport.as_ref(), next, item_changed, now) {
+                    #[cfg(windows)]
+                    if last_transport.as_ref().is_none_or(|published| published.transport.rate != next.rate) {
+                        if let Err(error) = set_windows_playback_rate(
+                            hwnd.expect("Windows media controls require a window"), next.rate)
+                        {
+                            log::warn(&format!("could not update the media playback rate: {error}"));
+                        }
+                    }
+                    let result = controls.set_playback(transport(next.playing, next.position_ms));
+                    // A failed publication is retried by the next full state.
+                    last_transport = result.is_ok().then_some(Published { transport: next, at: now });
+                    result
+                } else {
+                    Ok(())
+                }
             }
             Update::Stopped => {
                 PLAYING.store(false, Ordering::Relaxed);
                 last_metadata = None;
+                last_transport = None;
                 #[cfg(windows)]
                 if let Some(hwnd) = hwnd {
                     if let Err(error) = clear_windows_metadata(hwnd) {
@@ -292,6 +343,14 @@ fn windows_controls(
     unsafe { interop.GetForWindow(HWND(hwnd as isize)) }
 }
 
+/// The rate Windows runs the published timeline forward at. Souvlaki leaves
+/// it at 1.0, which would let the flyout drift at any other speed once the
+/// timeline is no longer republished every heartbeat.
+#[cfg(windows)]
+fn set_windows_playback_rate(hwnd: usize, rate: f32) -> windows::core::Result<()> {
+    windows_controls(hwnd)?.SetPlaybackRate(f64::from(rate))
+}
+
 #[cfg(windows)]
 fn disable_unsupported_seek_buttons(hwnd: usize) -> windows::core::Result<()> {
     let controls = windows_controls(hwnd)?;
@@ -336,8 +395,11 @@ pub fn update_state(state: &PlaybackState) {
     let duration_ms = track_duration(state.duration_ms, track.duration_ms);
     DURATION_MS.store(duration_ms as u64, Ordering::Relaxed);
     let _ = sender.send(Update::State {
-        playing: state.playing,
-        position_ms: state.position_ms,
+        transport: Transport {
+            playing: state.playing,
+            position_ms: state.position_ms,
+            rate: state.audible_playback_speed,
+        },
         metadata: Metadata {
             duration_ms,
             title: track.name.clone(),
@@ -348,16 +410,11 @@ pub fn update_state(state: &PlaybackState) {
     });
 }
 
-/// Mirrors a position heartbeat. Skipped entirely while paused: a frozen
-/// playhead is already what the last transport update described.
+/// Notes a position heartbeat for relative seeks from the overlay. Nothing is
+/// sent to the OS: it runs a playing timeline forward itself, and every real
+/// change (play, pause, seek, skip, rate) arrives as a full state.
 pub fn update_position(position_ms: u32) {
     POSITION_MS.store(position_ms as u64, Ordering::Relaxed);
-    if !PLAYING.load(Ordering::Relaxed) {
-        return;
-    }
-    if let Some(sender) = UPDATES.get() {
-        let _ = sender.send(Update::Position(position_ms));
-    }
 }
 
 /// Clears transport and metadata immediately while the engine is unavailable.
@@ -393,6 +450,33 @@ mod tests {
         }
         assert_eq!(published, [(180_000, "Song".into()), (30_000, "Song".into()),
             (180_000, "Song".into()), (180_000, "Corrected title".into())]);
+    }
+
+    #[test]
+    fn the_timeline_is_republished_only_on_a_real_transport_change() {
+        let at = Instant::now();
+        let playing = |position_ms, rate| Transport { playing: true, position_ms, rate };
+        let published = Published { transport: playing(10_000, 1.0), at };
+        let after = |ms| at + Duration::from_millis(ms);
+        assert!(timeline_changed(None, playing(0, 1.0), false, at), "the first state is always published");
+        // Steady playback: every later full state agrees with the OS's own clock.
+        assert!(!timeline_changed(Some(&published), playing(12_000, 1.0), false, after(2_000)));
+        assert!(!timeline_changed(Some(&published), playing(70_400, 1.0), false, after(60_000)));
+        // Play and pause, a seek either way, a stall, a rate change, a new item.
+        assert!(timeline_changed(Some(&published), Transport { playing: false, ..playing(12_000, 1.0) }, false, after(2_000)));
+        assert!(timeline_changed(Some(&published), playing(95_000, 1.0), false, after(2_000)));
+        assert!(timeline_changed(Some(&published), playing(1_000, 1.0), false, after(2_000)));
+        assert!(timeline_changed(Some(&published), playing(10_000, 1.0), false, after(5_000)));
+        assert!(timeline_changed(Some(&published), playing(12_000, 1.5), false, after(2_000)));
+        assert!(timeline_changed(Some(&published), playing(12_000, 1.0), true, after(2_000)));
+        // At another rate the OS runs the timeline at that rate.
+        let fast = Published { transport: playing(10_000, 2.0), at };
+        assert!(!timeline_changed(Some(&fast), playing(14_000, 2.0), false, after(2_000)));
+        // A paused playhead stays put until something moves it.
+        let paused = Published { transport: Transport { playing: false, ..playing(10_000, 1.0) }, at };
+        let still = Transport { playing: false, ..playing(10_000, 1.0) };
+        assert!(!timeline_changed(Some(&paused), still, false, after(600_000)));
+        assert!(timeline_changed(Some(&paused), Transport { position_ms: 40_000, ..still }, false, after(1)));
     }
 
     #[test]

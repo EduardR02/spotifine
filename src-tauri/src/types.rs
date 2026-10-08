@@ -1395,9 +1395,9 @@ impl Serialize for PlaybackEvent<'_> {
         if self.include_order {
             map.serialize_entry("upcoming", &state.upcoming)?;
         }
-        if let Some(ids) = &state.uncached_ids {
-            map.serialize_entry("uncached_ids", ids)?;
-        }
+        // Not `uncached_ids`: the state consumer forwards invalidations as an
+        // event of their own for every line that carries them, whether or not
+        // the line's transport is published, so they would arrive twice.
         if let Some(ids) = &state.cached_ids {
             map.serialize_entry("cached_ids", ids)?;
         }
