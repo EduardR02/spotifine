@@ -1965,14 +1965,18 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .tl-row.current:hover .eq { display: none; }
 
 /* The decorative meter's curves share a visible-only nominal 60 Hz clock
-   (lib/vu-meter.js), not perpetual compositor animations at display refresh. */
+   (lib/vu-meter.js), not perpetual compositor animations at display refresh.
+   Each bar is its own compositor layer, so a tick re-scales a texture rather
+   than repainting the row. Repainted in the row, the GPU's anti-aliasing of a
+   squashed round cap reaches the pixel left of the bar, outside what Chromium
+   invalidates, and those stale pixels piled up into a smudge. */
 .eq { align-items: flex-end; gap: 2px; height: 13px; flex: none; }
 .eq i {
   width: 2px; height: 100%; flex: none; background: var(--accent); border-radius: 1px;
-  transform-origin: bottom; transform: scaleY(0.3);
+  transform-origin: bottom; transform: scaleY(0.3); will-change: transform;
 }
 @media (prefers-reduced-motion: reduce) {
-  .eq i { transform: scaleY(0.7); }
+  .eq i { transform: scaleY(0.7); will-change: auto; }
 }
 
 .c-art { width: 36px; height: 36px; --tile: 36px; }
