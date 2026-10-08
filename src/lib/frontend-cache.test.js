@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 const { api, loadTrackCredits, trackCredits, openCredits, credits, closeCredits } = await import("./state.svelte.js");
 
 const settle = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };

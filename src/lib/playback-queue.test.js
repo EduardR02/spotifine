@@ -4,7 +4,7 @@ import { expect, test } from "bun:test";
    handed, and what these tests are about is which array objects the store
    keeps — identity, not reactivity — so the stub has to exist before the
    module is evaluated. */
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 
 const { applyPlayback, detail, playback, isPlayingSource } = await import("./state.svelte.js");
 

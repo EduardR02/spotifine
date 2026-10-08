@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 /* The hub is a runes module: outside Svelte `$state` is just the value it is
    handed, and what these tests are about is where a row sits in one array —
    ordering, not reactivity. */
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 
 /* `invoke` is the Tauri bridge, which no test has. Nothing here calls a
    command; the stub only keeps the module's import side from throwing. */

@@ -12,6 +12,7 @@
     openCredits,
     ui,
     openTrackEditor,
+    isCached,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
@@ -316,6 +317,11 @@
     editDefined: false, editEnabled: false, editLoading: false, editError: "",
     skipPending: false, skipError: "", anchor: null, liked: null, likeBusy: false,
   });
+  /* The row the menu was opened on, as the row object itself. `menu.track` is
+     that row seen through the menu's proxy, which suits the markup but is
+     never `===` a plain row of `tracks` (the long lists are `$state.raw`), so
+     the identity checks behind every async answer compare against this. */
+  let menuRow = null;
   let menuEl = $state(null);
   const picker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, track: null });
   /* Same shape and same placement rules as the playlist picker — a second
@@ -440,7 +446,7 @@
       menu.open &&
       menu.generation === generation &&
       playlistId === sourcePlaylist &&
-      menu.track === track &&
+      menuRow === track &&
       menu.index === index &&
       tracks[index] === track
     );
@@ -465,6 +471,7 @@
     menu.bottom = placed.bottom;
     menu.maxH = placed.maxH;
     menu.track = track;
+    menuRow = track;
     menu.index = i;
     menu.copyState = "idle";
     menu.skipPending = false;
@@ -530,7 +537,7 @@
     if (!playlistId || !menu.track?.id || !menu.editDefined || menu.editLoading) return;
     const generation = menu.generation;
     const sourcePlaylist = playlistId;
-    const track = menu.track;
+    const track = menuRow;
     const index = menu.index;
     const enabled = !menu.editEnabled;
     menu.editLoading = true;
@@ -566,7 +573,7 @@
    * spammable.
    */
   async function toggleRowSkip() {
-    const track = menu.track;
+    const track = menuRow;
     if (!skipsTracked || !track?.id || !playlistId || menu.skipPending) return;
     const id = String(track.id);
     const generation = menu.generation;
@@ -734,9 +741,13 @@
   let curFirst = 0;
   let curLast = 0;
 
-  /* A same-length playlist still needs a new window: identity changes reset
-     the retained absolute-index range before the new rows are patched. */
-  let seenTracks = null;
+  /* A list from another source needs a new window, even at the same length: a
+     source change resets the retained absolute-index range before the new
+     rows are patched. The lists themselves are immutable values ($state.raw),
+     so the same source handing over a new array — a sort, a reorder, a
+     refresh, another page — is an edit of the list on screen: it keeps its
+     window, and its keyed rows update in place instead of being rebuilt. */
+  let seenSource = null;
   let seenPlaylistId = null;
   let seenLength = -1;
 
@@ -809,15 +820,15 @@
     const body = bodyEl;
     if (!body) return;
 
-    const identityChanged = list !== seenTracks || playlistId !== seenPlaylistId;
+    const sourceChanged = queueSource !== seenSource || playlistId !== seenPlaylistId;
     const lengthChanged = length !== seenLength;
-    if (!identityChanged && !lengthChanged) return;
+    if (!sourceChanged && !lengthChanged) return;
 
-    seenTracks = list;
+    seenSource = queueSource;
     seenPlaylistId = playlistId;
     seenLength = length;
     const scroller = body.closest(".scroll");
-    if (identityChanged) resetWindow(length, scroller);
+    if (sourceChanged) resetWindow(length, scroller);
     else clampWindow(length);
   });
 
@@ -924,7 +935,7 @@
       <span class="c-title">
         <span class="t-name">{track.name}</span>
         <span class="t-sub">
-          {#if track.cached}
+          {#if isCached(track)}
             <!-- Status, not action. It sits before the names because that is
                  where the official client puts it and because it qualifies the
                  whole line rather than any one artist. -->

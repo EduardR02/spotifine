@@ -16,6 +16,7 @@
     ui,
     api,
     maybeBackfillLazyQueue,
+    setPlayheadVisible,
   } from "./lib/state.svelte.js";
   import IconSprite from "./components/IconSprite.svelte";
   import Icon from "./components/Icon.svelte";
@@ -391,6 +392,15 @@
   $effect(() => {
     setMeterActivity(playback.playing && ui.windowFocused && pageVisible && !frame.minimized);
     return () => setMeterActivity(false);
+  });
+
+  /* The playhead's 4 Hz tick follows whether the window can be seen at all —
+     not focus: a visible window behind another one still shows its progress
+     bar. Untracked, because a restore re-anchors from the projection, and this
+     effect must not come to depend on the playhead it is gating. */
+  $effect(() => {
+    const seen = pageVisible && !frame.minimized;
+    untrack(() => setPlayheadVisible(seen));
   });
 
   /* The same signal paces a Spotify device: the shell reads one regularly only

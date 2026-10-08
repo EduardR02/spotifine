@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 globalThis.window = { __TAURI_INTERNALS__: { invoke: () => new Promise(() => {}) } };
 const { session } = await import("./state.svelte.js");
 const { pins, loadPins, isPinned, togglePin, isCollapsed, toggleFolder } = await import("./pins.svelte.js");

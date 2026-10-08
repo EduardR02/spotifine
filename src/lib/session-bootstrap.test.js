@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-globalThis.$state ??= (value) => value;
+globalThis.$state ??= Object.assign((value) => value, { raw: (value) => value });
 const { applyPlayback, initEvents, playback, session, library, libraryState } = await import("./state.svelte.js");
 
 test("ready playback hydrates identity and a late startup snapshot cannot replace a newer session", async () => {

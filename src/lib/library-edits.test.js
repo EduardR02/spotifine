@@ -1,6 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 const calls = [];
 let answer = () => Promise.resolve(null);
 globalThis.window = {

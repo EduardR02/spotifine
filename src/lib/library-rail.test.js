@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 globalThis.window = { __TAURI_INTERNALS__: { invoke: () => new Promise(() => {}) } };
 const { library, setLibrary, promotePlaylist, libraryRailEntries } = await import("./state.svelte.js");
 

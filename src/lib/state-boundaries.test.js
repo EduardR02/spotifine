@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
-globalThis.$state ??= (value) => value;
+globalThis.$state ??= Object.assign((value) => value, { raw: (value) => value });
 const {
   api, applyPlayback, applySession, playback, session, route, navigate,
   library, libraryState, setLibrary, detail, loadDetail,

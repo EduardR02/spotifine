@@ -6,7 +6,7 @@
   import LikedMark from "../components/LikedMark.svelte";
   import { paletteFor } from "../lib/covertone.svelte.js";
   import { detailArtSize } from "../lib/layout.js";
-  import { mergeLikedRows, reconcileLikedRows, mergeLikedPage, applyLikedDelta } from "../lib/liked-songs.js";
+  import { mergeLikedRows, mergeLikedPage, applyLikedDelta } from "../lib/liked-songs.js";
   import { applyCacheMarks } from "../lib/cache-marks.js";
 
   /* Rose's own hue, rebuilt at the header's fixed dark. Every other detail
@@ -18,7 +18,17 @@
   /* Same rule as every other detail header: the artwork gives way first. */
   const artSize = $derived(detailArtSize(ui.paneWidth));
 
-  const collection = $state({ tracks: [], nextCursor: null, loadedPages: 0, removed: new Set() });
+  /* The collection is an immutable list: `tracks` is raw and replaced on every
+     change (liked-songs.js), so Play hands IPC plain rows. A deep proxy over a
+     few thousand rows made every Play pay for serializing through it. The
+     page count and the removed set are bookkeeping nothing renders. */
+  class Collection {
+    tracks = $state.raw([]);
+    nextCursor = $state(null);
+    loadedPages = 0;
+    removed = new Set();
+  }
+  const collection = new Collection();
   const tracks = $derived(collection.tracks);
   const nextCursor = $derived(collection.nextCursor);
   const playingThis = $derived(isPlayingSource("liked"));
@@ -91,16 +101,16 @@
       return;
     }
     // Unidentified external changes refresh only the pages already displayed.
-    const fresh = [];
+    let fresh = [];
     let cursor = null;
     for (let page = 0; page < Math.max(1, collection.loadedPages); page++) {
       const result = await api.browseLikedSongs(cursor);
       if (generation !== loadGeneration) return;
-      mergeLikedRows(fresh, result?.tracks);
+      fresh = mergeLikedRows(fresh, result?.tracks);
       cursor = result?.next_cursor ?? null;
       if (!cursor) break;
     }
-    reconcileLikedRows(tracks, fresh);
+    collection.tracks = fresh;
     collection.nextCursor = cursor;
   }
 

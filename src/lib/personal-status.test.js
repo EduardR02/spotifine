@@ -1,6 +1,6 @@
 import { beforeAll, expect, test } from "bun:test";
 
-globalThis.$state ??= (value) => value;
+globalThis.$state ??= Object.assign((value) => value, { raw: (value) => value });
 let applyPlayback, personal, personalConnected, refreshPersonal, watchPersonal;
 beforeAll(async () => {
   ({ applyPlayback } = await import("./state.svelte.js"));

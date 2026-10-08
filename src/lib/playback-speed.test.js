@@ -1,6 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 const requests = [];
 globalThis.window = {
   __TAURI_INTERNALS__: {

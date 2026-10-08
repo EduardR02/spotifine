@@ -502,6 +502,11 @@ export const session = $state({ username: null, error: null, authPending: false 
 
 const playhead = $state({ base_ms: 0, at: 0, now: 0 });
 let playheadTimer = null;
+/* Whether anyone can see the playhead: false while the window is minimized or
+   its document hidden. App.svelte owns the signal, because WebView2 can keep a
+   natively minimized document "visible" and only the shell's frame state says
+   otherwise (window-frame.svelte.js). */
+let playheadSeen = true;
 
 function startPlayheadTicker() {
   if (playheadTimer !== null) return;
@@ -520,10 +525,30 @@ function stopPlayheadTicker() {
 /** Reads the store rather than a caller's requested target: the ticker follows
     playback as a whole, so a play request that arrives while the engine is
     still loading cannot leave a 4 Hz invalidation running over a playhead that
-    has nothing to advance from. */
+    has nothing to advance from. Nor over one nobody can see. */
 function syncPlayheadTicker() {
-  if (playback.playing && !playback.buffering) startPlayheadTicker();
+  if (playheadSeen && playback.playing && !playback.buffering) startPlayheadTicker();
   else stopPlayheadTicker();
+}
+
+/**
+ * Stops the 4 Hz invalidation while the playhead cannot be seen and starts it
+ * again when it can.
+ *
+ * Nothing is lost in between: the projection runs off the monotonic clock, not
+ * off the tick, so `positionMs()` is exact at any moment. Coming back, the
+ * playhead is re-anchored at that projected position before anything renders,
+ * so the first frame shows the time it is now rather than the one the window
+ * was hidden at — the tick alone would leave that stale time up for a quarter
+ * of a second. A resync the shell sends on restore, a `position` or a full
+ * `state`, then lands on a fresh anchor whichever order the two arrive in.
+ */
+export function setPlayheadVisible(visible) {
+  const seen = !!visible;
+  if (seen === playheadSeen) return;
+  playheadSeen = seen;
+  if (seen) anchorPlayhead(positionMs());
+  syncPlayheadTicker();
 }
 
 /** Pins the playhead to `ms` as of right now; projection restarts from here. */
@@ -669,6 +694,27 @@ export function applyPlayback(payload) {
 /** Cache deltas update rows and late reads without replacing their identity. */
 const cacheMarkListeners = new Set();
 let cacheMarksVersion = 0;
+
+/**
+ * The one notification for download marks.
+ *
+ * A mark is written into the row object itself (`applyCacheMarks`), in place,
+ * so a row keeps its identity and a mark that lands mid-scroll does not hand
+ * the table a new list. Most rows are plain objects, though: the long lists
+ * live in `$state.raw` so IPC and iteration see plain rows, and a write to a
+ * plain `row.cached` notifies nobody. So every reader of a mark goes through
+ * `isCached`, and each propagation moves this one signal: the marks on screen
+ * re-read their row, and nothing else in the app is woken. It mirrors
+ * `cacheMarksVersion` but is a separate value on purpose: reads compare
+ * against that plain counter, and an effect that starts a read must never
+ * come to depend on marks.
+ */
+let cacheMarkTick = $state(0);
+
+export function isCached(track) {
+  cacheMarkTick;
+  return !!track?.cached;
+}
 const pendingCacheReads = new Set();
 const CACHE_PAYLOAD_KEYS = ["tracks", "top_tracks", "queue", "track", "releases", "episodes", "entries", "playback"];
 
@@ -737,6 +783,11 @@ function propagateCacheMarks(ids, cached = true) {
   applyCacheMarks(likedFirstPage?.page?.tracks, ids, cached);
   for (const page of playlistRecommendationsCache.values()) applyCacheMarks(page.tracks, ids, cached);
   for (const listener of cacheMarkListeners) listener(ids, cached);
+  // After the listeners: they patch their own rows in place, and this is
+  // what tells the screen any of those rows moved. Written from the plain
+  // counter rather than incremented, so a propagation that happens to run
+  // inside an effect never reads, and so never subscribes to, its own signal.
+  cacheMarkTick = cacheMarksVersion;
 }
 
 export function applySession(payload) {
@@ -867,8 +918,22 @@ async function drainLibraryCovers() {
  * for ever, with nothing on screen to say the request had failed or any way
  * to try it again. A missing payload has two causes and they need two
  * different screens.
+ *
+ * The payloads are raw: each is an immutable snapshot that a writer REPLACES
+ * (a refresh, a reorder) and never edits in place. A deep proxy would wrap
+ * every row of a 10,000-song playlist, and Play hands that list to IPC:
+ * serializing through the proxies took well over 100 ms for 10k rows, against
+ * under 10 ms for the same plain rows. Download marks are the one exception to
+ * "never edited in place", and they announce themselves through `isCached`.
  */
-export const detail = $state({ playlist: null, radio: null, album: null, artist: null, error: "" });
+class DetailPayloads {
+  playlist = $state.raw(null);
+  radio = $state.raw(null);
+  album = $state.raw(null);
+  artist = $state.raw(null);
+  error = $state("");
+}
+export const detail = new DetailPayloads();
 
 let browseSeq = 0;
 
@@ -2894,13 +2959,13 @@ function describeWiringFailure(error) {
  * This is that refresh landing.
  *
  * It is applied only if the playlist is still the one on screen, because the
- * fetch outlives the navigation that started it — and it is MERGED rather
- * than assigned. `TrackList` treats a new array as a new list and resets the
- * shared pane scroller to the top, so swapping `tracks` wholesale would yank
- * the reader back to row one a second after they opened the page and started
- * scrolling. Same rows in the same order means patch the fields in place;
- * only a genuinely different list earns a replacement, where starting at the
- * top is the honest thing to do anyway.
+ * fetch outlives the navigation that started it. The payload is a raw
+ * snapshot (see `detail`), so a refresh publishes a new snapshot rather than
+ * editing the open one; what it must not do is hand over a new LIST when the
+ * list did not change. The table's keyed rows, the open row menu and a
+ * reorder still in flight all hold on to row objects, so the same rows in the
+ * same order keep the open array and every row the refresh did not move. Only
+ * a genuinely different list takes the incoming array.
  */
 function handlePlaylistRefresh(e) {
   const fresh = e.payload;
@@ -2913,38 +2978,36 @@ function handlePlaylistRefresh(e) {
     detail.playlist = fresh;
     return;
   }
-
   // `PlaylistDetail` is flattened by serde: metadata and `tracks` are
-  // siblings. Refresh the metadata in place without replacing the detail or
-  // track array that the open list is rendering.
-  for (const key of Object.keys(fresh)) {
-    if (key !== "tracks" && open[key] !== fresh[key]) open[key] = fresh[key];
-  }
+  // siblings, so the metadata comes across whole and the rows are merged.
+  detail.playlist = { ...open, ...fresh, tracks: refreshedRows(open.tracks ?? [], fresh.tracks ?? []) };
+}
 
-  const current = open.tracks ?? [];
-  const incoming = fresh.tracks ?? [];
+/** The fields a refresh can legitimately move on a row it keeps. */
+const REFRESHED_ROW_FIELDS = ["cached", "play_count", "unavailable", "unavailable_reason", "added_at"];
+
+/**
+ * The open rows with a refresh applied: `current` itself when nothing moved,
+ * a copy whose moved rows are replaced when only fields moved, and `incoming`
+ * when the rows or their order differ. A moved row becomes a new object,
+ * never an edited one: its fields are plain, so an edit would notify nobody.
+ */
+function refreshedRows(current, incoming) {
   const sameRows =
     current.length === incoming.length &&
     current.every((track, i) => track.id === incoming[i]?.id);
-
-  if (!sameRows) {
-    open.tracks = incoming;
-    return;
-  }
-  /* The fields a refresh can legitimately move. Assigning only on a real
-     difference keeps this from waking every row's subscribers each time a
-     background refresh finds nothing new. */
+  if (!sameRows) return incoming;
+  let rows = current;
   for (let i = 0; i < current.length; i++) {
-    const from = incoming[i];
     const into = current[i];
-    if (into.cached !== from.cached) into.cached = from.cached;
-    if (into.play_count !== from.play_count) into.play_count = from.play_count;
-    if (into.unavailable !== from.unavailable) into.unavailable = from.unavailable;
-    if (into.unavailable_reason !== from.unavailable_reason) {
-      into.unavailable_reason = from.unavailable_reason;
-    }
-    if (into.added_at !== from.added_at) into.added_at = from.added_at;
+    const from = incoming[i];
+    if (REFRESHED_ROW_FIELDS.every((key) => into[key] === from[key])) continue;
+    if (rows === current) rows = current.slice();
+    const row = { ...into };
+    for (const key of REFRESHED_ROW_FIELDS) row[key] = from[key];
+    rows[i] = row;
   }
+  return rows;
 }
 
 export async function initEvents() {
@@ -3024,10 +3087,12 @@ export async function initEvents() {
     playback.error = failures.join("; ");
   }
 
-  // Pull initial state. The engine may not be ready yet, so the cached
-  // library snapshot (hydrated by the Rust side at startup) is applied here
-  // for an instant paint. Once ready, the coalesced library event supplies
-  // fresh rootlist data without issuing a duplicate browse request.
+  // Pull initial state. The engine may not be ready yet (offline, never), so
+  // the cached library of the last signed-in account — which the Rust side
+  // selects at startup and presents as the account signing in — is applied
+  // here for an instant paint. Once ready, the coalesced library event
+  // supplies fresh rootlist data without issuing a duplicate browse request;
+  // a different account at ready is an account switch, which resets it.
   const stateAtPull = stateEvents;
   const volumeAtPull = volumeEvents;
   const positionAtPull = positionEvents;

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 const { api, applyPlayback, playback, positionMs } = await import("./state.svelte.js");
 let previousWindow;
 let requests;

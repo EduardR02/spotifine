@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 /* The hub is a runes module: outside Svelte `$state` is just the value it is
    handed, and what these tests are about is which page the store keeps and how
    many walks it asks the shell for — identity, not reactivity. */
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 
 /* `invoke` is the Tauri bridge, which no test has. Every call lands here and is
    answered by the test, so a walk can be held open across an account change. */

@@ -172,7 +172,10 @@
   });
 
   function useLatest() {
-    source = $state.snapshot(playlist);
+    /* Holding the object is the freeze: the playlist is a raw snapshot that a
+       refresh or a reorder replaces and never edits (see `detail`). Only its
+       download marks move in place, and no rule reads one. */
+    source = playlist;
     reviewing = false;
     error = "";
     previewPage = 0;

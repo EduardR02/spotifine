@@ -253,6 +253,13 @@
     list.splice(to, 0, item);
   }
 
+  /** Publishes a row order. The playlist is a raw snapshot (see `detail`), so
+      a new order is a new array on a new snapshot, never an edit of the one
+      on screen: an edit would reach no reader. */
+  function showOrder(rows) {
+    detail.playlist = { ...detail.playlist, tracks: rows };
+  }
+
   function activeReorder(session) {
     return reorderSession === session && route.name === "playlist" &&
       route.id === session.id && detail.playlist?.id === session.id;
@@ -325,8 +332,7 @@
             session.pending.length = 0;
             return;
           }
-          detail.playlist = fresh;
-          const list = detail.playlist.tracks;
+          const list = fresh.tracks.slice();
           const freshTokens = trackTokens(list);
           // Keep duplicate rows' tokens attached to their confirmed storage
           // positions when the server reports the order of successful MOVs.
@@ -355,6 +361,7 @@
             move(list, from, to);
             session.pending.push({ ...pending, from, to });
           }
+          detail.playlist = { ...fresh, tracks: list };
           reorderBlocked = false;
         }
       }
@@ -381,7 +388,9 @@
       };
     }
     const session = reorderSession;
-    move(list, actualFrom, actualTo);
+    const rows = list.slice();
+    move(rows, actualFrom, actualTo);
+    showOrder(rows);
     move(session.tokens, actualFrom, actualTo);
     session.pending.push({
       from: actualFrom,
@@ -405,7 +414,7 @@
         incoming.every((token, index) => token === session.tokens[index])) return;
       const rows = new Map(incoming.map((token, index) => [token, list[index]]));
       if (session.tokens.some((token) => !rows.has(token))) return;
-      list.splice(0, list.length, ...session.tokens.map((token) => rows.get(token)));
+      showOrder(session.tokens.map((token) => rows.get(token)));
     });
   });
 
@@ -658,10 +667,20 @@
 
   /* ---------------- Skips ----------------
      The playlist's local skip preference arrives on the browse payload as
-     `excluded_track_ids` and stays live in the detail store: TrackList patches
-     THIS array when a row menu toggles, so this Set, the marks on screen and
-     the header's idea of where to begin move together with no refetch. */
-  const excludedTrackIds = $derived(pl?.excluded_track_ids ?? null);
+     `excluded_track_ids`. It is the one part of that payload edited in place —
+     TrackList patches the array optimistically when a row menu toggles — and
+     the payload is a raw snapshot (see `detail`), where an edit would reach no
+     reader. So the live list is this page's own deep copy, seeded from each
+     snapshot that brings a new one; a reorder carries the old array over and
+     so keeps a toggle still in flight. TrackList patches THIS array, so this
+     Set, the marks on screen and the header's idea of where to begin move
+     together with no refetch. */
+  const excludedSnapshot = $derived(pl?.excluded_track_ids ?? null);
+  let excludedTrackIds = $state(null);
+  $effect.pre(() => {
+    const ids = excludedSnapshot;
+    excludedTrackIds = ids ? [...ids] : null;
+  });
 
   const skippedSet = $derived.by(
     () => new Set((excludedTrackIds ?? []).map(String)),

@@ -3,7 +3,7 @@ import { applyCacheMarks } from "./cache-marks.js";
 
 // Match the existing playback-state tests: these assertions concern row
 // identity and metadata transitions, not Svelte rendering.
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 const { applyPlayback, playback, detail, search, api, clearCache, watchCacheMarks, loadCataloguePage } = await import("./state.svelte.js");
 
 const track = (id, cached = false) => ({ id, uri: `spotify:track:${id}`, cached });

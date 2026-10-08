@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { applyCacheMarks } from "./cache-marks.js";
 
-globalThis.$state = (value) => value;
+globalThis.$state = Object.assign((value) => value, { raw: (value) => value });
 const { api, applyPlayback, playback, detail, search, watchCacheMarks, loadCataloguePage, loadPlaylistRecommendations } = await import("./state.svelte.js");
 let requests;
 let previousWindow;
