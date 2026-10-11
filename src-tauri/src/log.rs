@@ -181,33 +181,30 @@ mod tests {
     }
 
     #[test]
-    fn init_rolls_an_oversized_previous_log_aside() {
+    fn rotation_preserves_the_previous_log_and_replaces_an_older_generation() {
         let dir = std::env::temp_dir().join(format!(
-            "renderer-log-roll-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
+            "renderer-log-roll-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
         ));
-        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("spotifine.log");
-        std::fs::write(&path, vec![b'x'; APP_LOG_MAX_BYTES as usize]).unwrap();
-
-        init(dir.clone());
-
-        // The roll itself is announced through `info`, so the fresh
-        // generation exists as soon as `init` returns. Other tests (the
-        // engine round-trip) may append INFO lines concurrently through the
-        // process-global logger, so assert on content, not line counts:
-        // the roll is announced and none of the rolled-away bytes survive.
-        let fresh = std::fs::read_to_string(&path).expect("fresh log exists after rotation");
-        assert!(fresh.contains("log rolled at"), "roll is logged: {fresh}");
-        assert!(!fresh.contains("xxxxxxxx"), "stale bytes survive a roll: {fresh}");
         let rolled = path.with_extension("log.1");
-        assert_eq!(std::fs::metadata(&rolled).unwrap().len(), APP_LOG_MAX_BYTES);
-        *LOG_FILE.lock().expect("app log lock") = None;
-        let _ = std::fs::remove_dir_all(&dir);
+        let limit = 32;
+        std::fs::write(&rolled, b"obsolete diagnostics").unwrap();
+        std::fs::write(&path, vec![b'a'; limit - 1]).unwrap();
+        assert!(rotate_file(&path, limit as u64).is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), vec![b'a'; limit - 1]);
+        assert_eq!(std::fs::read(&rolled).unwrap(), b"obsolete diagnostics");
+
+        let latest = vec![b'b'; limit];
+        std::fs::write(&path, &latest).unwrap();
+        assert!(rotate_file(&path, limit as u64).is_some());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&rolled).unwrap(), latest);
+        append_to(&path, "INFO", "new diagnostics");
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(current.contains("INFO new diagnostics"));
+        assert!(!current.contains("bbbbbbbb"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

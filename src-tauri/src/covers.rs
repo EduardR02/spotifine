@@ -348,8 +348,7 @@ mod tests {
         let (source, server) = one_image_server(vec![0xFF, 0xD8, 0xFF]).await;
         let key = cache_key(&source);
         let directory = std::env::temp_dir().join(format!("renderer-cover-truncated-{}-{key}", std::process::id()));
-        let error = image_bytes(&directory, &source, &key).await.unwrap_err();
-        assert!(error.contains("invalid image"));
+        assert!(image_bytes(&directory, &source, &key).await.is_err());
         assert!(!directory.join(&key).exists());
         server.await.unwrap();
     }

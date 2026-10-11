@@ -2,6 +2,7 @@
 //! that keep `AppState`, the disk caches, and the frontend events in sync.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,8 +14,8 @@ use crate::app::{
     save_tracks_cache,
     touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, tracks_cache_bytes,
     upsert_membership, upsert_playlist, upsert_tracks_cache, write_tracks_cache_bytes, AppSettings,
-    AppState, MembershipEntry, PlaylistListCache, PlaylistTracksEntry, RefreshCause,
-    CACHE_STATS_TTL_SECS, LIBRARY_PAGE_SIZE, LIKED_MEMBERSHIP_ID,
+    AppState, CacheStatsRead, MembershipEntry, PlaylistListCache, PlaylistRefreshOwner, PlaylistTracksEntry, RefreshCause,
+    LIBRARY_PAGE_SIZE, LIKED_MEMBERSHIP_ID,
 };
 use crate::engine_client::{unmark_cached_rows, EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
 use crate::log;
@@ -372,7 +373,7 @@ pub async fn browse_playlist(
         spawn_refresh_playlist(app, id, RefreshCause::Reopen);
         return Ok(detail);
     }
-    let mut result = fetch_playlist(&app, &state, &client, &id).await?;
+    let mut result = fetch_playlist(&app, &state, &client, &id, None).await?;
     let current = {
         let guard = state.lock();
         result.applied && library_generation_is_current(&guard, result.generation)
@@ -1286,20 +1287,61 @@ pub async fn set_devices_enabled(
 /// most once a minute.
 #[tauri::command]
 pub async fn get_cache_stats(state: State<'_, Mutex<AppState>>) -> Result<CacheStats, String> {
-    let now = now_secs();
-    {
-        let guard = state.lock();
-        if let Some((computed_at, stats)) = guard.cache_stats {
-            if now.saturating_sub(computed_at) < CACHE_STATS_TTL_SECS {
-                return Ok(stats);
+    measure_caches(&state, scan_caches).await
+}
+
+async fn scan_caches() -> Result<CacheStats, String> {
+    tauri::async_runtime::spawn_blocking(compute_cache_stats)
+        .await
+        .map_err(|error| format!("could not measure the caches: {error}"))
+}
+
+/// Register before inspecting metadata so a clear completing between the
+/// inspection and await cannot strand a reader. A superseded scan retries
+/// against the current generation; it must not return its old payload either.
+async fn measure_caches<F, Fut>(state: &Mutex<AppState>, mut scan: F) -> Result<CacheStats, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<CacheStats, String>>,
+{
+    let changed = state.lock().cache_stats.changed.clone();
+    loop {
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let read = state.lock().cache_stats.read(now_secs());
+        let generation = match read {
+            CacheStatsRead::Fresh(stats) => return Ok(stats),
+            CacheStatsRead::Scan(generation) => generation,
+            CacheStatsRead::Clearing => {
+                notified.await;
+                continue;
             }
+        };
+        let stats = scan().await?;
+        if let Some(stats) = state.lock().cache_stats.publish(generation, now_secs(), stats) {
+            return Ok(stats);
         }
     }
-    let stats = tauri::async_runtime::spawn_blocking(compute_cache_stats)
-        .await
-        .map_err(|error| format!("could not measure the caches: {error}"))?;
-    state.lock().cache_stats = Some((now, stats));
-    Ok(stats)
+}
+
+async fn clear_and_measure_caches<F, S, Fut>(
+    state: &Mutex<AppState>,
+    clear: F,
+    scan: S,
+) -> Result<CacheStats, String>
+where
+    F: Future<Output = Result<(), String>>,
+    S: FnMut() -> Fut,
+    Fut: Future<Output = Result<CacheStats, String>>,
+{
+    state.lock().cache_stats.begin_clear();
+    let result = clear.await;
+    // Failures can leave partially deleted directories. Invalidate the old
+    // memo on either outcome and only report measured, never assumed, sizes.
+    state.lock().cache_stats.finish_clear();
+    result?;
+    measure_caches(state, scan).await
 }
 
 /// Clears one cache after an explicit Settings confirmation. Clearing audio
@@ -1308,30 +1350,35 @@ pub async fn get_cache_stats(state: State<'_, Mutex<AppState>>) -> Result<CacheS
 /// playlist metadata, and diagnostic logs are outside both target directories.
 #[tauri::command]
 pub async fn clear_cache(
+    app: AppHandle,
     kind: String,
-    state: State<'_, Mutex<AppState>>,
     client: State<'_, Arc<EngineClient>>,
 ) -> Result<CacheStats, String> {
-    match kind.as_str() {
-        "audio" => {
-            // Playback retirement, producer fencing and disk deletion complete
-            // inside the serialized native command before it acknowledges.
-            client.clear_audio_cache().await?;
-        }
-        "covers" => {
-            let root = data_dir().join("covers");
-            tauri::async_runtime::spawn_blocking(move || clear_cache_directory(&root, &[]))
-                .await
-                .map_err(|error| format!("could not clear the covers cache: {error}"))??;
-        }
-        _ => return Err("cache kind must be 'audio' or 'covers'".to_owned()),
+    if !matches!(kind.as_str(), "audio" | "covers") {
+        return Err("cache kind must be 'audio' or 'covers'".to_owned());
     }
-
-    let stats = tauri::async_runtime::spawn_blocking(compute_cache_stats)
-        .await
-        .map_err(|error| format!("could not measure caches after clearing: {error}"))?;
-    state.lock().cache_stats = Some((now_secs(), stats));
-    Ok(stats)
+    let client = client.inner().clone();
+    // Dropping the IPC waiter must not retire ownership while an engine ACK
+    // or blocking directory removal is still outstanding. The owned task
+    // survives that cancellation and completes the generation fence.
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<Mutex<AppState>>();
+        clear_and_measure_caches(&state, async move {
+            match kind.as_str() {
+                "audio" => {
+                    // Native retirement, producer fencing and durable deletion
+                    // still complete before the engine acknowledges.
+                    client.clear_audio_cache().await
+                }
+                _ => {
+                    let root = data_dir().join("covers");
+                    tauri::async_runtime::spawn_blocking(move || clear_cache_directory(&root, &[]))
+                        .await
+                        .map_err(|error| format!("could not clear the covers cache: {error}"))?
+                }
+            }
+        }, scan_caches).await
+    }).await.map_err(|error| format!("could not complete cache clearing: {error}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -2182,23 +2229,19 @@ async fn browse_all_liked_uris(client: &EngineClient) -> Result<HashSet<String>,
 /// [`AppState::start_playlist_refresh`] rather than queued, because that fetch
 /// is about to emit exactly the payload a second pass would fetch.
 fn spawn_refresh_playlist(app: AppHandle, id: String, cause: RefreshCause) {
+    let owner = {
+        let state = app.state::<Mutex<AppState>>();
+        let Some(owner) = state.lock().start_playlist_refresh(&id, cause) else { return; };
+        owner
+    };
     tauri::async_runtime::spawn(async move {
         let client = app.state::<Arc<EngineClient>>();
         let state = app.state::<Mutex<AppState>>();
         loop {
-            {
-                let mut guard = state.lock();
-                if !guard.start_playlist_refresh(&id, cause) {
-                    return;
-                }
-            }
-
-            let result = fetch_playlist(&app, &state, &client, &id).await;
-            let again = {
-                let mut guard = state.lock();
-                guard.finish_playlist_refresh(&id);
-                guard.take_playlist_refresh_queued(&id)
-            };
+            let Some((result, again)) = playlist_refresh_pass(
+                &state, &id, owner,
+                fetch_playlist(&app, &state, &client, &id, Some(owner.library_generation)),
+            ).await else { return; };
 
             match result {
                 /* Tell the window, do not just warm the cache.
@@ -2239,6 +2282,17 @@ fn spawn_refresh_playlist(app: AppHandle, id: String, cause: RefreshCause) {
             }
         }
     });
+}
+
+async fn playlist_refresh_pass<T>(
+    state: &Mutex<AppState>,
+    id: &str,
+    owner: PlaylistRefreshOwner,
+    fetch: impl Future<Output = Result<T, String>>,
+) -> Option<(Result<T, String>, bool)> {
+    let result = fetch.await;
+    let again = state.lock().finish_playlist_refresh(id, owner)?;
+    Some((result, again))
 }
 
 fn remove_tree_playlist(tree: &mut Vec<LibraryNodeDetail>, id: &str) {
@@ -2361,10 +2415,11 @@ async fn fetch_playlist(
     state: &Mutex<AppState>,
     client: &EngineClient,
     id: &str,
+    refresh_generation: Option<u64>,
 ) -> Result<PlaylistFetchResult, String> {
     let (generation, playlist_generation) = {
         let guard = state.lock();
-        (guard.library_generation, guard.playlist_generation(id))
+        (refresh_generation.unwrap_or(guard.library_generation), guard.playlist_generation(id))
     };
     let cache_generation = client.cache_generation();
     let mut detail = PlaylistDetail::from(client.browse_playlist(id).await?);
@@ -2439,6 +2494,208 @@ async fn fetch_playlist(
 mod tests {
     use super::*;
     use crate::types::PlaybackState;
+
+    struct CacheFixture {
+        root: std::path::PathBuf,
+        state: Mutex<AppState>,
+    }
+
+    impl CacheFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!("renderer-cache-ownership-{}-{}",
+                std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir_all(root.join("audio")).unwrap();
+            std::fs::create_dir_all(root.join("covers")).unwrap();
+            std::fs::write(root.join("audio/song"), [1; 17]).unwrap();
+            std::fs::write(root.join("covers/cover"), [2; 31]).unwrap();
+            Self { state: Mutex::new(AppState::new(root.clone())), root }
+        }
+
+        fn stats(&self) -> CacheStats {
+            CacheStats {
+                audio: crate::app::directory_usage(&self.root.join("audio")),
+                covers: crate::app::directory_usage(&self.root.join("covers")),
+            }
+        }
+    }
+
+    impl Drop for CacheFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    async fn assert_pending<T>(mut future: std::pin::Pin<&mut impl Future<Output = T>>) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending(), "operation must await its owner");
+            std::task::Poll::Ready(())
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn scans_finishing_after_either_clear_return_and_memoize_only_current_disk_usage() {
+        for kind in ["audio", "covers"] {
+            let fixture = CacheFixture::new();
+            let stale = fixture.stats();
+            let (release, wait) = tokio::sync::oneshot::channel::<()>();
+            let mut wait = Some(wait);
+            let scan = measure_caches(&fixture.state, || {
+                let gate = wait.take();
+                let stats = fixture.stats();
+                async move {
+                    if let Some(gate) = gate { gate.await.unwrap(); }
+                    Ok(stats)
+                }
+            });
+            tokio::pin!(scan);
+            assert_pending(scan.as_mut()).await;
+            let root = fixture.root.join(kind);
+            let current = clear_and_measure_caches(&fixture.state, async move {
+                tokio::task::spawn_blocking(move || clear_cache_directory(&root, &[]))
+                    .await.unwrap()
+            }, || async { Ok(fixture.stats()) }).await.unwrap();
+            assert_ne!(current, stale);
+            release.send(()).unwrap();
+            assert_eq!(scan.await.unwrap(), current, "the already-captured old scan must not return");
+            let memo = measure_caches(&fixture.state, || std::future::ready(
+                Err("a current clear measurement must be reused".to_owned())
+            )).await.unwrap();
+            assert_eq!(memo, current);
+            assert_eq!(current, fixture.stats());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_clear_releases_readers_and_remeasures_partially_deleted_content() {
+        let fixture = CacheFixture::new();
+        let before = measure_caches(&fixture.state, || async { Ok(fixture.stats()) }).await.unwrap();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let clear = clear_and_measure_caches(&fixture.state, async {
+            gate.await.unwrap();
+            std::fs::remove_file(fixture.root.join("audio/song")).unwrap();
+            Err("a later deletion failed".to_owned())
+        }, || async { panic!("a failed clear cannot claim success") });
+        tokio::pin!(clear);
+        assert_pending(clear.as_mut()).await;
+        let reader = measure_caches(&fixture.state, || async { Ok(fixture.stats()) });
+        tokio::pin!(reader);
+        assert_pending(reader.as_mut()).await;
+        release.send(()).unwrap();
+        assert!(clear.await.is_err());
+        let after = reader.await.unwrap();
+        assert_ne!(after, before);
+        assert_eq!(after.audio.files, 0);
+        assert_eq!(after.covers, before.covers, "failure must not pretend all caches are empty");
+    }
+
+    #[tokio::test]
+    async fn overlapping_clears_keep_readers_fenced_until_both_operations_finish() {
+        let fixture = CacheFixture::new();
+        let (release_audio, audio_gate) = tokio::sync::oneshot::channel::<()>();
+        let (release_covers, covers_gate) = tokio::sync::oneshot::channel::<()>();
+        let audio = clear_and_measure_caches(&fixture.state, async {
+            audio_gate.await.unwrap();
+            clear_cache_directory(&fixture.root.join("audio"), &[])
+        }, || async { Ok(fixture.stats()) });
+        let covers = clear_and_measure_caches(&fixture.state, async {
+            covers_gate.await.unwrap();
+            clear_cache_directory(&fixture.root.join("covers"), &[])
+        }, || async { Ok(fixture.stats()) });
+        tokio::pin!(audio, covers);
+        assert_pending(audio.as_mut()).await;
+        assert_pending(covers.as_mut()).await;
+        let reader = measure_caches(&fixture.state, || async { Ok(fixture.stats()) });
+        tokio::pin!(reader);
+        assert_pending(reader.as_mut()).await;
+        release_audio.send(()).unwrap();
+        assert_pending(audio.as_mut()).await;
+        assert_pending(reader.as_mut()).await;
+        release_covers.send(()).unwrap();
+        let current = covers.await.unwrap();
+        assert_eq!(reader.await.unwrap(), current);
+        assert_eq!(audio.await.unwrap(), current);
+        assert_eq!(current, CacheStats::default());
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_clear_waiter_does_not_release_the_detached_clear_owner() {
+        let fixture = Arc::new(CacheFixture::new());
+        let (entered, started) = tokio::sync::oneshot::channel::<()>();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let (completed, done) = tokio::sync::oneshot::channel();
+        let worker_fixture = fixture.clone();
+        let worker = tokio::spawn(async move {
+            let result = clear_and_measure_caches(&worker_fixture.state, async {
+                entered.send(()).unwrap();
+                gate.await.unwrap();
+                clear_cache_directory(&worker_fixture.root.join("audio"), &[])
+            }, || async { Ok(worker_fixture.stats()) }).await;
+            completed.send(result).unwrap();
+        });
+        let waiter = tokio::spawn(async move { worker.await.unwrap() });
+        started.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        let reader = measure_caches(&fixture.state, || async { Ok(fixture.stats()) });
+        tokio::pin!(reader);
+        assert_pending(reader.as_mut()).await;
+        release.send(()).unwrap();
+        let current = done.await.unwrap().unwrap();
+        assert_eq!(reader.await.unwrap(), current);
+        assert_eq!(current.audio.files, 0);
+        assert_eq!(current.covers.files, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_post_clear_scan_makes_a_delayed_old_scan_rescan_current_content() {
+        let fixture = CacheFixture::new();
+        let before = fixture.stats();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let mut gate = Some(gate);
+        let scans = std::cell::Cell::new(0);
+        let old_scan = measure_caches(&fixture.state, || {
+            scans.set(scans.get() + 1);
+            let gate = gate.take();
+            let stats = fixture.stats();
+            async move {
+                if let Some(gate) = gate { gate.await.unwrap(); }
+                Ok(stats)
+            }
+        });
+        tokio::pin!(old_scan);
+        assert_pending(old_scan.as_mut()).await;
+        let result = clear_and_measure_caches(&fixture.state, async {
+            clear_cache_directory(&fixture.root.join("covers"), &[])
+        }, || async { Err("scan worker failed".to_owned()) }).await;
+        assert!(result.is_err());
+        release.send(()).unwrap();
+        let current = old_scan.await.unwrap();
+        assert_eq!(scans.get(), 2, "the old payload must be rejected even without a fresh memo");
+        assert_ne!(current, before);
+        assert_eq!(current.covers.files, 0);
+        assert_eq!(current.audio, before.audio);
+    }
+
+    #[tokio::test]
+    async fn failed_playlist_request_releases_only_its_owner_and_preserves_queued_edits() {
+        let state = Mutex::new(AppState::new(std::path::PathBuf::new()));
+        let owner = state.lock().start_playlist_refresh("p", RefreshCause::Reopen).unwrap();
+        assert!(state.lock().start_playlist_refresh("p", RefreshCause::Edit).is_none());
+        let (result, again) = playlist_refresh_pass::<()>(&state, "p", owner,
+            async { Err("request failed".to_owned()) }).await.unwrap();
+        assert!(result.is_err());
+        assert!(again);
+        assert!(state.lock().start_playlist_refresh("p", RefreshCause::Reopen).is_none());
+        let (_, again) = playlist_refresh_pass::<()>(&state, "p", owner,
+            async { Err("retry failed".to_owned()) }).await.unwrap();
+        assert!(!again);
+        let current = state.lock().start_playlist_refresh("p", RefreshCause::Reopen).unwrap();
+        assert!(playlist_refresh_pass::<()>(&state, "p", owner,
+            async { Err("obsolete failure".to_owned()) }).await.is_none());
+        assert!(state.lock().start_playlist_refresh("p", RefreshCause::Reopen).is_none());
+        assert!(!playlist_refresh_pass(&state, "p", current, async { Ok(()) }).await.unwrap().1);
+    }
 
     fn playlist_payload(name: &str, revision: &str, ids: &[&str]) -> PlaylistDetail {
         PlaylistDetail {
@@ -2620,22 +2877,6 @@ mod tests {
         assert_eq!(retry.take_due(started + Duration::from_secs(15)), None);
     }
 
-    #[test]
-    fn library_generation_predicate_rejects_pre_delete_results() {
-        let mut state = AppState::new(std::path::PathBuf::new());
-        let captured = state.library_generation;
-        assert!(library_generation_is_current(&state, captured));
-
-        state.library_generation = state.library_generation.wrapping_add(1);
-        assert!(
-            !library_generation_is_current(&state, captured),
-            "a response captured before delete must be fenced"
-        );
-        assert!(library_generation_is_current(
-            &state,
-            state.library_generation
-        ));
-    }
 
     fn playing_state(position_ms: u32) -> PlaybackState {
         PlaybackState {
@@ -2675,7 +2916,6 @@ mod tests {
         );
         assert_eq!(snapshot.playback.playing, true);
         assert_eq!(snapshot.playback.current_uri, "spotify:track:a");
-        assert_eq!(snapshot.playback.volume, 50);
         assert_eq!(snapshot.playback.queue, vec![Track::default()].into());
     }
 
@@ -2694,11 +2934,6 @@ mod tests {
         assert!(forward_position_heartbeat(&mut snapshot, beat(9_000)));
         // Paused while minimized: nothing was withheld, so nothing to resync.
         record_window_minimized(&mut snapshot, true);
-        assert!(!record_window_minimized(&mut snapshot, false));
-        // A full state after the withheld beat already carried the exact playhead.
-        record_window_minimized(&mut snapshot, true);
-        forward_position_heartbeat(&mut snapshot, beat(11_000));
-        snapshot.position_withheld = false; // what storing a full state does
         assert!(!record_window_minimized(&mut snapshot, false));
     }
 

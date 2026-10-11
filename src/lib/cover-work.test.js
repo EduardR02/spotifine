@@ -72,7 +72,7 @@ test("a reader that throws still lets the queue drain", async () => {
     { max: 4, limit: 1 },
   );
 
-  expect(read("bad", "bad")).rejects.toThrow("could not read");
+  await expect(read("bad", "bad")).rejects.toThrow("could not read");
   expect(await read("good", "good")).toBe("good");
 });
 

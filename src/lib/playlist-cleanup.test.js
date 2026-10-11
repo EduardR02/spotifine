@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import {
   addedCutoff, cleanupChoices, cleanupDuration, cleanupMatches, cleanupSelection,
-  filterCleanupChoices, cleanupPreview, parseLocalDate, ruleLabel,
+  filterCleanupChoices, cleanupPreview, parseLocalDate,
 } from "./playlist-cleanup.js";
 
 const tracks = [
@@ -40,18 +40,15 @@ test("whole-word filtering is Unicode-aware and never interprets user text as re
   expect(cleanupPreview(rows, [{ ...rule, text: ".*" }], "all").rows).toEqual([]);
 });
 
-test("choices carry the folded name the filter matches on, ids included", () => {
+test("choice search matches Unicode-normalized names without treating accents as interchangeable", () => {
   const rows = [
     { uri: "spotify:track:f", name: "Song", artist_names: ["ＡＣ／ＤＣ"], artist_ids: [""], duration_ms: 200000 },
     { uri: "spotify:track:g", name: "Other", artist_names: ["Beyoncé"], artist_ids: ["bey"], duration_ms: 200000 },
   ];
   const choices = cleanupChoices(rows, "artist");
-  // Folded once at build time, because the filter runs per keystroke: the
-  // fullwidth artist has to answer a query typed in plain ASCII. Folding is
-  // NFKC plus case, not accent stripping, so "é" is still typed as "é".
-  expect(choices.map(({ normalized }) => normalized).sort()).toEqual(["ac/dc", "beyoncé"]);
   expect(filterCleanupChoices(choices, "AC/DC").map(({ name }) => name)).toEqual(["ＡＣ／ＤＣ"]);
-  expect(filterCleanupChoices(choices, "BEYONCÉ").map(({ key }) => key)).toEqual(["id:bey"]);
+  expect(filterCleanupChoices(choices, "BEYONCÉ").map(({ id }) => id)).toEqual(["bey"]);
+  expect(filterCleanupChoices(choices, "BEYONCE")).toEqual([]);
   expect(filterCleanupChoices(choices, "  ")).toHaveLength(2);
   expect(filterCleanupChoices(choices, "no such artist")).toEqual([]);
 });
@@ -258,24 +255,3 @@ test("one match run serves every selection, and no selection can change it", () 
   expect(cleanupPreview(tracks, [{ field: "song", text: "live", operator: "contains" }], "all")).toEqual(untouched);
 });
 
-test("chips read the rule back, negation and units included", () => {
-  const choice = (field, id, name) => ({ field, choice: { key: `id:${id}`, id, name, normalized: name.toLowerCase() } });
-  expect(ruleLabel(choice("artist", "a1", "Artist A"))).toBe("Artist is Artist A");
-  expect(ruleLabel({ ...choice("artist", "a1", "Artist A"), operator: "is-not" })).toBe("Artist is not Artist A");
-  expect(ruleLabel({ ...choice("album", "al1", "Album A"), operator: "is-not" })).toBe("Album is not Album A");
-  expect(ruleLabel({ field: "song", operator: "contains", text: "live" })).toBe("Song contains “live”");
-  expect(ruleLabel({ field: "song", operator: "not-contains", text: "live" })).toBe("Song doesn't contain “live”");
-  expect(ruleLabel({ field: "song", operator: "words", text: "live" })).toBe("Song has whole words “live”");
-  expect(ruleLabel({ field: "song", operator: "not-words", text: "live" })).toBe("Song doesn't have whole words “live”");
-  expect(ruleLabel({ field: "duration", operator: "shorter", duration: 210000 })).toBe("Shorter than 3:30");
-  expect(ruleLabel({ field: "duration", operator: "longer", duration: 210500 })).toBe("Longer than 3:30.500");
-  expect(ruleLabel({ field: "unavailable" })).toBe("No longer playable");
-  expect(ruleLabel({ field: "older", amount: 1, unit: "months" })).toBe("Older than 1 month");
-  expect(ruleLabel({ field: "older", amount: 3, unit: "weeks" })).toBe("Older than 3 weeks");
-  // The date reads in the reader's own format, and reads the day they picked:
-  // the instant is local midnight, so no timezone can pull it a day either way.
-  const date = parseLocalDate("2024-03-01");
-  const dateText = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" }).format(new Date(2024, 2, 1));
-  expect(ruleLabel({ field: "added-before", date })).toBe(`Added before ${dateText}`);
-  expect(ruleLabel({ field: "added-after", date })).toBe(`Added after ${dateText}`);
-});

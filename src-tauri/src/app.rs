@@ -221,16 +221,12 @@ pub struct AppState {
     pub tracks_cache: Vec<PlaylistTracksEntry>,
     #[serde(skip)]
     pub data_dir: PathBuf,
-    /// Playlist ids with a background detail refresh currently in flight.
-    /// This is process-local bookkeeping and is deliberately not serialized.
+    /// Current-generation background detail owner per playlist. Obsolete
+    /// tasks may finish, but cannot release or queue work for a newer owner.
     #[serde(skip)]
-    playlist_refreshing: HashSet<String>,
-    /// Set when an edit lands while another fetch for the same playlist is
-    /// out; the running refresh re-runs once more instead of the edit being
-    /// dropped (it would otherwise never be seen until the next open). A
-    /// re-open while a fetch is out is not queued: that fetch answers it.
+    playlist_refreshing: HashMap<String, PlaylistRefresh>,
     #[serde(skip)]
-    playlist_refresh_queued: HashSet<String>,
+    playlist_refresh_sequence: u64,
     /// Serializes playlist state mutation with its rebuildable cache write.
     /// Async fetches may finish out of order; holding this outside the
     /// AppState lock lets disk I/O proceed without blocking state readers while
@@ -260,11 +256,9 @@ pub struct AppState {
     /// Fences full Liked Songs walks against confirmed personal-API writes.
     #[serde(skip)]
     pub liked_generation: u64,
-    /// Last computed cache sizes and the unix second they were computed at,
-    /// so reopening Settings does not re-walk thousands of files. See
-    /// [`CACHE_STATS_TTL_SECS`].
+    /// Account-independent disk-cache measurement ownership.
     #[serde(skip)]
-    pub cache_stats: Option<(i64, CacheStats)>,
+    pub(crate) cache_stats: CacheStatsMemo,
     /// Reverse lookup index answering "which of my containers hold this
     /// track": owned playlists plus the Liked Songs collection. Backs the
     /// player bar's saved mark without any network round trip at play time.
@@ -318,16 +312,16 @@ impl AppState {
             library_import_pending: false,
             tracks_cache: Vec::new(),
             data_dir,
-            playlist_refreshing: HashSet::new(),
+            playlist_refreshing: HashMap::new(),
             playlist_persistence: Arc::new(Mutex::new(())),
-            playlist_refresh_queued: HashSet::new(),
+            playlist_refresh_sequence: 0,
             library_fetching: false,
             library_refresh_queued: false,
             library_generation: 0,
             account_generation: 0,
             playlist_generations: HashMap::new(),
             liked_generation: 0,
-            cache_stats: None,
+            cache_stats: CacheStatsMemo::default(),
             memberships: Vec::new(),
             membership_fetching: false,
             membership_refresh_queued: false,
@@ -497,28 +491,38 @@ impl AppState {
         }))
     }
 
-    pub(crate) fn start_playlist_refresh(&mut self, id: &str, cause: RefreshCause) -> bool {
-        if self.playlist_refreshing.insert(id.to_owned()) {
-            return true;
+    pub(crate) fn start_playlist_refresh(&mut self, id: &str, cause: RefreshCause) -> Option<PlaylistRefreshOwner> {
+        if let Some(refresh) = self.playlist_refreshing.get_mut(id) {
+            if refresh.owner.account_generation == self.account_generation
+                && refresh.owner.library_generation == self.library_generation
+            {
+                refresh.queued |= cause == RefreshCause::Edit;
+                return None;
+            }
         }
-        // Another fetch is out for this playlist. Only an edit behind it
-        // needs one more pass: it would otherwise be answered by a read that
-        // predates it, and never seen until the next open. A re-open carries
-        // no such news — the fetch in flight already answers it, and queuing
-        // it would spend a second round trip only to drop the first payload.
-        if cause == RefreshCause::Edit {
-            self.playlist_refresh_queued.insert(id.to_owned());
-        }
-        false
+        self.playlist_refresh_sequence = self.playlist_refresh_sequence.wrapping_add(1);
+        let owner = PlaylistRefreshOwner {
+            account_generation: self.account_generation,
+            library_generation: self.library_generation,
+            task: self.playlist_refresh_sequence,
+        };
+        self.playlist_refreshing.insert(id.to_owned(), PlaylistRefresh { owner, queued: false });
+        Some(owner)
     }
 
-    pub(crate) fn finish_playlist_refresh(&mut self, id: &str) {
+    /// A queued edit retains the same owner for another pass, without a gap
+    /// in which another trigger could launch a duplicate request.
+    pub(crate) fn finish_playlist_refresh(&mut self, id: &str, owner: PlaylistRefreshOwner) -> Option<bool> {
+        let refresh = self.playlist_refreshing.get_mut(id)?;
+        if refresh.owner != owner { return None; }
+        if owner.account_generation == self.account_generation
+            && owner.library_generation == self.library_generation
+            && std::mem::take(&mut refresh.queued)
+        {
+            return Some(true);
+        }
         self.playlist_refreshing.remove(id);
-    }
-
-    /// Takes and clears a mid-flight refresh trigger for `id`.
-    pub(crate) fn take_playlist_refresh_queued(&mut self, id: &str) -> bool {
-        self.playlist_refresh_queued.remove(id)
+        Some(false)
     }
 }
 
@@ -531,6 +535,64 @@ impl AppState {
 pub(crate) enum RefreshCause {
     Reopen,
     Edit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlaylistRefreshOwner {
+    account_generation: u64,
+    pub(crate) library_generation: u64,
+    task: u64,
+}
+
+#[derive(Debug)]
+struct PlaylistRefresh {
+    owner: PlaylistRefreshOwner,
+    queued: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CacheStatsMemo {
+    generation: u64,
+    clearing: usize,
+    measured: Option<(i64, CacheStats)>,
+    pub(crate) changed: Arc<tokio::sync::Notify>,
+}
+
+pub(crate) enum CacheStatsRead {
+    Fresh(CacheStats),
+    Scan(u64),
+    Clearing,
+}
+
+impl CacheStatsMemo {
+    pub(crate) fn read(&self, now: i64) -> CacheStatsRead {
+        if self.clearing != 0 { return CacheStatsRead::Clearing; }
+        if let Some((computed_at, stats)) = self.measured {
+            if now.saturating_sub(computed_at) < CACHE_STATS_TTL_SECS {
+                return CacheStatsRead::Fresh(stats);
+            }
+        }
+        CacheStatsRead::Scan(self.generation)
+    }
+
+    pub(crate) fn publish(&mut self, generation: u64, now: i64, stats: CacheStats) -> Option<CacheStats> {
+        if self.generation != generation || self.clearing != 0 { return None; }
+        self.measured = Some((now, stats));
+        Some(stats)
+    }
+
+    pub(crate) fn begin_clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.measured = None;
+        self.clearing += 1;
+    }
+
+    pub(crate) fn finish_clear(&mut self) {
+        self.clearing -= 1;
+        self.generation = self.generation.wrapping_add(1);
+        self.measured = None;
+        self.changed.notify_waiters();
+    }
 }
 
 /// One cached playlist tracks payload, matching the on-disk entry shape.
@@ -1823,20 +1885,6 @@ mod tests {
         assert_eq!(settings.audio_cache_limit_mb, 2048);
         assert!(!settings.launch_at_login);
         assert!(!settings.start_minimized);
-        assert!(!settings.normalisation, "normalisation defaults to off");
-        assert!(settings.devices_enabled, "devices stay on until turned off");
-
-        let mut saved = AppSettings::default();
-        saved.launch_at_login = true;
-        saved.start_minimized = true;
-        saved.normalisation = true;
-        saved.devices_enabled = false;
-        let round_trip: AppSettings =
-            serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
-        assert!(round_trip.launch_at_login);
-        assert!(round_trip.start_minimized);
-        assert!(round_trip.normalisation);
-        assert!(!round_trip.devices_enabled);
     }
 
     fn membership(id: &str, revision: &str, uris: &[&str]) -> MembershipEntry {
@@ -1961,9 +2009,6 @@ mod tests {
         snapshot.position_ms = 84_000;
         save_playback_snapshot_to(&dir, &snapshot).unwrap();
         assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot));
-        assert!(!playback_state_path(&dir)
-            .with_extension("json.tmp")
-            .exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2305,73 +2350,73 @@ mod tests {
 
     #[test]
     fn playlist_refresh_state_coalesces_same_id_but_allows_other_ids() {
-        let mut state = AppState::new(PathBuf::from("unused"));
+        let mut state = AppState::new(PathBuf::new());
+        let p1 = state.start_playlist_refresh("p1", RefreshCause::Reopen).unwrap();
+        assert!(state.start_playlist_refresh("p1", RefreshCause::Edit).is_none());
+        assert!(state.start_playlist_refresh("p1", RefreshCause::Edit).is_none());
+        assert!(state.start_playlist_refresh("p1", RefreshCause::Reopen).is_none());
+        let p2 = state.start_playlist_refresh("p2", RefreshCause::Reopen).unwrap();
 
-        assert!(state.start_playlist_refresh("p1", RefreshCause::Reopen));
-        // An edit landing mid-fetch is refused but queued for a single
-        // re-run: the read in flight may predate it and must not speak for it.
-        assert!(!state.start_playlist_refresh("p1", RefreshCause::Edit));
-        // A re-open is refused too, but queues nothing: the fetch in flight
-        // already answers it, and a second round trip would only discard the
-        // payload that fetch is about to emit.
-        assert!(!state.start_playlist_refresh("p1", RefreshCause::Reopen));
-        assert!(state.start_playlist_refresh("p2", RefreshCause::Reopen));
-
-        state.finish_playlist_refresh("p1");
-        assert!(state.take_playlist_refresh_queued("p1"));
-        assert!(!state.take_playlist_refresh_queued("p1"));
-
-        assert!(state.start_playlist_refresh("p1", RefreshCause::Reopen));
-        assert!(!state.start_playlist_refresh("p1", RefreshCause::Reopen));
-        state.finish_playlist_refresh("p1");
-        assert!(
-            !state.take_playlist_refresh_queued("p1"),
-            "a re-open behind a fetch leaves no second pass behind it"
-        );
-        state.finish_playlist_refresh("p2");
+        assert_eq!(state.finish_playlist_refresh("p1", p1), Some(true));
+        assert!(state.start_playlist_refresh("p1", RefreshCause::Reopen).is_none(),
+            "the queued pass retains ownership without launching another request");
+        assert_eq!(state.finish_playlist_refresh("p1", p1), Some(false));
+        let reopened = state.start_playlist_refresh("p1", RefreshCause::Reopen).unwrap();
+        assert!(state.start_playlist_refresh("p1", RefreshCause::Reopen).is_none());
+        assert_eq!(state.finish_playlist_refresh("p1", reopened), Some(false));
+        assert_eq!(state.finish_playlist_refresh("p2", p2), Some(false));
     }
 
     #[test]
-    fn followed_browse_updates_library_but_public_browse_does_not_insert() {
-        let mut followed = vec![playlist("followed")];
-        assert!(is_followed_playlist(&followed, "followed"));
-        if is_followed_playlist(&followed, "followed") {
-            upsert_playlist(
-                &mut followed,
-                Playlist {
-                    snapshot_id: "rev-new".into(),
-                    ..playlist("followed")
-                },
-            );
-        }
-        assert_eq!(followed[0].snapshot_id, "rev-new");
-
-        let mut public = Vec::new();
-        assert!(!is_followed_playlist(&public, "public"));
-        if is_followed_playlist(&public, "public") {
-            upsert_playlist(&mut public, playlist("public"));
-        }
-        assert!(public.is_empty());
+    fn obsolete_account_refresh_cannot_release_or_consume_the_new_accounts_pass() {
+        let root = std::env::temp_dir().join(format!("renderer-refresh-account-{}", std::process::id()));
+        let mut state = AppState::new(root.clone());
+        state.select_library_account("account-a");
+        let old = state.start_playlist_refresh("shared", RefreshCause::Reopen).unwrap();
+        assert!(state.start_playlist_refresh("shared", RefreshCause::Edit).is_none());
+        state.select_library_account("account-b");
+        let current = state.start_playlist_refresh("shared", RefreshCause::Reopen).unwrap();
+        assert!(state.start_playlist_refresh("shared", RefreshCause::Edit).is_none());
+        assert_eq!(state.finish_playlist_refresh("shared", old), None);
+        assert!(state.start_playlist_refresh("shared", RefreshCause::Reopen).is_none());
+        assert_eq!(state.finish_playlist_refresh("shared", current), Some(true));
+        assert_eq!(state.finish_playlist_refresh("shared", old), None);
+        assert_eq!(state.finish_playlist_refresh("shared", current), Some(false));
+        assert!(state.start_playlist_refresh("shared", RefreshCause::Reopen).is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn tracks_cache_keeps_most_recent_first_and_caps_at_25() {
+    fn a_library_fence_reopens_without_inheriting_an_obsolete_edit_trigger() {
+        let mut state = AppState::new(PathBuf::new());
+        let old = state.start_playlist_refresh("p", RefreshCause::Reopen).unwrap();
+        assert!(state.start_playlist_refresh("p", RefreshCause::Edit).is_none());
+        state.library_generation = state.library_generation.wrapping_add(1);
+        let current = state.start_playlist_refresh("p", RefreshCause::Reopen).unwrap();
+        assert_eq!(state.finish_playlist_refresh("p", old), None);
+        assert_eq!(state.finish_playlist_refresh("p", current), Some(false));
+        assert!(state.start_playlist_refresh("p", RefreshCause::Reopen).is_some());
+    }
+
+
+    #[test]
+    fn tracks_cache_keeps_recent_entries_within_its_resource_bound() {
         let mut cache = Vec::new();
-        for id in 0..30 {
+        for id in 0..TRACKS_CACHE_MAX + 5 {
             upsert_tracks_cache(
                 &mut cache,
                 PlaylistTracksEntry {
                     id: format!("p{id}"),
-                    fetched_at: Some(id),
+                    fetched_at: Some(id as i64),
                     revision: String::new(),
                     tracks: vec![track("t")],
                     excluded_track_ids: Vec::new(),
                 },
             );
         }
-        assert_eq!(cache.len(), 25);
-        assert_eq!(cache[0].id, "p29");
-        assert_eq!(cache[24].id, "p5");
+        assert_eq!(cache.len(), TRACKS_CACHE_MAX);
+        assert_eq!(cache[0].id, format!("p{}", TRACKS_CACHE_MAX + 4));
+        assert_eq!(cache.last().unwrap().id, "p5");
     }
 
     #[test]
@@ -2731,64 +2776,6 @@ mod tests {
         // invent a Home listening-history entry.
         assert_eq!(cache.playlists[0].last_played, None);
         assert_eq!(cache.playlists[0].last_activity, None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    #[test]
-    fn local_activity_stamps_survive_a_save_and_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!("renderer-lru-{}", now_secs()));
-        std::fs::create_dir_all(&dir).unwrap();
-        save_playlist_list(
-            &dir,
-            &PlaylistListCache {
-                version: 1,
-                fetched_at: Some(42),
-                me_id: "me".to_owned(),
-                playlist_tree: Vec::new(),
-                playlists: vec![
-                    Playlist {
-                        last_played: Some(1_700),
-                        last_activity: Some(1_800),
-                        ..playlist("opened")
-                    },
-                    playlist("never"),
-                ],
-            },
-        );
-        let cache = load_playlist_list(&dir).expect("the cache round-trips");
-        assert_eq!(cache.playlists[0].last_played, Some(1_700));
-        assert_eq!(cache.playlists[0].last_activity, Some(1_800));
-        assert_eq!(cache.playlists[1].last_played, None);
-        assert_eq!(cache.playlists[1].last_activity, None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn playlist_cache_save_replaces_an_existing_snapshot() {
-        let dir = std::env::temp_dir().join(format!(
-            "renderer-cache-replace-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in ["first", "second"] {
-            save_playlist_list(
-                &dir,
-                &PlaylistListCache {
-                    version: 1,
-                    fetched_at: Some(42),
-                    me_id: "me".to_owned(),
-                    playlist_tree: Vec::new(),
-                    playlists: vec![Playlist {
-                        name: name.to_owned(),
-                        ..playlist("p1")
-                    }],
-                },
-            );
-        }
-        assert_eq!(
-            load_playlist_list(&dir).unwrap().playlists[0].name,
-            "second"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -37,3 +37,40 @@ export function applyLikedDelta(collection, uris, saved, additions = []) {
   const kept = collection.tracks.filter((row) => !collection.removed.has(row.uri));
   if (kept.length !== collection.tracks.length) collection.tracks = kept;
 }
+
+/** Saved changes run in the view's serial queue, after any cursor page in flight.
+    A refresh is authoritative for the returned prefix; later deltas run next. */
+export async function applyLikedChange(collection, change, api, isCurrent) {
+  if (!isCurrent()) return;
+  const uris = change?.uris?.filter((uri) => uri.startsWith("spotify:track:"));
+  if (uris && typeof change.saved === "boolean") {
+    if (!change.saved) {
+      applyLikedDelta(collection, uris, false);
+      return;
+    }
+    const saved = [];
+    for (const uri of uris) {
+      if (collection.tracks.some((track) => track.uri === uri)) continue;
+      saved.push(await api.browseTrack(uri.slice("spotify:track:".length)));
+      if (!isCurrent()) return;
+    }
+    applyLikedDelta(collection, uris, true, saved);
+    return;
+  }
+
+  // Unidentified external changes refresh only the pages already displayed.
+  let fresh = [];
+  let cursor = null;
+  for (let page = 0; page < Math.max(1, collection.loadedPages); page++) {
+    const result = await api.browseLikedSongs(cursor);
+    if (!isCurrent()) return;
+    fresh = mergeLikedRows(fresh, result?.tracks);
+    cursor = result?.next_cursor ?? null;
+    if (!cursor) break;
+  }
+  // A returned URI supersedes an older unlike. Absent URIs retain their
+  // tombstones so later cursor pages cannot restore those removed songs.
+  for (const track of fresh) collection.removed.delete(track.uri);
+  collection.tracks = fresh;
+  collection.nextCursor = cursor;
+}

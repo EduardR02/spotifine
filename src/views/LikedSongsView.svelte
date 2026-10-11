@@ -6,7 +6,7 @@
   import LikedMark from "../components/LikedMark.svelte";
   import { paletteFor } from "../lib/covertone.svelte.js";
   import { detailArtSize } from "../lib/layout.js";
-  import { mergeLikedRows, mergeLikedPage, applyLikedDelta } from "../lib/liked-songs.js";
+  import { mergeLikedPage, applyLikedChange } from "../lib/liked-songs.js";
   import { applyCacheMarks } from "../lib/cache-marks.js";
 
   /* Rose's own hue, rebuilt at the header's fixed dark. Every other detail
@@ -84,39 +84,10 @@
     untrack(reloadCollection);
   });
 
-  async function applySavedChange(change, generation) {
-    if (generation !== loadGeneration) return;
-    const uris = change?.uris?.filter((uri) => uri.startsWith("spotify:track:"));
-    if (uris && typeof change.saved === "boolean") {
-      if (!change.saved) {
-        applyLikedDelta(collection, uris, false);
-        return;
-      }
-      const saved = [];
-      for (const uri of uris) {
-        if (tracks.some((track) => track.uri === uri)) continue;
-        saved.push(await api.browseTrack(uri.slice("spotify:track:".length)));
-      }
-      if (generation === loadGeneration) applyLikedDelta(collection, uris, true, saved);
-      return;
-    }
-    // Unidentified external changes refresh only the pages already displayed.
-    let fresh = [];
-    let cursor = null;
-    for (let page = 0; page < Math.max(1, collection.loadedPages); page++) {
-      const result = await api.browseLikedSongs(cursor);
-      if (generation !== loadGeneration) return;
-      fresh = mergeLikedRows(fresh, result?.tracks);
-      cursor = result?.next_cursor ?? null;
-      if (!cursor) break;
-    }
-    collection.tracks = fresh;
-    collection.nextCursor = cursor;
-  }
-
   $effect(() => watchSavedTracks((change) => {
     const generation = loadGeneration;
-    changes = Promise.all([changes, pageRequest?.catch(() => {})]).then(() => applySavedChange(change, generation))
+    changes = Promise.all([changes, pageRequest?.catch(() => {})]).then(() =>
+      applyLikedChange(collection, change, api, () => generation === loadGeneration))
       .catch((reason) => {
         if (generation === loadGeneration) error = String(reason || "Could not update Liked Songs.");
       });

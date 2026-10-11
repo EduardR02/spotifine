@@ -234,13 +234,18 @@ with a small buffer, retaining rows needed for focus and active interactions.
 Loaded collections and tracks remain available in memory: bounded rendering is
 not a cap on resident library data.
 
+Track drags and seek gestures stay bound to their source collection or playback
+target; navigation and track changes cannot redirect an old gesture. Pending
+playlist edits reconcile against the latest snapshot, and newer account/library
+data takes precedence over stale replies and optimistic rollbacks.
+
 Playing-row meters are decorative, not audio measurements. Visible meters share
 one nominal 60 Hz clock while playback runs in a focused, visible window. Timer
 delays can skip updates rather than trigger catch-up bursts. Pausing, hiding a
 meter or removing its row stops its updates; reduced motion keeps the bars static.
-The four bars reuse their DOM nodes and transform strings computed once at
-module load: updates select cached transforms, not regenerate graphics. Browser
-rendering and compositing still do work when those transforms change.
+Each meter draws four cached bar sprites into an independent OffscreenCanvas,
+using curve samples computed once at module load. This avoids per-frame DOM
+style updates, but browser compositing and presentation still do work.
 
 On Windows, native minimize state pauses Canvas playback and decorative meters,
 even if the WebView still reports a focused, visible document. The same visibility
@@ -252,6 +257,8 @@ and handles everything to do with sound. The Tauri shell in `src-tauri/`
 supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.
 Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
+Even an engine that exits during startup goes through restart backoff; shutdown
+cancels pending restart waits.
 Recovery settles against the replacement engine's actual state before publishing
 playback, including a crash during reconnection. Playlist edits fence older
 pending reads, and local library activity is written atomically. Library,
@@ -268,6 +275,9 @@ Clearing audio stops its producers and fences pending downloads before deleting
 files; success is acknowledged only after deletion. It resets playback and
 download marks, but preserves credentials and the audio-cache layout marker.
 A deletion failure is reported as a failure, not a successful reset.
+Cache measurements are fenced through the clear's actual completion, including
+cancelled callers and deletion lasting beyond the ordinary command deadline.
+An older scan cannot overwrite or return a superseded cache measurement.
 
 The audio path has its own resampler. Spotify decodes at 44.1 kHz and most
 Windows devices run at 48 kHz, and librespot's stock conversion comes out about

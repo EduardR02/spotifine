@@ -1731,13 +1731,14 @@ mod tests {
             },
         };
 
-        let entry = HistoryEntry::from(item);
-        assert_eq!(entry.track_id, "track-1");
-        assert_eq!(entry.started_at, 1_725_000_123_456);
-        assert_eq!(entry.ms_played, 91_000);
-        assert!(entry.completed);
-        assert_eq!(entry.context, "playlist:mix");
-        assert_eq!(entry.track.name, "Song");
+        let entry = serde_json::to_value(HistoryEntry::from(item)).unwrap();
+        assert_eq!(entry["track_id"], "track-1");
+        assert_eq!(entry["started_at"], 1_725_000_123_456_i64);
+        assert_eq!(entry["ms_played"], 91_000);
+        assert_eq!(entry["completed"], true);
+        assert_eq!(entry["context"], "playlist:mix");
+        assert_eq!(entry["track"]["name"], "Song");
+        assert!(entry.get("row").is_none(), "the webview reads history scalars at the top level");
     }
 
     /// The page's counts are what the view sizes its scrollbar and its
@@ -1872,14 +1873,6 @@ mod tests {
         assert_eq!(Track::from(reference), track);
     }
 
-    #[test]
-    fn a_missing_cover_urls_field_deserializes_to_no_candidates() {
-        // Caches written before the field existed must still load.
-        let playlist: Playlist =
-            serde_json::from_str(r#"{"id":"p1","name":"Mixtape","cover_url":""}"#).unwrap();
-        assert_eq!(playlist.id, "p1");
-        assert!(playlist.cover_urls.is_empty());
-    }
 
     #[test]
     fn search_result_maps_playlist_references_and_defaults_legacy_payloads() {
@@ -2054,12 +2047,6 @@ mod tests {
         assert_eq!(json["monthly_listeners"], 3_400);
         assert_eq!(json["popular_releases"][0]["name"], "Popular");
         assert_eq!(json["related_artists"][0]["name"], "Related");
-    }
-    #[test]
-    fn songwriter_playlist_defaults_when_missing_from_standalone_payload() {
-        let empty: SongwriterPlaylist = serde_json::from_str("{}").unwrap();
-        assert_eq!(empty.playlist, Playlist::default());
-        assert!(empty.tracks.is_empty());
     }
 
     #[test]

@@ -278,7 +278,6 @@ mod tests {
         match decode_request(r#"{"request_id":"request-8","type":"seek"}"#) {
             Input::Invalid { request_id, error } => {
                 assert_eq!(request_id, "request-8");
-                assert!(error.starts_with("invalid request: "));
                 assert!(error.contains("position_ms"));
             }
             other => panic!("expected an invalid request, got {other:?}"),

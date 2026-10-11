@@ -10,22 +10,22 @@ test("credits retain recently used entries and evict old payloads shared by pane
   const calls = [];
   api.browseTrackCredits = async (id) => { calls.push(id); return { groups: [], id }; };
   try {
-    for (let i = 0; i < 128; i++) {
+    loadTrackCredits({ id: "bounded-credit-recent" });
+    await settle();
+    // Churn beyond a generous retained-payload bound, not the cache's exact capacity.
+    for (let i = 0; i < 1024; i++) {
       loadTrackCredits({ id: `bounded-credit-${i}` });
       await settle();
+      if (i % 32 === 0) openCredits({ id: "bounded-credit-recent" });
     }
+    const reads = calls.length;
+    openCredits({ id: "bounded-credit-recent" });
+    expect(calls).toHaveLength(reads);
     openCredits({ id: "bounded-credit-0" });
-    expect(credits.loading).toBe(false);
-    expect(calls).toHaveLength(128);
-    loadTrackCredits({ id: "bounded-credit-128" });
     await settle();
-    openCredits({ id: "bounded-credit-0" });
-    expect(calls).toHaveLength(129);
-    openCredits({ id: "bounded-credit-1" });
-    await settle();
-    expect(calls).toHaveLength(130);
-    expect(credits.data.id).toBe("bounded-credit-1");
-    expect(trackCredits.data.id).toBe("bounded-credit-128");
+    expect(calls).toHaveLength(reads + 1);
+    expect(credits.data.id).toBe("bounded-credit-0");
+    expect(trackCredits.data.id).toBe("bounded-credit-1023");
   } finally {
     api.browseTrackCredits = original;
     closeCredits();
@@ -41,17 +41,19 @@ test("final cover tones retain recent palettes and evict older entries", async (
   };
   try {
     const { coverTone } = await import("./covertone.svelte.js");
+    coverTone("bounded-tone-recent", "recent");
+    await settle();
+    const recent = coverTone("bounded-tone-recent", "recent");
     let evicted;
-    for (let i = 0; i < 512; i++) {
+    // Keep a hot palette while cold entries exceed a generous memory bound.
+    for (let i = 0; i < 1024; i++) {
       coverTone(`bounded-tone-${i}`, `seed-${i}`);
       await settle();
-      if (i === 1) evicted = coverTone("bounded-tone-1", "seed-1");
+      if (i === 0) evicted = coverTone("bounded-tone-0", "seed-0");
+      if (i % 32 === 0) coverTone("bounded-tone-recent", "recent");
     }
-    const oldest = coverTone("bounded-tone-0", "seed-0");
-    coverTone("bounded-tone-512", "seed-512");
-    await settle();
-    expect(coverTone("bounded-tone-0", "seed-0")).toBe(oldest);
-    expect(coverTone("bounded-tone-1", "seed-1")).not.toBe(evicted);
+    expect(coverTone("bounded-tone-recent", "recent")).toBe(recent);
+    expect(coverTone("bounded-tone-0", "seed-0")).not.toBe(evicted);
     await settle();
   } finally {
     globalThis.Image = oldImage;

@@ -333,21 +333,38 @@ let volumePendingGeneration = null;
 let confirmedVolume = playback.volume;
 
 
-const lazyQueue = $state({ generation: 0, source: null, cursor: null, loading: false, retryAfter: 0 });
+// Logical playback target: transport ticks and queue-tail edits are not new plays.
+let playbackIdentityGeneration = $state(0);
+
+export function playbackIdentity() {
+  return playbackIdentityGeneration;
+}
+
+const lazyQueue = $state({ generation: 0, source: null, cursor: null, loading: false, retryAfter: 0, suspendedLease: null });
 const QUEUE_BACKFILL_LOW_WATER = 8;
 let lazyBackfillPromise = null;
 const cataloguePageCache = new Map();
 const CATALOGUE_PAGE_CACHE_MAX = 64;
 const cataloguePagePending = new Map();
 
-function clearLazyQueue() {
+function clearLazyQueue(keepSource = false) {
   lazyQueue.generation += 1;
+  // Cursor choices cancel pending starts but keep the installed source's
+  // single-flight backfill, so an already-submitted page cannot be duplicated.
+  if (keepSource) return;
   lazyQueue.source = null;
   lazyQueue.cursor = null;
   lazyQueue.loading = false;
   lazyQueue.retryAfter = 0;
+  lazyQueue.suspendedLease = null;
   lazyBackfillPromise = null;
 }
+function beginPlayback(keepLazySource = false) {
+  clearLazyQueue(keepLazySource);
+  playbackIdentityGeneration += 1;
+  return lazyQueue.generation;
+}
+
 
 /**
  * Labels a row with the context it is about to play in.
@@ -385,10 +402,8 @@ function contextForQueueSource(source) {
   return "";
 }
 
-async function startLazyQueue(tracks, source, cursor, index = 0) {
+async function startLazyQueue(tracks, source, cursor, index = 0, generation) {
   if (!tracks?.length) throw new Error("No playable tracks were returned.");
-  clearLazyQueue();
-  const generation = lazyQueue.generation;
   const context = contextForQueueSource(source);
   await invoke("play_queue", {
     queue: contextTracks(tracks, context),
@@ -437,29 +452,32 @@ export function loadCataloguePage(id, releaseTypes = ["albums", "singles"], offs
 }
 
 export async function playCatalogueContext(releases, id, releaseTypes, nextOffset, index) {
+  const generation = beginPlayback();
   // would require enumerating the very catalogue this path intentionally does
   // not fetch, so this context is explicitly sequential.
   if (playback.shuffle) await invoke("set_shuffle", { enabled: false });
+  if (generation !== lazyQueue.generation) return;
   await startLazyQueue(
     catalogueTracks(releases),
     { kind: "catalogue", id, releaseTypes: [...releaseTypes] },
     nextOffset,
     index,
+    generation,
   );
 }
 
 async function backfillLazyQueue(force = false) {
   const source = lazyQueue.source;
+  // Tail ownership follows the installed source, not subsequent cursor plays.
   const cursor = lazyQueue.cursor;
-  if (!source || cursor == null) return;
+  if (!source || cursor == null || lazyQueue.suspendedLease !== null) return;
   if (!force && (performance.now() < lazyQueue.retryAfter || playback.current_index < 0 || playback.queue.length - playback.current_index > QUEUE_BACKFILL_LOW_WATER)) return;
   if (lazyBackfillPromise) return lazyBackfillPromise;
-  const generation = lazyQueue.generation;
   lazyQueue.loading = true;
-  lazyBackfillPromise = (async () => {
+  const request = (async () => {
     try {
       const page = await loadCataloguePage(source.id, source.releaseTypes, cursor);
-      if (generation !== lazyQueue.generation) return;
+      if (source !== lazyQueue.source || lazyQueue.suspendedLease !== null) return;
       const tracks = catalogueTracks(page?.releases);
       if (tracks.length) {
         const context = contextForQueueSource(source);
@@ -468,21 +486,31 @@ async function backfillLazyQueue(force = false) {
           context,
         });
       }
-      if (generation !== lazyQueue.generation) return;
+      if (source !== lazyQueue.source) return;
       lazyQueue.retryAfter = 0;
       lazyQueue.cursor = page?.next_offset ?? null;
       if (lazyQueue.cursor == null) lazyQueue.source = null;
     } catch (error) {
-      if (generation === lazyQueue.generation) lazyQueue.retryAfter = performance.now() + 5000;
+      if (source === lazyQueue.source) lazyQueue.retryAfter = performance.now() + 5000;
       throw error;
     } finally {
-      if (generation === lazyQueue.generation) {
+      if (lazyBackfillPromise === request) {
         lazyQueue.loading = false;
         lazyBackfillPromise = null;
       }
     }
   })();
-  return lazyBackfillPromise;
+  lazyBackfillPromise = request;
+  return request;
+}
+
+function resumeLazyQueue(source, previewLeaseId) {
+  if (source !== lazyQueue.source || lazyQueue.suspendedLease?.id !== previewLeaseId) return;
+  lazyQueue.suspendedLease = null;
+  // A suspended read must finish releasing its slot before we resume its page.
+  (lazyBackfillPromise ?? Promise.resolve()).then(() => {
+    if (source === lazyQueue.source) return backfillLazyQueue(false);
+  }).catch(() => {});
 }
 
 export function maybeBackfillLazyQueue() {
@@ -604,6 +632,10 @@ function namedQueueRevision(value) {
 
 export function applyPlayback(payload) {
   if (!payload) return;
+  if (("output_device_id" in payload && payload.output_device_id !== playback.output_device_id)
+    || ("current_index" in payload && payload.current_index !== playback.current_index)
+    || ("current_uri" in payload && payload.current_uri !== playback.current_uri)
+    || ("context" in payload && payload.context !== playback.context)) playbackIdentityGeneration += 1;
   if ("position_ms" in payload || "playing" in payload || "buffering" in payload
     || "current_uri" in payload || "current_index" in payload
     || "output_device_id" in payload || "audible_playback_speed" in payload) {
@@ -839,6 +871,7 @@ export const library = $state([]);
  * mount listening-history rows that the fresh answer immediately reshuffles.
  */
 export const libraryState = $state({ loaded: false, fresh: false, tree: [] });
+let libraryAuthorityGeneration = 0;
 
 // Only missing, visible rows enter this queue. Headers reuse the engine's
 // account-scoped profile metadata; the library remains the sole row store.
@@ -1258,6 +1291,7 @@ function observeSearchSession(payload) {
       username !== previous.username;
     if (actualLogout || accountTransition) {
       searchSessionEpoch += 1;
+      playbackIdentityGeneration += 1;
       resetSearchForSession();
       resetPersonalizedDiscoveryForSession();
       invalidateLikedFirstPage();
@@ -1975,6 +2009,7 @@ function activityValue(playlist) {
 }
 
 export function setLibrary(playlists, { fresh = false, tree } = {}) {
+  libraryAuthorityGeneration += 1;
   if (tree !== undefined) libraryState.tree = tree;
   const ordered = [...(playlists ?? [])];
   ordered.sort((left, right) => {
@@ -2289,6 +2324,7 @@ export function removeFromLibrary(id) {
 
 async function removeLibraryPlaylist(id) {
   const epoch = searchSessionEpoch;
+  const authority = libraryAuthorityGeneration;
   const index = library.findIndex((row) => row?.id === id);
   if (index < 0) return false;
   const row = library[index];
@@ -2301,8 +2337,10 @@ async function removeLibraryPlaylist(id) {
     return epoch === searchSessionEpoch;
   } catch (error) {
     if (epoch !== searchSessionEpoch) return false;
-    if (!library.some((entry) => entry?.id === id)) library.splice(Math.min(index, library.length), 0, row);
-    if (libraryState.tree === shown) libraryState.tree = previous;
+    if (authority === libraryAuthorityGeneration) {
+      if (!library.some((entry) => entry?.id === id)) library.splice(Math.min(index, library.length), 0, row);
+      if (libraryState.tree === shown) libraryState.tree = previous;
+    }
     editFailed(`Could not remove "${row.name}" from your library.`, error);
     return false;
   }
@@ -2451,40 +2489,76 @@ export const cacheStats = $state({
   updatedAt: 0,
 });
 let cacheStatsRequest = null;
+let cacheStatsGeneration = 0;
+let cacheClearTail = null;
+
+function invalidateCacheStatsRead() {
+  cacheStatsGeneration += 1;
+  cacheStatsRequest = null;
+  cacheStats.loading = false;
+}
+
+function applyCacheStats(payload) {
+  cacheStats.audio = payload?.audio ?? null;
+  cacheStats.covers = payload?.covers ?? null;
+  cacheStats.updatedAt = Date.now();
+  cacheStats.error = null;
+}
+
 
 export function refreshCacheStats() {
   if (cacheStatsRequest) return cacheStatsRequest;
+  const generation = ++cacheStatsGeneration;
   cacheStats.loading = true;
   cacheStats.error = null;
   const request = api
     .getCacheStats()
     .then((payload) => {
-      cacheStats.audio = payload?.audio ?? null;
-      cacheStats.covers = payload?.covers ?? null;
-      cacheStats.updatedAt = Date.now();
+      if (generation === cacheStatsGeneration && cacheStatsRequest === request) applyCacheStats(payload);
       return payload;
     })
     .catch((error) => {
-      cacheStats.error = String(error || "Could not measure caches.");
+      if (generation === cacheStatsGeneration && cacheStatsRequest === request) {
+        cacheStats.error = String(error || "Could not measure caches.");
+      }
       throw error;
     })
     .finally(() => {
-      cacheStats.loading = false;
-      cacheStatsRequest = null;
+      if (generation === cacheStatsGeneration && cacheStatsRequest === request) {
+        cacheStats.loading = false;
+        cacheStatsRequest = null;
+      }
     });
   cacheStatsRequest = request;
   return request;
 }
 
-export async function clearCache(kind) {
-  const payload = await api.clearCache(kind);
-  // Reset kept pages and fence reads that were already in flight.
-  if (kind === "audio") propagateCacheMarks(null);
-  cacheStats.audio = payload?.audio ?? null;
-  cacheStats.covers = payload?.covers ?? null;
-  cacheStats.updatedAt = Date.now();
-  cacheStats.error = null;
-  return payload;
+export function clearCache(kind) {
+  // Both kinds return a complete snapshot, so serialize clears rather than let
+  // an older reply for one kind replace the other kind's newer result.
+  const run = async () => {
+    invalidateCacheStatsRead();
+    const generation = cacheStatsGeneration;
+    try {
+      const payload = await api.clearCache(kind);
+      // Fence scans started before or during the clear, including late errors.
+      invalidateCacheStatsRead();
+      if (kind === "audio") propagateCacheMarks(null);
+      applyCacheStats(payload);
+      return payload;
+    } catch (error) {
+      if (generation === cacheStatsGeneration) {
+        cacheStats.error = String(error || "Could not clear the cache.");
+      }
+      throw error;
+    }
+  };
+  const operation = cacheClearTail ? cacheClearTail.then(run, run) : run();
+  const pending = operation.finally(() => {
+    if (cacheClearTail === pending) cacheClearTail = null;
+  });
+  cacheClearTail = pending;
+  return pending;
 }
 
 /** The image request itself fetches and caches missing artwork. */
@@ -2532,6 +2606,9 @@ function decodeTrackWaveform(payload) {
   };
 }
 function requestPlaying(target) {
+  // A later resume/pause intent cancels a pending catalogue start, not its
+  // already-installed tail or the logical target of a seek gesture.
+  clearLazyQueue(true);
   const previous = playback.playing;
   const at = positionMs();
   const generation = ++playingRequestGeneration;
@@ -2578,7 +2655,7 @@ export const canvasLookups = createCanvasLookups((id) => invoke("browse_canvas",
 
 export const api = {
   selectOutput: (deviceId = null) => {
-    clearLazyQueue();
+    beginPlayback(true);
     return invoke("select_output", { deviceId }).catch((error) => {
       ui.error = String(error);
       throw error;
@@ -2588,12 +2665,17 @@ export const api = {
   pause: () => requestPlaying(false),
   setWindowVisible: (visible, refresh = false) => invoke("set_window_visible", { visible, refresh }),
   next: async () => {
+    const generation = beginPlayback(true);
     if (lazyQueue.source && playback.current_index >= playback.queue.length - 1) {
       await backfillLazyQueue(true);
     }
+    if (generation !== lazyQueue.generation) return;
     return invoke("next");
   },
-  previous: () => invoke("previous"),
+  previous: () => {
+    beginPlayback(true);
+    return invoke("previous");
+  },
   seek: (ms) => {
     const target = Math.max(0, Math.round(ms));
     const generation = ++seekRequestGeneration;
@@ -2640,7 +2722,7 @@ export const api = {
    * play exactly what was asked for, even with shuffle enabled.
    */
   playQueue: (queue, index, context = "", { automaticStart = false } = {}) => {
-    clearLazyQueue();
+    beginPlayback();
     const source = String(context ?? "").trim();
     return invoke("play_queue", {
       queue: contextTracks(queue, source),
@@ -2649,7 +2731,10 @@ export const api = {
       automaticStart,
     });
   },
-  playQueueIndex: (index) => invoke("play_queue_index", { index }),
+  playQueueIndex: (index) => {
+    beginPlayback(true);
+    return invoke("play_queue_index", { index });
+  },
   addQueue: (track, context = "") => {
     const source = String(context ?? "").trim();
     return invoke("add_queue", { track: contextTrack(track, source), context: source });
@@ -2687,16 +2772,35 @@ export const api = {
     invoke("save_track_edit", { trackId, durationMs, cuts, loopRange }),
   deleteTrackEdit: (trackId) => invoke("delete_track_edit", { trackId }),
   previewTrackEdit: (track, cuts, loopRange = null, positionMs = 0, previewLeaseId) => {
-    clearLazyQueue();
+    beginPlayback(true);
+    const source = lazyQueue.source;
+    const accepted = lazyQueue.suspendedLease?.id === previewLeaseId && lazyQueue.suspendedLease.accepted;
+    lazyQueue.suspendedLease = { id: previewLeaseId, accepted };
+    const lease = lazyQueue.suspendedLease;
     return invoke("preview_track_edit", {
       track,
       cuts,
       loopRange,
       positionMs: Math.max(0, Math.round(Number(positionMs) || 0)),
       previewLeaseId,
+    }).then((value) => {
+      if (source === lazyQueue.source && lazyQueue.suspendedLease?.id === previewLeaseId) {
+        lazyQueue.suspendedLease.accepted = true;
+      }
+      return value;
+    }).catch((error) => {
+      if (lazyQueue.suspendedLease === lease && !lease.accepted) resumeLazyQueue(source, previewLeaseId);
+      throw error;
     });
   },
-  restorePreview: (previewLeaseId) => invoke("restore_preview", { previewLeaseId }),
+  restorePreview: (previewLeaseId) => {
+    if (lazyQueue.suspendedLease?.id === previewLeaseId) beginPlayback(true);
+    const source = lazyQueue.source;
+    return invoke("restore_preview", { previewLeaseId }).then((value) => {
+      resumeLazyQueue(source, previewLeaseId);
+      return value;
+    });
+  },
   setPlaylistTrackEditEnabled: (playlistId, trackId, enabled) =>
     invoke("set_playlist_track_edit_enabled", {
       playlistId,

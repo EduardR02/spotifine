@@ -337,9 +337,9 @@ test("lookups are shared while in flight, kept when answered, and forgotten with
   const lookups = createCanvasLookups(() => (calls++, new Promise((resolve) => { answer = resolve; })));
   const first = lookups.lookup("a");
   const second = lookups.lookup("a");
-  expect(first).toBe(second);
+  expect(calls).toBe(1);
   answer({ url: "loop-a" });
-  expect(await first).toBe("loop-a");
+  expect(await Promise.all([first, second])).toEqual(["loop-a", "loop-a"]);
   expect(lookups.peek("a")).toBe("loop-a");
   await lookups.lookup("a");
   expect(calls).toBe(1);

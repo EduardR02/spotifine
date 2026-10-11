@@ -31,11 +31,11 @@ test("release persists the final clamped device-pixel width exactly once", () =>
   expect(p.capture).toBeNull();
 });
 
-for (const interruption of ["pointercancel", "lostpointercapture", "disappear", "unmount"]) {
+for (const interruption of ["pointercancel", "lostpointercapture", "owner teardown"]) {
   test(`${interruption} cancels tentative width without a persistence commit`, () => {
     const p = gesture();
     p.send("pointermove", 450);
-    if (interruption === "disappear" || interruption === "unmount") p.cancel();
+    if (interruption === "owner teardown") p.cancel();
     else p.send(interruption, 450);
     p.cancel();
     p.send("pointerup", 400);

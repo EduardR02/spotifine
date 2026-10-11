@@ -353,8 +353,6 @@ pub struct Wsola {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct SearchAudit {
-    chosen: usize,
-    exhaustive: usize,
     chosen_similarity: f32,
     best_similarity: f32,
 }
@@ -710,8 +708,6 @@ impl Wsola {
             let last = search.num_candidates - 1;
             let exhaustive = full_search(&search, 0, last, exclude, &mut ignored);
             self.search_audit.push(SearchAudit {
-                chosen,
-                exhaustive: exhaustive.map_or(chosen, |(candidate, _)| candidate),
                 chosen_similarity: refined
                     .map_or_else(|| search.similarity(chosen, &mut ignored), |(_, s)| s),
                 best_similarity: exhaustive.map_or(f32::NEG_INFINITY, |(_, s)| s),
@@ -1437,183 +1433,6 @@ mod tests {
         );
     }
 
-    fn legacy_similarity(
-        region: &[f32],
-        target: &[f32],
-        window: usize,
-        candidate: usize,
-        sample_step: usize,
-    ) -> f32 {
-        let base = candidate * CHANNELS;
-        let mut sum = 0.0f32;
-        for channel in 0..CHANNELS {
-            let mut dot = 0.0f32;
-            let mut energy_target = 0.0f32;
-            let mut energy_candidate = 0.0f32;
-            for n in (0..window).step_by(sample_step) {
-                let t = target[n * CHANNELS + channel];
-                let c = region[base + n * CHANNELS + channel];
-                dot += t * c;
-                energy_target += t * t;
-                energy_candidate += c * c;
-            }
-            sum += dot / (energy_target * energy_candidate).sqrt().max(1.0e-12);
-        }
-        sum
-    }
-
-    fn legacy_search(region: &[f32], target: &[f32], window: usize, num_candidates: usize) -> usize {
-        const D: usize = 4;
-        let last = num_candidates - 1;
-        let mut best = None;
-        let mut best_similarity = f32::NEG_INFINITY;
-        let mut candidate = 0;
-        while candidate < num_candidates {
-            let s = legacy_similarity(region, target, window, candidate, D);
-            if s > best_similarity {
-                best_similarity = s;
-                best = Some(candidate);
-            }
-            candidate += D;
-        }
-        if last % D != 0 {
-            // The winning similarity is deliberately not carried forward: the
-            // refinement below restarts the comparison from scratch, so writing it
-            // here would be a store nothing reads.
-            let s = legacy_similarity(region, target, window, last, D);
-            if s > best_similarity {
-                best = Some(last);
-            }
-        }
-        let coarse = best.unwrap_or(0);
-        let low = coarse.saturating_sub(D - 1);
-        let high = (coarse + D - 1).min(last);
-        best = None;
-        best_similarity = f32::NEG_INFINITY;
-        for candidate in low..=high {
-            let s = legacy_similarity(region, target, window, candidate, 1);
-            if s > best_similarity {
-                best_similarity = s;
-                best = Some(candidate);
-            }
-        }
-        best.unwrap_or(coarse)
-    }
-
-    /// Wall-clock cost of one search against the decimated search this replaced.
-    /// Reports; asserts nothing — a timing number is a property of the machine it
-    /// ran on, and asserting one would fail whenever the laptop was busy. Ignored
-    /// so a routine `cargo test` pays nothing for it.
-    ///
-    ///     cargo test --release -- --ignored --nocapture bench_search_cost
-    #[test]
-    #[ignore = "instrument, not a test: reports timings and asserts nothing"]
-    fn bench_search_cost() {
-        use std::hint::black_box;
-        use std::time::Instant;
-        let input = stereo_harmonics(SAMPLE_RATE as usize * 2, 220.0, 0.7);
-        let stretcher = searched(&input, 2.0);
-        let window = stretcher.window;
-        let num_candidates = stretcher.num_candidates;
-        let region = &stretcher.search_buf;
-        let target = &stretcher.target_buf;
-        let exclude = (-1i64, -1i64);
-        let reps = 300;
-
-        let mut energies = vec![0.0f32; num_candidates * CHANNELS];
-        let mut macs = 0usize;
-        // Warm up both.
-        for _ in 0..20 {
-            black_box(legacy_search(region, target, window, num_candidates));
-        }
-
-        let start = Instant::now();
-        for _ in 0..reps {
-            let mut energy_target = [0.0f32; CHANNELS];
-            for frame in 0..window {
-                for (channel, energy) in energy_target.iter_mut().enumerate() {
-                    let s = target[frame * CHANNELS + channel];
-                    *energy += s * s;
-                }
-            }
-            moving_block_energies(region, window, num_candidates, &mut energies, &mut macs);
-            let search = Search {
-                target,
-                region,
-                energy_target,
-                energy_candidates: &energies,
-                block_frames: window,
-                num_candidates,
-            };
-            let coarse = decimated_search(&search, exclude, &mut macs);
-            let low = coarse.saturating_sub(SEARCH_DECIMATION);
-            let high = (coarse + SEARCH_DECIMATION).min(num_candidates - 1);
-            black_box(full_search(&search, low, high, exclude, &mut macs));
-        }
-        let fixed = start.elapsed();
-
-        let start = Instant::now();
-        for _ in 0..reps {
-            black_box(legacy_search(region, target, window, num_candidates));
-        }
-        let legacy = start.elapsed();
-
-        println!(
-            "BENCH per search: chromium={:?} legacy={:?} speedup={:.2}x",
-            fixed / reps,
-            legacy / reps,
-            legacy.as_secs_f64() / fixed.as_secs_f64()
-        );
-    }
-
-    /// How close the search lands to an exhaustive sweep, per waveform and speed.
-    /// The bound this exists to inform is asserted by
-    /// `the_search_picks_a_block_as_good_as_an_exhaustive_search_would`; this
-    /// prints the whole distribution so a regression can be read rather than
-    /// inferred from a single failing bound.
-    ///
-    ///     cargo test --release -- --ignored --nocapture report_search_quality
-    #[test]
-    #[ignore = "instrument, not a test: reports quality and asserts nothing"]
-    fn report_search_quality() {
-        for (fundamental, speed) in [(220.0f32, 2.0f32), (147.0, 0.6), (330.0, 1.37)] {
-            let input = stereo_harmonics(SAMPLE_RATE as usize * 2, fundamental, 0.7);
-            let s = searched(&input, speed);
-            let n = s.search_audit.len();
-            let exact = s
-                .search_audit
-                .iter()
-                .filter(|a| a.chosen == a.exhaustive)
-                .count();
-            let worst = s
-                .search_audit
-                .iter()
-                .map(|a| a.best_similarity - a.chosen_similarity)
-                .fold(0.0f32, f32::max);
-            let avg_macs = s.search_macs() / s.search_count;
-            let exhaustive = s.num_candidates * s.window * CHANNELS;
-            println!(
-                "HARM f={fundamental} speed={speed}: searches={n} exact={exact} worst_gap={worst:.6} avg_macs={avg_macs} exhaustive={exhaustive} ratio={:.4}",
-                avg_macs as f64 / exhaustive as f64
-            );
-        }
-        for (freq, speed) in [(440.0f32, 2.0f32), (147.0, 0.6), (997.0, 1.37)] {
-            let input = stereo_tone(SAMPLE_RATE as usize * 2, freq, 0.7);
-            let s = searched(&input, speed);
-            let n = s.search_audit.len();
-            let exact = s
-                .search_audit
-                .iter()
-                .filter(|a| a.chosen == a.exhaustive)
-                .count();
-            let worst = s
-                .search_audit
-                .iter()
-                .map(|a| a.best_similarity - a.chosen_similarity)
-                .fold(0.0f32, f32::max);
-            println!("TONE f={freq} speed={speed}: searches={n} exact={exact} worst_gap={worst:.6}");
-        }
-    }
 
     #[test]
     fn finish_preserves_the_exact_delayed_eof_duration() {

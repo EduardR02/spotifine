@@ -286,7 +286,7 @@
    */
   function sameRule(a, b) {
     if (a.field !== b.field) return false;
-    if (a.field === "artist" || a.field === "album") return a.choice.key === b.choice.key;
+    if (a.field === "artist" || a.field === "album") return a.operator === b.operator && a.choice.key === b.choice.key;
     if (a.field === "song") return a.operator === b.operator && a.text === b.text;
     if (a.field === "duration") return a.operator === b.operator && a.duration === b.duration;
     if (a.field === "older") return a.amount === b.amount && a.unit === b.unit;

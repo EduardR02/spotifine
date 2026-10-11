@@ -14,6 +14,7 @@
 
 <script>
   import { untrack } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
   import { listen } from "@tauri-apps/api/event";
   import {
     detail,
@@ -27,6 +28,7 @@
     togglePlay,
     ui,
     session,
+    sessionEpoch,
     retryDetail,
     loadPlaylistRecommendations,
     removePlaylistRecommendation,
@@ -196,6 +198,24 @@
       })
       .map(({ track }) => track);
   });
+  const sortedTrackKeys = $derived.by(() => {
+    // A known local MOV carries occurrence tokens with its rows. A new
+    // authoritative array cannot inherit that proof merely by matching URIs.
+    const tokens = reorderSession?.rows === tracks
+      ? reorderSession.tokens : trackTokens(tracks);
+    const byTrack = new Map();
+    for (let i = 0; i < tracks.length; i++) {
+      const keys = byTrack.get(tracks[i]) ?? [];
+      keys.push(tokens[i]);
+      byTrack.set(tracks[i], keys);
+    }
+    const seen = new Map();
+    return sortedTracks.map((track) => {
+      const occurrence = seen.get(track) ?? 0;
+      seen.set(track, occurrence + 1);
+      return byTrack.get(track)[occurrence];
+    });
+  });
 
   /**
    * Ascending, then descending, then off.
@@ -257,6 +277,7 @@
       a new order is a new array on a new snapshot, never an edit of the one
       on screen: an edit would reach no reader. */
   function showOrder(rows) {
+    if (reorderSession) reorderSession.rows = rows;
     detail.playlist = { ...detail.playlist, tracks: rows };
   }
 
@@ -361,6 +382,7 @@
             move(list, from, to);
             session.pending.push({ ...pending, from, to });
           }
+          session.rows = list;
           detail.playlist = { ...fresh, tracks: list };
           reorderBlocked = false;
         }
@@ -380,7 +402,8 @@
     const last = list.length - 1;
     const actualFrom = mirrored ? last - from : from;
     const actualTo = mirrored ? last - to : to;
-    if (!reorderSession || reorderSession.id !== id) {
+    if (!reorderSession || reorderSession.id !== id ||
+        (!reorderSession.pending.length && reorderSession.rows !== list)) {
       const tokens = trackTokens(list);
       reorderSession = {
         id, tokens, confirmedTokens: tokens.slice(), pending: [], running: false,
@@ -390,8 +413,8 @@
     const session = reorderSession;
     const rows = list.slice();
     move(rows, actualFrom, actualTo);
-    showOrder(rows);
     move(session.tokens, actualFrom, actualTo);
+    showOrder(rows);
     session.pending.push({
       from: actualFrom,
       to: actualTo,
@@ -408,7 +431,7 @@
     if (!list) return;
     untrack(() => {
       const session = reorderSession;
-      if (!session?.pending.length || !activeReorder(session)) return;
+      if (!session?.pending.length || !activeReorder(session) || session.rows === list) return;
       const incoming = trackTokens(list);
       if (incoming.length !== session.tokens.length ||
         incoming.every((token, index) => token === session.tokens[index])) return;
@@ -638,19 +661,14 @@
    * The view knows the source playlist; the engine only receives track URIs and
    * cannot infer which followed playlist they came from.
    */
-  function markPlayed() {
-    if (!pl) return;
-    promotePlaylist(pl.id, { played: true });
-    api.touchPlaylist(pl.id).catch(() => {});
-  }
-
   function playQueue(queue, index, options = undefined) {
-    // Do not promote or persist a failed play. This keeps `last_played`
-    // exclusive to actual playback, rather than an attempted command.
-    // `options` is only ever `{ automaticStart: true }` from the header;
-    // a clicked row passes nothing and plays exactly what was clicked.
-    return api.playQueue(queue, index, `playlist:${pl?.id ?? ""}`, options).then(() => {
-      markPlayed();
+    const sourceId = pl?.id;
+    const epoch = sessionEpoch();
+    // Navigation cannot retarget a successful play; an account change fences it.
+    return api.playQueue(queue, index, `playlist:${sourceId ?? ""}`, options).then(() => {
+      if (!sourceId || epoch !== sessionEpoch()) return;
+      promotePlaylist(sourceId, { played: true });
+      api.touchPlaylist(sourceId).catch(() => {});
     });
   }
 
@@ -665,22 +683,63 @@
 
   const playingThis = $derived(isPlayingSource(`playlist:${pl?.id ?? ""}`));
 
-  /* ---------------- Skips ----------------
-     The playlist's local skip preference arrives on the browse payload as
-     `excluded_track_ids`. It is the one part of that payload edited in place —
-     TrackList patches the array optimistically when a row menu toggles — and
-     the payload is a raw snapshot (see `detail`), where an edit would reach no
-     reader. So the live list is this page's own deep copy, seeded from each
-     snapshot that brings a new one; a reorder carries the old array over and
-     so keeps a toggle still in flight. TrackList patches THIS array, so this
-     Set, the marks on screen and the header's idea of where to begin move
-     together with no refetch. */
+  /* Snapshot replacement starts with authoritative skips and overlays only
+     this playlist/account owner's unsettled intents. The post-command refresh
+     is authoritative, including a later change made elsewhere. */
   const excludedSnapshot = $derived(pl?.excluded_track_ids ?? null);
-  let excludedTrackIds = $state(null);
+  const pendingSkips = new SvelteMap();
+  let skipOwner = null;
   $effect.pre(() => {
-    const ids = excludedSnapshot;
-    excludedTrackIds = ids ? [...ids] : null;
+    const id = pl?.id;
+    const epoch = sessionEpoch();
+    if (skipOwner?.id === id && skipOwner?.epoch === epoch) return;
+    skipOwner = { id, epoch };
+    pendingSkips.clear();
   });
+  const excludedTrackIds = $derived.by(() => {
+    const ids = excludedSnapshot;
+    if (!ids) return null;
+    const live = new Set(ids.map(String));
+    for (const [id, intent] of pendingSkips) {
+      if (intent.acknowledged && ids !== intent.snapshot) continue;
+      if (intent.exclude) live.add(id);
+      else live.delete(id);
+    }
+    return [...live];
+  });
+  $effect(() => {
+    const snapshot = excludedSnapshot;
+    for (const [id, intent] of pendingSkips) {
+      if (intent.acknowledged && snapshot !== intent.snapshot) pendingSkips.delete(id);
+    }
+  });
+  function setTrackExcluded(id, exclude) {
+    const owner = skipOwner;
+    if (!owner?.id || owner.id !== pl?.id || owner.epoch !== sessionEpoch()) return Promise.resolve();
+    const previous = pendingSkips.get(id)?.promise;
+    const intent = { exclude, acknowledged: false, snapshot: null, promise: null };
+    const currentOwner = () => skipOwner === owner && owner.id === pl?.id && owner.epoch === sessionEpoch();
+    pendingSkips.set(id, intent);
+    intent.promise = (async () => {
+      // Preserve write order for repeated intents without retaining an old
+      // optimistic array. Only the latest operation owns reconciliation.
+      if (previous) await previous.catch(() => {});
+      // Navigation does not revoke an already chosen source-playlist intent.
+      // An account transition does, before a queued native write is dispatched.
+      if (owner.epoch !== sessionEpoch()) return;
+      try {
+        await api.setPlaylistTrackExcluded(owner.id, id, exclude);
+        if (!currentOwner() || pendingSkips.get(id) !== intent) return;
+        const snapshot = excludedSnapshot;
+        if ((snapshot ?? []).map(String).includes(id) === exclude) pendingSkips.delete(id);
+        else pendingSkips.set(id, { ...intent, acknowledged: true, snapshot });
+      } catch (reason) {
+        if (currentOwner() && pendingSkips.get(id) === intent) pendingSkips.delete(id);
+        throw reason;
+      }
+    })();
+    return intent.promise;
+  }
 
   const skippedSet = $derived.by(
     () => new Set((excludedTrackIds ?? []).map(String)),
@@ -963,6 +1022,7 @@
       <div style="margin-top:var(--s6)">
         <TrackList
           tracks={sortedTracks}
+          occurrenceKeys={sortedTrackKeys}
           {playFrom}
           playlistId={editable ? pl.id : null}
           queueContext={`playlist:${pl?.id ?? ""}`}
@@ -971,6 +1031,7 @@
           sortDirection={sortState.direction}
           onSort={toggleSort}
           excludedTrackIds={excludedTrackIds}
+          onSetExcluded={setTrackExcluded}
           onReorder={editable && ownOrderShown && !reorderBlocked ? reorderTracks : null}
         />
       </div>

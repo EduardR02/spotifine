@@ -454,8 +454,7 @@ void main() {
   outColor = vec4(floor(v.r * 255.0 + noiseAt(i, uKey)), floor(v.g * 255.0 + noiseAt(i + 1, uKey)), floor(v.b * 255.0 + noiseAt(i + 2, uKey)), 255.0) / 255.0;
 }`;
 
-/** Every fragment shader, whole: for the programs, and for the test that
-    holds them to TUNING. */
+/** Complete fragment shaders with the shared TUNING definitions. */
 export function shaderSources() {
   const head = `#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n${defines()}\n${COMMON}`;
   return Object.fromEntries(Object.entries(PASSES).map(([name, body]) => [name, head + body]));

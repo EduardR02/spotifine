@@ -76,6 +76,33 @@
   let curFirst = 0;
   let curLast = 0;
   let resetFrame = 0;
+  let focusedKey = $state(null);
+  function entryKey(entry, index) {
+    return JSON.stringify([entry.started_at, entry.track_id ?? entry.track.uri, entry.context, index]);
+  }
+  // Only loaded pages participate; retaining focus never fetches the archive.
+  const focusedRow = $derived.by(() => {
+    if (focusedKey === null) return -1;
+    for (const [page, entries] of Object.entries(pages)) {
+      const offset = entries.findIndex((entry, offset) => entryKey(entry, Number(page) * PAGE + offset) === focusedKey);
+      if (offset >= 0) return Number(page) * PAGE + offset;
+    }
+    return -1;
+  });
+  const renderedIndices = $derived.by(() => {
+    const indices = [];
+    if (focusedRow >= 0 && focusedRow < firstRow) indices.push(focusedRow);
+    for (let index = firstRow; index < lastRow; index++) indices.push(index);
+    if (focusedRow >= lastRow) indices.push(focusedRow);
+    return indices;
+  });
+  function retainRowFocus(event) {
+    const row = event.target.closest("[data-history-key]");
+    if (row) focusedKey = row.dataset.historyKey;
+  }
+  function releaseRowFocus(event) {
+    if (!bodyEl?.contains(event.relatedTarget)) focusedKey = null;
+  }
   let debounceTimer = 0;
 
   /* ONE day formatter, used by the row that opens a day and by the running day
@@ -243,7 +270,7 @@
    */
   const visible = $derived.by(() => {
     const out = [];
-    for (let index = firstRow; index < lastRow; index += 1) {
+    for (const index of renderedIndices) {
       const entry = entryAt(index);
       const previous = entryAt(index - 1);
       const opensDay =
@@ -292,6 +319,7 @@
       const changed = loaded && page.recorded !== recorded;
       if (changed) {
         generation += 1;
+        focusedKey = null;
         inflight.clear();
         pages = {};
       }
@@ -325,6 +353,7 @@
   /** Starts the list over: a new filter or order is a different list. */
   function reload() {
     generation += 1;
+    focusedKey = null;
     inflight.clear();
     committedQuery = query.trim();
     committedSort = sort;
@@ -636,16 +665,19 @@
     <div
       class="history-list"
       bind:this={bodyEl}
+      onfocusin={retainRowFocus}
+      onfocusout={releaseRowFocus}
       style="position: relative; overflow-anchor: none"
       style:height="{Math.max(loaded ? total : 10, 1) * ROW_H}px"
     >
-      <div style="position: absolute; inset: 0 0 auto" style:transform="translateY({firstRow * ROW_H}px)">
+      <div style="position: absolute; inset: 0 0 auto">
         {#if !loaded}
           {#each Array.from({ length: 12 }) as _, i (i)}
             {@render placeholder(i)}
           {/each}
         {:else}
-          {#each visible as row (row.index)}
+          {#each visible as row (row.entry ? entryKey(row.entry, row.index) : `pending:${row.index}`)}
+            <div style="position: absolute; left: 0; right: 0" style:top="{row.index * ROW_H}px">
             {#if !row.entry}
               <!-- A row inside the window whose page is still in flight. Same
                    height, same columns: a page landing never moves anything
@@ -654,6 +686,7 @@
             {:else}
               <div
                 class="hi-row"
+                data-history-key={entryKey(row.entry, row.index)}
                 class:opens-day={row.opensDay}
                 class:heads-list={row.headsList}
                 class:repeat={row.repeat}
@@ -693,6 +726,7 @@
                 </button>
               </div>
             {/if}
+            </div>
           {/each}
         {/if}
       </div>

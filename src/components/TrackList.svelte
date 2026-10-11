@@ -1,5 +1,5 @@
 <script>
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import {
     api,
     navigate,
@@ -13,6 +13,8 @@
     ui,
     openTrackEditor,
     isCached,
+    session,
+    sessionEpoch,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
@@ -29,19 +31,16 @@
 
   let {
     tracks = [],
+    occurrenceKeys = null,
     playFrom,
     showAlbum = true,
     showArt = true,
     /** Off for short embedded lists (search), where column heads are noise. */
     showHead = true,
     playlistId = null,
-    /**
-     * The playlist's live skip list, passed BY REFERENCE from the detail
-     * store. Its presence alone turns the feature on: only a real playlist
-     * table has rows that can be skipped, so search results, albums and
-     * recommendation footers never grow a mark or a menu item.
-     */
+    /** The page-owned live skip projection and mutation callback. */
     excludedTrackIds = null,
+    onSetExcluded = null,
     /** Compact source context copied onto tracks added to the queue. */
     queueContext = null,
     /** Playlist tables may give the added date its own column. */
@@ -73,16 +72,11 @@
   /* =====================================================================
      PLAYLIST SKIPS
 
-     A per-playlist listening preference stored beside the track-edit data:
-     skipped rows keep their colour, their click and their play glyph, and
-     lose nothing but their place in AUTOMATIC playback — the header starts
-     elsewhere and Next/Previous/repeat/shuffle walk around them. Everything
-     here reads one shared array; nothing copies it.
-
-     `skippedIds` is rebuilt whenever the shared array mutates, which is how
-     an optimistic row-menu edit lights every mark in one frame without a
-     refetch — and how sort/filter/windowing stay correct for free, since the
-     class binds to the TRACK's id, never to its position.
+     A per-playlist listening preference stored beside the track-edit data.
+     Skipped rows keep their colour, click and play glyph.
+     The page owns pending intents and overlays them on its latest snapshot.
+     Every row and the header read that same live projection, so a background
+     refresh cannot erase an unacknowledged menu edit.
      ===================================================================== */
   const skipsTracked = $derived(!!playlistId && Array.isArray(excludedTrackIds));
   const skippedIds = $derived.by(
@@ -150,12 +144,21 @@
   });
 
   $effect(() => {
-    if (!zoneEl || !onReorder) return;
-    // `meta` reads live props at drag time, so lengths and handlers stay
-    // fresh without re-registering on every tracks mutation.
+    if (!zoneEl) return;
+    // A table/list revision replaces gesture ownership. Window recycling does
+    // not: individual row DOM can disappear while its owner remains valid.
+    queueSource;
+    playlistId;
+    session.username;
+    sortKey;
+    sortDirection;
+    tracks;
+    occurrenceKeys;
     return registerReorderZone(zoneEl, () => ({
       length: tracks.length,
-      canReorder: true,
+      source: `${queueSource}\u0000${playlistId ?? ""}\u0000${sessionEpoch()}`,
+      canReorder: !!onReorder,
+      indexOf: occurrenceIndex,
       run: onReorder,
     }));
   });
@@ -167,10 +170,15 @@
     const row = event.target.closest(".tl-row");
     if (!row) return;
     const index = Number(row.dataset.i);
+    if (row.dataset.rowKey !== rowKeys[index]) return;
     if (!tracks[index]?.uri?.startsWith("spotify:track:")) return;
     pressTrack({
       event,
       rowEl: row,
+      ownerEl: zoneEl,
+      source: `${queueSource}\u0000${playlistId ?? ""}\u0000${sessionEpoch()}`,
+      occurrence: rowKeys[index],
+      multiplicity: keyMultiplicity(rowKeys[index]),
       index,
       track: tracks[index],
       playlistId: playlistId ?? null,
@@ -313,7 +321,7 @@
      `maxH` is part of the position, not decoration: see openRowMenu. */
   const menu = $state({
     open: false, x: 0, top: null, bottom: null, maxH: 0,
-    track: null, index: -1, copyState: "idle", generation: 0,
+    track: null, index: -1, copyState: "idle", generation: 0, epoch: -1,
     editDefined: false, editEnabled: false, editLoading: false, editError: "",
     skipPending: false, skipError: "", anchor: null, liked: null, likeBusy: false,
   });
@@ -323,19 +331,22 @@
      the identity checks behind every async answer compare against this. */
   let menuRow = null;
   let menuEl = $state(null);
-  const picker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, track: null });
+  const picker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, track: null, trigger: null });
   /* Same shape and same placement rules as the playlist picker — a second
 
      surface hanging off one row of the menu, rather than N rows inside it. */
-  const artistPicker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, artists: [] });
+  const artistPicker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, artists: [], trigger: null });
   let menuTracks;
   let menuPlaylistId;
+  let menuSession;
   $effect(() => {
     const nextTracks = tracks;
     const nextPlaylistId = playlistId;
-    if (nextTracks === menuTracks && nextPlaylistId === menuPlaylistId) return;
+    const nextSession = session.username;
+    if (nextTracks === menuTracks && nextPlaylistId === menuPlaylistId && nextSession === menuSession) return;
     menuTracks = nextTracks;
     menuPlaylistId = nextPlaylistId;
+    menuSession = nextSession;
     if (menu.open || picker.open || artistPicker.open) untrack(closeMenus);
   });
 
@@ -445,6 +456,7 @@
     return (
       menu.open &&
       menu.generation === generation &&
+      menu.epoch === sessionEpoch() &&
       playlistId === sourcePlaylist &&
       menuRow === track &&
       menu.index === index &&
@@ -471,6 +483,7 @@
     menu.bottom = placed.bottom;
     menu.maxH = placed.maxH;
     menu.track = track;
+    menu.epoch = sessionEpoch();
     menuRow = track;
     menu.index = i;
     menu.copyState = "idle";
@@ -558,43 +571,20 @@
     }
   }
 
-  /**
-   * The row-menu half of the skip preference.
-   *
-   * Optimistic on purpose: the shared id array is patched FIRST, so the mark
-   * on the row, the sr-only text and the header's next start row all move in
-   * the same frame as the click. A confirmed command closes the menu through
-   * the usual path — the mark appearing on the row is the acknowledgement,
-   * the same way every other fire-and-forget item dismisses. A refused
-   * command puts the id back exactly where the edit took it from and says so
-   * inside the still-open menu — the store is the truth, and the list follows
-   * it, never the reverse. The item stays disabled while the command is in
-   * flight, which makes the preference read as deliberate rather than
-   * spammable.
-   */
+  /** Mutation ownership lives in PlaylistView, not a captured exclusions array. */
   async function toggleRowSkip() {
     const track = menuRow;
-    if (!skipsTracked || !track?.id || !playlistId || menu.skipPending) return;
+    if (!skipsTracked || !onSetExcluded || !track?.id || !playlistId || menu.skipPending) return;
     const id = String(track.id);
     const generation = menu.generation;
     const sourcePlaylist = playlistId;
-    const sourceExcluded = excludedTrackIds;
     const index = menu.index;
     const exclude = !skippedIds.has(id);
-    const setPresent = (present) => {
-      const at = sourceExcluded.findIndex((value) => String(value) === id);
-      if (present ? at === -1 : at !== -1) {
-        if (present) sourceExcluded.push(id);
-        else sourceExcluded.splice(at, 1);
-      }
-    };
     menu.skipPending = true;
     menu.skipError = "";
-    setPresent(exclude);
     try {
-      await api.setPlaylistTrackExcluded(sourcePlaylist, id, exclude);
+      await onSetExcluded(id, exclude);
     } catch (reason) {
-      setPresent(!exclude);
       if (menuTargetCurrent(generation, sourcePlaylist, track, index)) {
         menu.skipError = String(reason || "Could not update this playlist.");
       }
@@ -612,6 +602,7 @@
        position that was computed for a much shorter list. */
     const placed = placePopover(e.currentTarget.getBoundingClientRect(), 60 * 6);
     picker.open = true;
+    picker.trigger = e.currentTarget;
     picker.track = menu.track;
     picker.x = Math.max(8, menu.x - SUBMENU_OFFSET);
     picker.top = placed.top;
@@ -628,6 +619,7 @@
     }
     const placed = placePopover(e.currentTarget.getBoundingClientRect(), 40 * menuArtists.length);
     artistPicker.open = true;
+    artistPicker.trigger = e.currentTarget;
     artistPicker.artists = menuArtists;
     artistPicker.x = Math.max(8, menu.x - SUBMENU_OFFSET);
     artistPicker.top = placed.top;
@@ -719,8 +711,8 @@
   }
 
   /* ---------------- Windowed rendering ----------------
-     Long page-level lists keep a fixed-height body and keyed rows positioned
-     at their absolute indexes. Overlapping rows retain their Cover subtree
+     Long page-level lists keep a fixed-height body and occurrence-keyed rows
+     positioned at their absolute indexes. Overlapping rows retain their Cover subtree
      when the window slides. A focused row stays mounted outside the window,
      so a scroll never discards the keyboard's anchor. The shared pane owns
      the scroll offset, not this component. */
@@ -751,23 +743,95 @@
   let seenPlaylistId = null;
   let seenLength = -1;
 
-  let focusedRow = $state(-1);
+  // Keys are computed on list changes, never on scroll. URI plus insertion
+  // identity distinguishes duplicate playlist occurrences across snapshots.
+  const rowKeys = $derived.by(() => {
+    if (occurrenceKeys) return occurrenceKeys;
+    const counts = new Map();
+    return tracks.map((track) => {
+      const identity = `${track.uri ?? track.id}\u0000${track.added_at ?? ""}`;
+      const occurrence = counts.get(identity) ?? 0;
+      counts.set(identity, occurrence + 1);
+      return `${identity}\u0000${occurrence}`;
+    });
+  });
+  const rowIdentity = $derived.by(() => {
+    const indices = new Map();
+    const counts = new Map();
+    for (let i = 0; i < rowKeys.length; i++) {
+      const key = rowKeys[i];
+      indices.set(key, i);
+      const base = key.slice(0, key.lastIndexOf("\u0000"));
+      counts.set(base, (counts.get(base) ?? 0) + 1);
+    }
+    return { indices, counts };
+  });
+  function keyMultiplicity(key) {
+    return rowIdentity.counts.get(key.slice(0, key.lastIndexOf("\u0000"))) ?? 0;
+  }
+  function occurrenceIndex(key, multiplicity) {
+    if (multiplicity !== undefined && keyMultiplicity(key) !== multiplicity) return -1;
+    return rowIdentity.indices.get(key) ?? -1;
+  }
+  let focusedKey = $state(null);
+  let focusedMultiplicity = $state(0);
+  let focusedTrack = null;
+  // Exact duplicates on a fresh snapshot have no provable correspondence.
+  // Known local MOVs keep both this row object and its carried occurrence key.
+  const focusedRow = $derived(focusedKey === null ? -1 : occurrenceIndex(focusedKey, focusedMultiplicity));
   const renderedIndices = $derived.by(() => {
     const indices = [];
     if (focusedRow >= 0 && focusedRow < firstRow && focusedRow < tracks.length) indices.push(focusedRow);
     for (let i = firstRow; i < lastRow; i++) indices.push(i);
     if (focusedRow >= lastRow && focusedRow < tracks.length) indices.push(focusedRow);
+    if (menu.open && tracks[menu.index] === menuRow && !indices.includes(menu.index)) {
+      indices.push(menu.index);
+    }
     return indices;
   });
   const visible = $derived(disableWindowing ? tracks : renderedIndices.map((i) => tracks[i]));
 
   function retainRowFocus(event) {
     const row = event.target.closest(".tl-row");
-    if (row) focusedRow = Number(row.dataset.i);
+    if (row) {
+      focusedKey = row.dataset.rowKey;
+      focusedMultiplicity = keyMultiplicity(focusedKey);
+      focusedTrack = tracks[Number(row.dataset.i)];
+    }
   }
 
+  let focusOwner = null;
+  $effect.pre(() => {
+    const owner = `${queueSource}\u0000${playlistId ?? ""}\u0000${session.username ?? ""}`;
+    if (owner === focusOwner) return;
+    focusOwner = owner;
+    untrack(() => {
+      if (zoneEl?.contains(document.activeElement)) document.activeElement.blur();
+      focusedKey = null;
+    });
+  });
+  $effect.pre(() => {
+    rowKeys;
+    const owner = focusOwner;
+    const body = zoneEl;
+    const active = untrack(() => document.activeElement);
+    if (!body?.contains(active)) return;
+    if (untrack(() => focusedKey !== null && (
+      focusedRow < 0 || (focusedMultiplicity > 1 && tracks[focusedRow] !== focusedTrack)
+    ))) {
+      active.blur();
+      focusedKey = null;
+      return;
+    }
+    // Moving an existing keyed node can temporarily drop browser focus.
+    tick().then(() => {
+      if (owner === focusOwner && active.isConnected && document.activeElement === document.body) {
+        active.focus({ preventScroll: true });
+      }
+    });
+  });
   function releaseRowFocus(event) {
-    if (!bodyEl?.contains(event.relatedTarget)) focusedRow = -1;
+    if (event.relatedTarget && !bodyEl?.contains(event.relatedTarget)) focusedKey = null;
   }
 
   $effect(() => watchPersonal());
@@ -885,7 +949,7 @@
 </script>
 
 {#snippet trackRows(items, start, indices = null)}
-  {#each items as track, k (indices ? indices[k] : start + k)}
+  {#each items as track, k (rowKeys[indices ? indices[k] : start + k])}
     {@const i = indices ? indices[k] : start + k}
     <div
       class="tl-row"
@@ -894,6 +958,7 @@
       class:skipped={rowSkipped(track)}
       class:drag-source={rowIsSource(i)}
       data-i={i}
+      data-row-key={rowKeys[i]}
       style:transform={rowDragTransform(i)}
       style:position={indices ? "absolute" : null}
       style:top={indices ? `${i * ROW_H}px` : null}
@@ -1253,7 +1318,7 @@
 {/if}
 
 {#if picker.open}
-  <Menu class="track-submenu submenu" placement={picker} returnTo={menu.anchor} group label="Add to playlist" onclose={() => (picker.open = false)}>
+  <Menu class="track-submenu submenu" placement={picker} returnTo={picker.trigger} group label="Add to playlist" onclose={() => (picker.open = false)}>
     <div class="menu-scroll" use:scrollbar style:max-height="{picker.maxH}px">
       {#each library as pl (pl.id)}
         <button class="menu-item" title={pl.name} onclick={() => addToPlaylist(pl)}><span class="menu-label">{pl.name}</span></button>
@@ -1263,7 +1328,7 @@
 {/if}
 
 {#if artistPicker.open}
-  <Menu class="track-submenu submenu" placement={artistPicker} returnTo={menu.anchor} group label="Go to artist" onclose={() => (artistPicker.open = false)}>
+  <Menu class="track-submenu submenu" placement={artistPicker} returnTo={artistPicker.trigger} group label="Go to artist" onclose={() => (artistPicker.open = false)}>
     <div class="menu-scroll" use:scrollbar style:max-height="{artistPicker.maxH}px">
     {#each artistPicker.artists as artist (artist.id)}
       <button

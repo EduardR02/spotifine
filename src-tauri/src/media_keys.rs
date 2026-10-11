@@ -46,8 +46,18 @@ enum Update {
 struct Transport {
     playing: bool,
     position_ms: u32,
-    /// The rate audio is reaching the output at.
+    /// Playhead clock rate; Windows freezes buffering without changing intent.
     rate: f32,
+}
+
+impl Transport {
+    fn from_state(state: &PlaybackState) -> Self {
+        Self {
+            playing: state.playing,
+            position_ms: state.position_ms,
+            rate: if cfg!(windows) && state.buffering { 0.0 } else { state.audible_playback_speed },
+        }
+    }
 }
 
 /// How far a reported playhead may sit from where the OS has extrapolated it
@@ -61,11 +71,9 @@ struct Published {
     at: Instant,
 }
 
-/// Windows runs a playing timeline forward on its own, at the published
-/// rate, so the timeline is republished only on a real change: play or
-/// pause, a rate change, a new item, or a playhead that left the
-/// extrapolation (a seek, a skip, a loop, a stall). A full state that changed
-/// something else — a queue edit, a download mark — costs the OS nothing.
+/// Publish transport changes against the declared playhead clock, separately
+/// from command intent. Heartbeats do not publish OS state; full states carry
+/// seeks, skips, buffering boundaries and speed changes.
 fn timeline_changed(published: Option<&Published>, next: Transport, item_changed: bool, now: Instant) -> bool {
     let Some(published) = published else { return true };
     let last = published.transport;
@@ -78,6 +86,47 @@ fn timeline_changed(published: Option<&Published>, next: Transport, item_changed
         f64::from(last.position_ms)
     };
     (f64::from(next.position_ms) - expected).abs() > TIMELINE_TOLERANCE_MS
+}
+
+/// Rate and timeline are independent OS calls: a successful timeline must not
+/// suppress retrying a failed rate. A confirmed rate change also reanchors the
+/// position so recovery from a rate failure starts from the current playhead.
+fn publish_transport<R, T>(
+    previous: &mut Option<Published>,
+    confirmed_rate: &mut Option<f32>,
+    next: Transport,
+    item_changed: bool,
+    now: Instant,
+    set_rate: impl FnOnce(f32) -> Result<(), R>,
+    set_timeline: impl FnOnce(MediaPlayback) -> Result<(), T>,
+) -> (Result<(), R>, Result<(), T>) {
+    let mut rate_changed = false;
+    let rate_result = if *confirmed_rate != Some(next.rate) {
+        let result = set_rate(next.rate);
+        if result.is_ok() {
+            *confirmed_rate = Some(next.rate);
+            rate_changed = true;
+        }
+        result
+    } else { Ok(()) };
+    let timeline_result = if timeline_changed(previous.as_ref(), next, item_changed || rate_changed, now) {
+        let result = set_timeline(transport(next.playing, next.position_ms));
+        *previous = result.is_ok().then_some(Published { transport: next, at: now });
+        result
+    } else { Ok(()) };
+    (rate_result, timeline_result)
+}
+
+fn publish_stopped<E>(
+    metadata: &mut Option<Metadata>,
+    timeline: &mut Option<Published>,
+    rate: &mut Option<f32>,
+    publish: impl FnOnce(MediaPlayback) -> Result<(), E>,
+) -> Result<(), E> {
+    *metadata = None;
+    *timeline = None;
+    *rate = None;
+    publish(MediaPlayback::Stopped)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -197,6 +246,7 @@ fn run_controls(
     // Position heartbeats never reach this thread: the OS runs the timeline.
     let mut last_metadata = None;
     let mut last_transport: Option<Published> = None;
+    let mut confirmed_rate = None;
     for update in receiver {
         let result = match update {
             Update::State {
@@ -216,27 +266,24 @@ fn run_controls(
                     log::warn(&format!("could not update media metadata: {error:?}"));
                 }
                 let now = Instant::now();
-                if timeline_changed(last_transport.as_ref(), next, item_changed, now) {
-                    #[cfg(windows)]
-                    if last_transport.as_ref().is_none_or(|published| published.transport.rate != next.rate) {
-                        if let Err(error) = set_windows_playback_rate(
-                            hwnd.expect("Windows media controls require a window"), next.rate)
-                        {
-                            log::warn(&format!("could not update the media playback rate: {error}"));
-                        }
-                    }
-                    let result = controls.set_playback(transport(next.playing, next.position_ms));
-                    // A failed publication is retried by the next full state.
-                    last_transport = result.is_ok().then_some(Published { transport: next, at: now });
-                    result
-                } else {
-                    Ok(())
+                let (rate_result, timeline_result) = publish_transport(
+                    &mut last_transport, &mut confirmed_rate, next, item_changed, now,
+                    |rate| {
+                        #[cfg(windows)]
+                        { set_windows_playback_rate(hwnd.expect("Windows media controls require a window"), rate) }
+                        #[cfg(not(windows))]
+                        { let _ = rate; Ok::<_, ()>(()) }
+                    },
+                    |playback| controls.set_playback(playback),
+                );
+                if let Err(error) = rate_result {
+                    log::warn(&format!("could not update the media playback rate: {error:?}"));
                 }
+                timeline_result
             }
             Update::Stopped => {
-                PLAYING.store(false, Ordering::Relaxed);
-                last_metadata = None;
-                last_transport = None;
+                // The producer owns current intent. A queued stop is historical
+                // and must never overwrite a newer playing state.
                 #[cfg(windows)]
                 if let Some(hwnd) = hwnd {
                     if let Err(error) = clear_windows_metadata(hwnd) {
@@ -247,7 +294,8 @@ fn run_controls(
                 if let Err(error) = controls.set_metadata(MediaMetadata::default()) {
                     log::warn(&format!("could not clear media metadata: {error:?}"));
                 }
-                controls.set_playback(MediaPlayback::Stopped)
+                publish_stopped(&mut last_metadata, &mut last_transport, &mut confirmed_rate,
+                    |playback| controls.set_playback(playback))
             }
         };
         if let Err(error) = result {
@@ -343,9 +391,8 @@ fn windows_controls(
     unsafe { interop.GetForWindow(HWND(hwnd as isize)) }
 }
 
-/// The rate Windows runs the published timeline forward at. Souvlaki leaves
-/// it at 1.0, which would let the flyout drift at any other speed once the
-/// timeline is no longer republished every heartbeat.
+/// Publish the declared progress rate independently of Playing/Paused intent.
+/// Buffering declares a held playhead (zero); resuming restores audible speed.
 #[cfg(windows)]
 fn set_windows_playback_rate(hwnd: usize, rate: f32) -> windows::core::Result<()> {
     windows_controls(hwnd)?.SetPlaybackRate(f64::from(rate))
@@ -382,24 +429,18 @@ fn clear_windows_metadata(hwnd: usize) -> windows::core::Result<()> {
 /// Mirrors one full engine state into the media session. Cheap: a channel
 /// send; the owning thread deduplicates metadata against the previous track.
 pub fn update_state(state: &PlaybackState) {
-    PLAYING.store(state.playing, Ordering::Relaxed);
+    let track = state.current_index.and_then(|index| state.queue.get(index));
+    record_intent(&PLAYING, state.playing, track.is_some());
     POSITION_MS.store(state.position_ms as u64, Ordering::Relaxed);
-    let Some(sender) = UPDATES.get() else {
-        return;
-    };
-    let Some(track) = state.current_index.and_then(|index| state.queue.get(index)) else {
-        DURATION_MS.store(0, Ordering::Relaxed);
+    let duration_ms = track.map_or(0, |track| track_duration(state.duration_ms, track.duration_ms));
+    DURATION_MS.store(duration_ms as u64, Ordering::Relaxed);
+    let Some(sender) = UPDATES.get() else { return; };
+    let Some(track) = track else {
         let _ = sender.send(Update::Stopped);
         return;
     };
-    let duration_ms = track_duration(state.duration_ms, track.duration_ms);
-    DURATION_MS.store(duration_ms as u64, Ordering::Relaxed);
     let _ = sender.send(Update::State {
-        transport: Transport {
-            playing: state.playing,
-            position_ms: state.position_ms,
-            rate: state.audible_playback_speed,
-        },
+        transport: Transport::from_state(state),
         metadata: Metadata {
             duration_ms,
             title: track.name.clone(),
@@ -427,6 +468,11 @@ pub fn update_disconnected() {
     }
 }
 
+/// Only producers update current intent; draining historical OS updates does not.
+fn record_intent(playing: &AtomicBool, intent: bool, playable: bool) {
+    playing.store(intent && playable, Ordering::Relaxed);
+}
+
 fn track_duration(compiled_ms: u32, source_ms: u32) -> u32 {
     if compiled_ms > 0 { compiled_ms } else { source_ms }
 }
@@ -434,6 +480,89 @@ fn track_duration(compiled_ms: u32, source_ms: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_rate_retries_independently_of_successful_timeline_and_then_deduplicates() {
+        let now = Instant::now();
+        let next = Transport { playing: true, position_ms: 12_000, rate: 1.5 };
+        let mut timeline = None;
+        let mut rate = None;
+        let mut positions = Vec::new();
+        let (rate_result, timeline_result) = publish_transport(&mut timeline, &mut rate, next, false, now,
+            |_| Err("rate rejected"), |playback| { positions.push(playback); Ok::<_, ()>(()) });
+        assert!(rate_result.is_err());
+        assert!(timeline_result.is_ok());
+        assert_eq!(timeline.as_ref().unwrap().transport, next);
+        assert_eq!(rate, None);
+        let mut rates = Vec::new();
+        let (rate_result, timeline_result) = publish_transport(&mut timeline, &mut rate, next, false, now,
+            |value| { rates.push(value); Ok::<_, ()>(()) },
+            |playback| { positions.push(playback); Ok::<_, ()>(()) });
+        assert!(rate_result.is_ok() && timeline_result.is_ok());
+        assert_eq!(rate, Some(1.5));
+        let (a, b) = publish_transport(&mut timeline, &mut rate, next, false, now,
+            |value| { rates.push(value); Ok::<_, ()>(()) },
+            |playback| { positions.push(playback); Ok::<_, ()>(()) });
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(rates, [1.5]);
+        assert_eq!(positions.len(), 2);
+        let changed = Transport { position_ms: 50_000, rate: 2.0, ..next };
+        let (_, result) = publish_transport(&mut timeline, &mut rate, changed, false, now,
+            |_| Ok::<_, ()>(()), |_| Err("timeline rejected"));
+        assert!(result.is_err());
+        assert_eq!(rate, Some(2.0));
+        assert!(timeline.is_none());
+        let (_, result) = publish_transport(&mut timeline, &mut rate, changed, false, now,
+            |_| -> Result<(), ()> { panic!("confirmed rate must not be retried") }, |_| Ok::<_, ()>(()));
+        assert!(result.is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn buffering_holds_progress_without_changing_play_intent_and_restores_audible_speed() {
+        let now = Instant::now();
+        let mut timeline = None;
+        let mut rate = None;
+        let mut rates = Vec::new();
+        let mut playback = Vec::new();
+        let mut state = PlaybackState { playing: true, position_ms: 10_000,
+            audible_playback_speed: 1.5, ..Default::default() };
+        for (buffering, position_ms, elapsed) in [
+            (false, 10_000, 0), (true, 10_000, 0), (true, 10_000, 60),
+            (false, 10_000, 60), (false, 13_000, 62),
+        ] {
+            state.buffering = buffering;
+            state.position_ms = position_ms;
+            let (a, b) = publish_transport(&mut timeline, &mut rate, Transport::from_state(&state), false,
+                now + Duration::from_secs(elapsed),
+                |value| { rates.push(value); Ok::<_, ()>(()) },
+                |value| { playback.push(value); Ok::<_, ()>(()) });
+            assert!(a.is_ok() && b.is_ok());
+        }
+        assert_eq!(rates, [1.5, 0.0, 1.5]);
+        assert_eq!(playback.len(), 3, "held and resumed clocks need no heartbeat publications");
+        assert!(playback.iter().all(|value| matches!(value, MediaPlayback::Playing { .. })),
+            "buffering cannot turn the user's playing intent into Pause/Resume");
+    }
+
+    #[test]
+    fn draining_old_stop_does_not_overwrite_newer_producer_toggle_intent() {
+        let playing = AtomicBool::new(false);
+        let mut metadata = None;
+        let mut timeline = None;
+        let mut rate = Some(1.0);
+        record_intent(&playing, false, false);
+        record_intent(&playing, true, true);
+        let mut stopped = false;
+        publish_stopped(&mut metadata, &mut timeline, &mut rate, |value| {
+            stopped = matches!(value, MediaPlayback::Stopped);
+            Ok::<_, ()>(())
+        }).unwrap();
+        assert!(stopped);
+        assert!(playing.load(Ordering::Relaxed), "Toggle still derives Pause from the newest producer");
+        record_intent(&playing, true, false);
+        assert!(!playing.load(Ordering::Relaxed), "a no-playable boundary stops intent synchronously");
+    }
 
     #[test]
     fn media_metadata_publishes_preview_duration_restore_and_same_song_refresh_only_when_changed() {
@@ -484,7 +613,7 @@ mod tests {
         let song = || Metadata { duration_ms: 10, title: "Song".into(),
             artist: String::new(), album: String::new(), cover: String::new() };
         let mut previous = None;
-        assert_eq!(publish_metadata(&mut previous, song(), |_| Err("OS unavailable")), Err("OS unavailable"));
+        assert!(publish_metadata(&mut previous, song(), |_| Err("OS unavailable")).is_err());
         let mut calls = 0;
         publish_metadata(&mut previous, song(), |_| { calls += 1; Ok::<_, ()>(()) }).unwrap();
         publish_metadata(&mut previous, song(), |_| { calls += 1; Ok::<_, ()>(()) }).unwrap();

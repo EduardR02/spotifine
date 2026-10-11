@@ -1,5 +1,6 @@
 <script>
-  import { playback, api, navigate, togglePlay, ui } from "../lib/state.svelte.js";
+  import { tick, untrack } from "svelte";
+  import { playback, api, navigate, togglePlay, ui, session } from "../lib/state.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import ArtistLinks from "../components/ArtistLinks.svelte";
@@ -52,7 +53,8 @@
 
   /* ---------------- Windowed rendering ----------------
      Same scheme as TrackList: a fixed-height body preserves the queue's full
-     geometry while an absolute-index-keyed window is translated through it.
+     geometry while an occurrence-keyed window moves through it. One focused
+     offscreen occurrence is retained without expanding the visible range.
      Sliding by one row retains every overlapping row/Cover subtree and only
      removes and adds the boundary rows. The scroller is an ancestor (.scroll
      in App.svelte), not this component, so the offset has to be read from it
@@ -88,7 +90,75 @@
   let seenQueue = null;
   let seenLength = -1;
 
-  const visible = $derived(rows.slice(firstRow, lastRow));
+  const queueIdentity = $derived.by(() => {
+    const counts = new Map();
+    const keys = queue.map((track) => {
+      const identity = JSON.stringify([track.uri, track.added_at ?? null, track.context ?? ""]);
+      const occurrence = counts.get(identity) ?? 0;
+      counts.set(identity, occurrence + 1);
+      return `${identity}:${occurrence}`;
+    });
+    return { keys, counts };
+  });
+  const queueKeys = $derived(queueIdentity.keys);
+  function keyMultiplicity(key) {
+    return queueIdentity.counts.get(key.slice(0, key.lastIndexOf(":"))) ?? 0;
+  }
+  let focusedKey = $state(null);
+  let focusedMultiplicity = $state(0);
+  let focusedTrack = null;
+  // Native queue snapshots do not carry occurrence IDs. If an exact duplicate
+  // is replaced, discard its focus rather than trusting a regenerated ordinal.
+  const focusedRow = $derived(
+    focusedKey === null || keyMultiplicity(focusedKey) !== focusedMultiplicity
+      ? -1 : rows.findIndex((qi) => queueKeys[qi] === focusedKey),
+  );
+  const visible = $derived.by(() => {
+    const positions = [];
+    if (focusedRow >= 0 && focusedRow < firstRow) positions.push(focusedRow);
+    for (let k = firstRow; k < lastRow; k++) positions.push(k);
+    if (focusedRow >= lastRow) positions.push(focusedRow);
+    return positions;
+  });
+  function retainRowFocus(event) {
+    const row = event.target.closest("[data-queue-key]");
+    if (row) {
+      focusedKey = row.dataset.queueKey;
+      focusedMultiplicity = keyMultiplicity(focusedKey);
+      const index = queueKeys.indexOf(focusedKey);
+      focusedTrack = queue[index];
+    }
+  }
+  function releaseRowFocus(event) {
+    if (event.relatedTarget && !bodyEl?.contains(event.relatedTarget)) focusedKey = null;
+  }
+  let focusOwner = null;
+  $effect.pre(() => {
+    const owner = `${playback.context ?? ""}\u0000${playback.output_device_id ?? ""}\u0000${session.username ?? ""}`;
+    if (owner === focusOwner) return;
+    focusOwner = owner;
+    untrack(() => {
+      if (bodyEl?.contains(document.activeElement)) document.activeElement.blur();
+      focusedKey = null;
+    });
+  });
+  $effect.pre(() => {
+    queueKeys;
+    rows;
+    const owner = focusOwner;
+    const active = untrack(() => document.activeElement);
+    if (!bodyEl?.contains(active)) return;
+    if (untrack(() => focusedKey !== null && (
+      focusedRow < 0 || (focusedMultiplicity > 1 && queue[rows[focusedRow]] !== focusedTrack)
+    ))) {
+      active.blur();
+      focusedKey = null;
+      return;
+    }
+    tick().then(() => {
+      if (owner === focusOwner && active.isConnected && document.activeElement === document.body) active.focus({ preventScroll: true });
+    });
+  });
 
   function measure(scroller) {
     if (!bodyEl || !scroller) return;
@@ -241,19 +311,21 @@
         bind:this={bodyEl}
         style="overflow-anchor: none; position: relative"
         style:height="{rows.length * ROW_H}px"
+        onfocusin={retainRowFocus}
+        onfocusout={releaseRowFocus}
       >
         <div
           style="position: absolute; inset: 0 0 auto"
-          style:transform="translateY({firstRow * ROW_H}px)"
         >
-          <!-- Absolute-index keys retain all overlapping rows when the window
-               slides. `k` is the display position; `qi` is the queue index
-               every action below is addressed by. -->
-          {#each visible as qi, j (firstRow + j)}
-            {@const k = firstRow + j}
+          <!-- Keep one focused occurrence outside the bounded visible range. -->
+          {#each visible as k (queueKeys[rows[k]])}
+            {@const qi = rows[k]}
             {@const track = queue[qi]}
             <div
               class="tl-row"
+              data-queue-key={queueKeys[qi]}
+              style="position: absolute; left: 0; right: 0"
+              style:top="{k * ROW_H}px"
               class:current={k === 0}
               class:unavailable={track.unavailable}
               role="button"

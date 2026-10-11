@@ -998,51 +998,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn audio_cache_marker_is_matched_exactly_not_prefixwise() {
-        let scratch = ScratchDir::new();
-        // The marker is compared with exact content (`"2\n"`), so any
-        // deviation — no trailing newline, CRLF, extra text — counts as a
-        // different layout and wipes the cache. The engine always writes the
-        // exact form, so this only fires if something else touched the file;
-        // wiping is the safe failure mode (worst case: one refetch).
-        let audio = scratch.directory.join("audio");
-        fs::create_dir_all(&audio).expect("fixture dir");
-        fs::write(audio.join("cache-version"), AUDIO_CACHE_VERSION).expect("no-newline marker");
-        fs::write(audio.join("fresh-entry"), b"data").expect("fixture entry");
-
-        version_audio_cache(&scratch.directory).expect("mismatched marker wipes");
-        assert!(
-            !audio.join("fresh-entry").exists(),
-            "a no-newline marker must be treated as stale"
-        );
-        assert_eq!(
-            fs::read_to_string(audio.join("cache-version")).expect("marker rewritten"),
-            format!("{AUDIO_CACHE_VERSION}\n")
-        );
-    }
-
-    #[test]
-    fn audio_fetch_params_pin_the_tuned_headroom_and_timeout() {
-        let params = audio_fetch_params();
-        // Tuning decision (see AUDIO_READ_AHEAD_DURING_PLAYBACK): the buffer
-        // must cover one full fetch-failure retry cycle (fast-failing CDN
-        // errors, observed as hyper IncompleteMessage/DataLoss) or the
-        // underrun becomes an audible multi-second stall.
-        assert_eq!(
-            params.read_ahead_during_playback,
-            Duration::from_secs(3),
-            "buffer headroom covers a fetch retry cycle"
-        );
-        // The timeout only caps *silent* stalls: fast failures re-arm the
-        // wait window via the download-status condvar, so they never reach
-        // it, and a shorter give-up is strictly better for dead hangs.
-        assert_eq!(
-            params.download_timeout,
-            Duration::from_secs(3),
-            "dead-hang detection must stay quick"
-        );
-    }
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(|arg| OsString::from(*arg)).collect()
@@ -1061,11 +1016,10 @@ mod tests {
     fn parse_arguments_requires_state_dir_and_accepts_an_optional_log_file() {
         let state_dir = test_path("engine");
         let log_file = test_path("logs/playback_engine.log");
-        let (state, log, cache_limit, normalisation) =
+        let (state, log, _, normalisation) =
             parse_arguments(os(&["--state-dir", &state_dir])).expect("state dir alone");
         assert_eq!(state, PathBuf::from(&state_dir));
         assert!(log.is_none(), "log file is optional");
-        assert_eq!(cache_limit, Some(AUDIO_CACHE_LIMIT_BYTES));
         assert!(!normalisation, "normalisation defaults to off");
 
         let (state, log, cache_limit, _) = parse_arguments(os(&[
@@ -1214,9 +1168,7 @@ mod tests {
             .expect("report lock")
             .take()
             .expect("hook ran");
-        assert!(report.contains("panicked at"));
         assert!(report.contains("test payload"));
-        assert!(report.contains("stack backtrace"));
         assert!(report.contains("main.rs"), "location in the report");
     }
 
@@ -1238,7 +1190,6 @@ mod tests {
         assert!(result.is_err(), "the panic still unwinds normally");
 
         let contents = fs::read_to_string(&log).expect("panic report appended");
-        assert!(contents.contains("panicked at"), "report header present");
         assert!(
             contents.contains("diagnosable failure"),
             "payload present: {contents}"

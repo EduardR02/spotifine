@@ -56,14 +56,17 @@ export const railDrag = $state({ active: false, item: null, target: undefined })
 const zones = new Set();
 
 /**
- * Registers a TrackList body as a reorder target; returns the unregister
- * function. `meta()` is read lazily at drag time so the registry never holds
- * stale lengths or handlers.
+ * Registers a TrackList body as a gesture owner and optional reorder target.
+ * Unregistering cancels that owner's press/drag, not an individual recycled
+ * row. `meta()` supplies live source, occurrence lookup, length and handler.
  */
 export function registerReorderZone(el, meta) {
   const zone = { el, meta };
   zones.add(zone);
-  return () => zones.delete(zone);
+  return () => {
+    zones.delete(zone);
+    if (press?.kind === "track" && press.ctx.ownerEl === el) endDrag(false);
+  };
 }
 
 /**
@@ -109,7 +112,7 @@ let scrollers = []; // scrollable elements resolved once per drag
  * A row was pressed. Nothing visible happens until the pointer travels past
  * the threshold; press-and-release stays the no-op click it always was.
  *
- * ctx: { event, rowEl, index, track, playlistId }
+ * ctx: { event, rowEl, ownerEl, source, occurrence, multiplicity, index, track, playlistId }
  *   `playlistId` present => move semantics (owned playlist source).
  */
 export function pressTrack(ctx) {
@@ -350,16 +353,18 @@ function bandPenetration(distance) {
  * the drop cancels. Shared by the rAF loop and by endDrag — the pointer can
  * come up before the loop's first pass, and the drop must still resolve.
  */
-function hitTest(x, y) {
+function hitTest(x, y, held = press) {
   let zoneEl = null;
   let slot = -1;
   for (const z of zones) {
-    if (!z.el.isConnected) continue;
+    if (!z.el.isConnected || z.el !== held?.ctx.ownerEl) continue;
     const r = z.el.getBoundingClientRect();
     if (x < r.left || x > r.right || y < r.top || y >= r.bottom) continue;
     const meta = z.meta();
-    if (meta.canReorder && meta.length > 0) {
-      const from = trackDrag.sourceIndex;
+    if (meta.source !== held.ctx.source) continue;
+    const from = meta.indexOf(held.ctx.occurrence, held.ctx.multiplicity);
+    if (meta.canReorder && meta.length > 0 && from >= 0) {
+      trackDrag.sourceIndex = from;
       const last = meta.length - 1;
       const raw = Math.round((y - r.top) / ROW_H);
       if (raw <= from) {
@@ -467,11 +472,19 @@ function endDrag(commit) {
   const wasActive = d.active;
   let outcome = "cancel";
 
-  if (commit && wasActive) {
+  let source = null;
+  if (p) for (const zone of zones) {
+    if (zone.el === p.ctx.ownerEl && zone.el.isConnected &&
+        zone.meta().source === p.ctx.source) {
+      source = zone;
+      break;
+    }
+  }
+  if (commit && wasActive && source && source.meta().indexOf(p.ctx.occurrence, p.ctx.multiplicity) >= 0) {
     /* The last pointermove may still be waiting for its frame when the pointer
        comes up. Resolve at the final coordinates rather than using the
        previous frame's target. */
-    const hit = hitTest(pointerX, pointerY);
+    const hit = hitTest(pointerX, pointerY, p);
     d.listEl = hit.zoneEl;
     d.slot = hit.slot;
     p.dropRow = hit.dropRow;
@@ -481,13 +494,13 @@ function endDrag(commit) {
         if (z.el === d.listEl) { matched = z; break; }
       }
     }
-    if (matched) {
+    if (matched && matched === source) {
       const meta = matched.meta();
-      const from = d.sourceIndex;
+      const from = meta.indexOf(p.ctx.occurrence, p.ctx.multiplicity);
       /* `slot` is already the FINAL index — bar, parting preview and this
          call all derive from it; no coordinate conversion left. */
       const to = d.slot;
-      if (to !== from && to >= 0) {
+      if (meta.canReorder && from >= 0 && to !== from && to >= 0 && to < meta.length) {
         meta.run(from, to);
         outcome = "reorder";
       }

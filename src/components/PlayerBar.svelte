@@ -6,6 +6,7 @@
     togglePlay,
     navigate,
     positionMs,
+    playbackIdentity,
     ui,
     setNowPlayingOpen,
     nowSaved,
@@ -411,15 +412,18 @@
         if (!savedFocus) savedHushed = false;
       }, 120);
     };
-    const focusIn = () => {
+    // Native focus events can fire synchronously while Svelte removes a
+    // focused saved-panel branch. They own focus state, not the rendering
+    // reaction that happened to trigger the browser event.
+    const focusIn = () => untrack(() => {
       if (!savedFocus && !savedHover) placeSaved();
       savedFocus = true;
-    };
-    const focusOut = (event) => {
+    });
+    const focusOut = (event) => untrack(() => {
       if (group.contains(event.relatedTarget)) return;
       savedFocus = false;
       if (!savedHover) savedHushed = false;
-    };
+    });
     const key = (event) => {
       if (event.key !== "Escape" || !savedOpen) return;
       event.preventDefault();
@@ -848,12 +852,14 @@
             label="Seek"
             step={5000}
             formatValue={formatTime}
+            gestureKey={playbackIdentity}
             onCommit={(v) => {
               dragPos = null;
               api.seek(v).catch(() => {});
             }}
             onDragStart={(v) => (dragPos = v)}
             onDragChange={(v) => (dragPos = v)}
+            onDragCancel={() => (dragPos = null)}
           />
           {#if effectiveEdit}
             <span class="p-seek-markers" aria-hidden="true">

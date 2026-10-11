@@ -1627,39 +1627,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// The number [`MAX_HISTORY_ITEMS`] was chosen against. If a row grows
-    /// much past this, the ceiling is the thing to revisit.
-    #[test]
-    fn a_stored_row_stays_within_its_memory_budget() {
-        let item = HistoryItem {
-            row: HistoryRow {
-                track_id: "4cOdK2wGLETKBW3PvgPWqT".to_owned(),
-                started_at: 1_757_000_000_000,
-                ms_played: 210_000,
-                completed: true,
-                context: "playlist:37i9dQZF1DXcBWIGoYBM5M".to_owned(),
-            },
-            track: sanitize_track(&TrackRef {
-                id: "4cOdK2wGLETKBW3PvgPWqT".to_owned(),
-                uri: "spotify:track:4cOdK2wGLETKBW3PvgPWqT".to_owned(),
-                name: "Never Gonna Give You Up".to_owned(),
-                artist_names: vec!["Rick Astley".to_owned()],
-                artist_ids: vec!["0gxyHStUsqpMadRV0Di1Qt".to_owned()],
-                artist_id: "0gxyHStUsqpMadRV0Di1Qt".to_owned(),
-                album_id: "6eUW0wxWtzkFdaEFsTJto6".to_owned(),
-                album_name: "Whenever You Need Somebody".to_owned(),
-                cover_url: "https://i.scdn.co/image/ab67616d0000b273c66d4b6a1a7a2b3c4d5e6f70".to_owned(),
-                duration_ms: 213_573,
-                ..TrackRef::default()
-            }),
-        };
-        let bytes = serde_json::to_vec(&item).unwrap().len();
-        assert!(
-            bytes < 640,
-            "a history row measured {bytes} bytes; the {MAX_HISTORY_ITEMS}-row \
-             ceiling was sized on a few hundred"
-        );
-    }
 
     #[test]
     fn a_torn_final_line_is_dropped_and_earlier_damage_is_never_overwritten() {

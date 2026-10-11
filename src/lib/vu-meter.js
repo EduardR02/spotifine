@@ -4,12 +4,11 @@
    owner's screen) even with stepped keyframes; explicit ticks bound that work.
 
    Each meter is a canvas handed over to an OffscreenCanvas, which this clock
-   draws into. Its frames reach the display compositor on their own, so a tick
-   costs the meter's 14×13 px and nothing of the page around it: no style,
-   paint or layerization of the document and no new frame of its layers. Bars
-   that were page elements moved by a transform made Chromium run the page's
-   lifecycle and re-plan all of its layers on every tick, which cost more than
-   the meter itself.
+   draws into. That confines the meter's raster drawing to its 14×13 CSS px
+   backing store rather than changing page elements on each tick. Presenting
+   those frames still requires independent browser composition work; this is
+   not a guarantee that the surrounding document's lifecycle or layers do no
+   work.
 
    A bar is drawn as the compositor drew the scaled bar element: one unscaled
    bar, rasterized the way CSS rasterizes a rounded box (an SVG rect), then
@@ -127,7 +126,7 @@ export function createMeterTicker(clock = realClock) {
   };
 }
 
-/** The unscaled bar at `dpr`, once per colour and ratio for the session. */
+/** The unscaled bar at `dpr`, cached per colour and ratio after a successful load. */
 const sprites = new Map();
 function spriteFor(color, dpr) {
   const key = `${color} ${dpr}`;
@@ -138,7 +137,16 @@ function spriteFor(color, dpr) {
       `viewBox="0 0 ${BAR_W} ${H}" preserveAspectRatio="none"><rect width="${BAR_W}" height="${H}" rx="1" fill="${color}"/></svg>`;
     const img = new Image();
     img.src = `data:image/svg+xml,${encodeURIComponent(svg)}`;
-    sprite.ready = img.decode().then(() => createImageBitmap(img)).then((bitmap) => (sprite.bitmap = bitmap));
+    sprite.ready = Promise.resolve()
+      .then(() => img.decode())
+      .then(() => createImageBitmap(img))
+      .then((bitmap) => (sprite.bitmap = bitmap))
+      .catch(() => {
+        // A failed load belongs to this attempt, not to every future mount.
+        // Keep the rejection handled even if all waiting meters were removed.
+        if (sprites.get(key) === sprite) sprites.delete(key);
+        return null;
+      });
     sprites.set(key, sprite);
   }
   return sprite;
@@ -162,7 +170,7 @@ function fit(meter) {
   meter.sprite = sprite.bitmap;
   if (!sprite.bitmap) {
     sprite.ready.then(() => {
-      if (meters.get(meter.node) !== meter || meter.want !== sprite) return;
+      if (meters.get(meter.node) !== meter || meter.want !== sprite || !sprite.bitmap) return;
       meter.sprite = sprite.bitmap;
       draw(meter, meter.shown);
     });

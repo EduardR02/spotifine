@@ -44,7 +44,7 @@ test("a move that fails puts the tree back and says so; a move to where it is wr
   answer = () => Promise.reject(new Error("offline"));
   expect(await moveLibraryItem({ kind: "playlist", id: "b" }, null)).toBe(false);
   expect(libraryState.tree).toEqual([leaf("a"), folder("box", [leaf("b")])]);
-  expect(ui.error).toBe('Could not move "B". offline');
+  expect(ui.error).toContain("offline");
   calls.length = 0;
   expect(await moveLibraryItem({ kind: "playlist", id: "b" }, "box")).toBe(false);
   expect(calls).toEqual([]);

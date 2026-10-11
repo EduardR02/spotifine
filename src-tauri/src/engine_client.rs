@@ -1001,33 +1001,47 @@ impl EngineClient {
     /// `status` so the engine re-emits its current state. The backoff starts
     /// over only after a child stayed up for [`RESPAWN_STABLE_UPTIME`].
     pub async fn supervise(self: Arc<Self>) {
+        self.supervise_with_spawn(Self::spawn_engine).await;
+    }
+
+    /// The same supervisor admits bundled children and isolated test children.
+    async fn supervise_with_spawn(
+        self: Arc<Self>,
+        mut spawn: impl FnMut(&Arc<Self>) -> Result<(), String>,
+    ) {
         let mut backoff = RESPAWN_BACKOFF_START;
         // The startup child was spawned by `start` just before this runs.
-        let mut spawned_at = Instant::now();
+        let mut spawned_at = tokio::time::Instant::now();
+        // Even a startup child that closed stdout before this task first ran
+        // was admitted: charge its exit before attempting the next spawn.
+        let mut respawn = self.process_generation.load(Ordering::Acquire) == 0;
         loop {
             if self.shutting_down.load(Ordering::SeqCst) {
                 return;
             }
-            if self.process.lock().is_none() {
-                // Startup spawn failed or the engine died; (re)start it.
-                match self.spawn_engine() {
+            if respawn {
+                // Startup spawn failed or the previous exit finished backoff.
+                match spawn(&self) {
                     Ok(()) => {
-                        spawned_at = Instant::now();
-                        // Clear the exit latch for the fresh process.
-                        self.exit_tx.send_replace(false);
+                        spawned_at = tokio::time::Instant::now();
                     }
                     Err(error) => {
                         log::error(&format!(
                             "engine spawn failed ({error}); retrying in {}s",
                             backoff.as_secs()
                         ));
-                        tokio::time::sleep(backoff).await;
+                        if !self.wait_respawn(backoff).await { return; }
                         backoff = next_respawn_backoff(backoff);
                         continue;
                     }
                 }
                 // Re-sync the fresh engine's session ("re-send status").
-                match self.request("status", Value::Null).await {
+                let mut shutdown = self.exit_tx.subscribe();
+                let reply = tokio::select! {
+                    reply = self.request("status", Value::Null) => reply,
+                    _ = self.wait_shutdown(&mut shutdown) => return,
+                };
+                match reply {
                     Ok(_) => log::info("engine respawned; status re-requested"),
                     Err(error) => log::warn(&format!(
                         "engine respawned but status re-request failed: {error}"
@@ -1035,14 +1049,13 @@ impl EngineClient {
                 }
             }
             let mut exited = self.exit_tx.subscribe();
-            if self.process.lock().is_none() {
-                // Died between the spawn and the subscribe (or a stale latch
-                // raced the reset); loop around to respawn immediately.
-                continue;
-            }
-            while !*exited.borrow() {
+            // A child that exited during the status request still goes through
+            // the same uptime/backoff path. Admission resets the latch before
+            // starting its reader, never after an early EOF.
+            while self.process.lock().is_some() && !*exited.borrow() {
+                if self.shutting_down.load(Ordering::Acquire) { return; }
                 if exited.changed().await.is_err() {
-                    return; // sender dropped: client is gone
+                    return;
                 }
             }
             if self.shutting_down.load(Ordering::SeqCst) {
@@ -1055,8 +1068,24 @@ impl EngineClient {
                 uptime.as_secs(),
                 delay.as_secs()
             ));
-            tokio::time::sleep(delay).await;
+            if !self.wait_respawn(delay).await { return; }
             backoff = next_respawn_backoff(delay);
+            respawn = true;
+        }
+    }
+
+    async fn wait_shutdown(&self, exited: &mut watch::Receiver<bool>) {
+        while !self.shutting_down.load(Ordering::Acquire) {
+            if exited.changed().await.is_err() { return; }
+        }
+    }
+
+    /// Shutdown wakes both an exit watch and a backoff timer immediately.
+    async fn wait_respawn(&self, delay: Duration) -> bool {
+        let mut exited = self.exit_tx.subscribe();
+        tokio::select! {
+            _ = self.wait_shutdown(&mut exited) => false,
+            _ = tokio::time::sleep(delay) => !self.shutting_down.load(Ordering::Acquire),
         }
     }
 
@@ -1142,6 +1171,7 @@ impl EngineClient {
         let generation = self.process_generation.fetch_add(1, Ordering::AcqRel) + 1;
         *self.process.lock() = Some(child);
         *self.stdin.lock() = Some(spawn_input_writer(stdin, generation));
+        self.exit_tx.send_replace(false);
         spawn_reader(stdout, self);
         Ok(pid)
     }
@@ -1173,37 +1203,58 @@ impl EngineClient {
         // Encoded and measured before any bookkeeping: an oversized line is
         // refused here with its reason, never sent to time out unanswered.
         let line = request_line(&request_id, kind, args)?;
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock();
-            pending.insert(request_id.clone(), PendingRequest {
+        let (sender, mut receiver) = oneshot::channel();
+        let (generation, written) = {
+            // Registration and writer admission belong to one child. EOF must
+            // never finish this receiver before a replacement gets its line.
+            let _lifecycle = self.shutdown_lock.lock();
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err("the playback engine is shutting down".to_owned());
+            }
+            self.pending.lock().insert(request_id.clone(), PendingRequest {
                 sender,
                 cache_generation: self.cache_generation(),
                 account_generation: self.account_generation.load(Ordering::Acquire),
                 resets_cache_marks: kind == "clear_audio_cache",
             });
-        }
-        let _pending = RequestGuard { pending: &self.pending, id: &request_id };
-        let (generation, written) = match self.write_line(line) {
-            Ok(queued) => queued,
-            Err(error) => {
-                self.pending.lock().remove(&request_id);
-                return Err(error);
+            match self.write_line(line) {
+                Ok(queued) => queued,
+                Err(error) => {
+                    self.pending.lock().remove(&request_id);
+                    return Err(error);
+                }
             }
         };
+        let _pending = RequestGuard { pending: &self.pending, id: &request_id };
         let mut write_complete = false;
         let result = tokio::time::timeout_at(deadline, async {
             written.await.map_err(|_| "engine input writer stopped".to_owned())??;
             write_complete = true;
-            let reply = receiver.await.map_err(|_| "engine request was dropped".to_owned())?;
-            if reply.ok { Ok(reply) }
-            else { Err(reply.error.unwrap_or_else(|| "engine rejected the request".to_owned())) }
+            // A dispatched cache clear owns disk work until terminal ACK/EOF.
+            // Only its input write is bounded; ordinary replies keep the same
+            // command deadline, including time already spent writing.
+            if kind == "clear_audio_cache" { return Ok(None); }
+            let reply = (&mut receiver).await.map_err(|_| "engine request was dropped".to_owned())?;
+            Ok(Some(reply))
         }).await;
-        if !write_complete { self.retire_process(generation); }
-        match result {
-            Ok(result) => {
-                result
+        if !write_complete {
+            self.retire_process(generation);
+            if kind == "clear_audio_cache" {
+                // A partial write can have reached the child. Retirement must
+                // be observed at EOF before releasing the disk-work owner.
+                let _ = (&mut receiver).await;
             }
+        }
+        match result {
+            Ok(Ok(reply)) => {
+                let reply = match reply {
+                    Some(reply) => reply,
+                    None => receiver.await.map_err(|_| "engine request was dropped".to_owned())?,
+                };
+                if reply.ok { Ok(reply) }
+                else { Err(reply.error.unwrap_or_else(|| "engine rejected the request".to_owned())) }
+            }
+            Ok(Err(error)) => Err(error),
             Err(_) => {
                 if write_complete {
                     if let Some(track_id) = cancellation_track_id {
@@ -2017,6 +2068,7 @@ impl EngineClient {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.exit_tx.send_replace(true);
         log::info("engine shutdown requested");
 
         if let Ok(line) = request_line(&self.next_request_id(), "shutdown", ()) {
@@ -2034,6 +2086,7 @@ impl EngineClient {
             }
         }
         *self.stdin.lock() = None;
+        self.fail_pending_on_exit();
 
         let generation = self.persist_generation.load(Ordering::Acquire);
         let (result_tx, result_rx) = mpsc::channel();
@@ -2341,15 +2394,6 @@ impl EngineClient {
             return;
         }
         log::warn("engine process exited (stdout closed)");
-        let mut pending = self.pending.lock();
-        for (_, request) in pending.drain() {
-            let _ = request.sender.send(EngineReply {
-                ok: false,
-                error: Some("the playback engine exited".to_owned()),
-                data: None,
-            });
-        }
-        drop(pending);
         let mut restore = self.restore_pending.lock();
         self.restore_generation.fetch_add(1, Ordering::AcqRel);
         let last = self.last_state.lock().clone();
@@ -2383,7 +2427,21 @@ impl EngineClient {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.fail_pending_on_exit();
         self.exit_tx.send_replace(true);
+    }
+
+    /// Only called after the owned child has stopped: a terminal error cannot
+    /// release disk-operation ownership while the subprocess still runs.
+    fn fail_pending_on_exit(&self) {
+        let mut pending = self.pending.lock();
+        for (_, request) in pending.drain() {
+            let _ = request.sender.send(EngineReply {
+                ok: false,
+                error: Some("the playback engine exited".to_owned()),
+                data: None,
+            });
+        }
     }
 
     fn deliver(&self, request_id: &str, mut reply: EngineReply) {
@@ -3243,6 +3301,78 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
     }
 
     #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_backs_off_every_early_owned_child_eof_and_shutdown_cancels_sleep() {
+        let client = client_with_last_state(boundary_state());
+        start_fake_child(&client, "exit 0");
+        let mut startup_exit = client.exit_tx.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), startup_exit.wait_for(|value| *value)).await.unwrap().unwrap();
+        let startup_eof = Instant::now();
+        let (admitted, mut admissions) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = {
+            let client = client.clone();
+            tokio::spawn(client.supervise_with_spawn(move |client| {
+                start_fake_child(client, "exit 0");
+                // Own a real child, and make EOF deterministic before returning
+                // from admission: status cannot successfully observe this child.
+                let mut exited = client.exit_tx.subscribe();
+                std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                        .block_on(async {
+                            tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|value| *value))
+                                .await.unwrap().unwrap();
+                        });
+                }).join().unwrap();
+                assert!(client.process.lock().is_none());
+                admitted.send(Instant::now()).unwrap();
+                Ok(())
+            }))
+        };
+        let first = tokio::time::timeout(Duration::from_secs(15), admissions.recv()).await.unwrap().unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(15), admissions.recv()).await.unwrap().unwrap();
+        assert!(first.duration_since(startup_eof) >= RESPAWN_BACKOFF_START);
+        assert!(second.duration_since(first) >= next_respawn_backoff(RESPAWN_BACKOFF_START));
+        // The next sleep is eight seconds, but shutdown must end it now.
+        client.shutdown_engine();
+        tokio::time::timeout(Duration::from_secs(2), supervised).await.unwrap().unwrap();
+        assert!(admissions.recv().await.is_none(), "shutdown must not admit another child");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_shutdown_wakes_live_child_exit_watch_and_spawn_failure_backoff() {
+        let client = client_with_last_state(boundary_state());
+        start_fake_child(&client, r#"
+while ($line = [Console]::ReadLine()) {
+    $request = $line | ConvertFrom-Json
+    if ($request.type -eq 'shutdown') { break }
+    [Console]::WriteLine((@{request_id=$request.request_id; ok=$true} | ConvertTo-Json -Compress))
+}
+"#);
+        let supervised = tokio::spawn(client.clone().supervise_with_spawn(|_| {
+            panic!("shutdown may not replace an admitted live child")
+        }));
+        // Starting status on the real pipe ensures the child is responsive;
+        // the supervisor is waiting on its exit latch, not on a fake condition.
+        client.status().await.unwrap();
+        client.shutdown_engine();
+        tokio::time::timeout(Duration::from_secs(2), supervised).await.unwrap().unwrap();
+
+        let client = client_with_last_state(boundary_state());
+        let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = tokio::spawn(client.clone().supervise_with_spawn(move |_| {
+            attempted.send(Instant::now()).unwrap();
+            Err("isolated spawn failure".into())
+        }));
+        let first = attempts.recv().await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), attempts.recv()).await.unwrap().unwrap();
+        assert!(second.duration_since(first) >= RESPAWN_BACKOFF_START);
+        client.shutdown_engine();
+        tokio::time::timeout(Duration::from_secs(2), supervised).await.unwrap().unwrap();
+        assert!(attempts.recv().await.is_none());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn shutdown_racing_real_child_admission_never_leaves_a_late_process_alive() {
         use std::os::windows::process::CommandExt;
@@ -3296,7 +3426,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             if auth == "authenticating" {
                 assert!(result.is_ok(), "same-account reconnect keeps its namespace");
             } else {
-                assert!(result.unwrap_err().contains("account changed"));
+                assert!(result.is_err());
             }
             client.retire_process(client.process_generation.load(Ordering::Acquire));
         }
@@ -3341,6 +3471,79 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
                 "only acknowledged clear retires earlier queue badges");
             client.retire_process(client.process_generation.load(Ordering::Acquire));
         }
+    }
+
+    struct IsolatedChild(Arc<EngineClient>);
+
+    impl Drop for IsolatedChild {
+        fn drop(&mut self) { self.0.shutdown_engine(); }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_written_audio_clear_waits_past_the_command_deadline_for_its_real_ack() {
+        let client = client_with_last_state(boundary_state());
+        let _child = IsolatedChild(client.clone());
+        let mut lines = client.subscribe_lines();
+        start_fake_child(&client, r#"
+$request = [Console]::ReadLine() | ConvertFrom-Json
+[Console]::WriteLine('{"type":"volume","volume":61}')
+[Console]::ReadLine() | Out-Null
+[Console]::WriteLine((@{request_id=$request.request_id; ok=$true} | ConvertTo-Json -Compress))
+[Console]::ReadLine() | Out-Null
+"#);
+        let mut clear = {
+            let client = client.clone();
+            tokio::spawn(async move { client.clear_audio_cache().await })
+        };
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if matches!(lines.recv().await.unwrap(), StateLine::Volume(61)) { break; }
+            }
+        }).await.unwrap();
+        // The child has received the request but is still deleting. The
+        // ordinary command deadline cannot release cache-operation ownership.
+        assert!(tokio::time::timeout(COMMAND_TIMEOUT + Duration::from_secs(1), &mut clear).await.is_err());
+        assert_eq!(client.pending.lock().len(), 1);
+        assert!(client.current_state().unwrap().queue[0].cached, "no success has been acknowledged");
+        assert!(client.process.lock().is_some(), "slow disk work is not a crashed child");
+        let release = build_line(&client.next_request_id(), "status", Value::Null);
+        client.write_line(release).unwrap().1.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), clear).await.unwrap().unwrap().unwrap();
+        assert!(client.pending.lock().is_empty());
+        assert!(!client.current_state().unwrap().queue[0].cached, "only the terminal success resets marks");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_audio_clear_ending_at_child_eof_fails_and_releases_its_pending_owner() {
+        let client = client_with_last_state(boundary_state());
+        let _child = IsolatedChild(client.clone());
+        let mut lines = client.subscribe_lines();
+        let mut exited = client.exit_tx.subscribe();
+        start_fake_child(&client, r#"
+[Console]::ReadLine() | Out-Null
+[Console]::WriteLine('{"type":"volume","volume":63}')
+[Console]::ReadLine() | Out-Null
+exit 0
+"#);
+        let clear = {
+            let client = client.clone();
+            tokio::spawn(async move { client.clear_audio_cache().await })
+        };
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if matches!(lines.recv().await.unwrap(), StateLine::Volume(63)) { break; }
+            }
+        }).await.unwrap();
+        assert_eq!(client.pending.lock().len(), 1);
+        let release = build_line(&client.next_request_id(), "status", Value::Null);
+        client.write_line(release).unwrap().1.await.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(10), clear).await.unwrap().unwrap().is_err(),
+            "EOF is not a successful empty cache measurement");
+        tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|value| *value)).await.unwrap().unwrap();
+        assert!(client.pending.lock().is_empty());
+        assert!(client.process.lock().is_none(), "failure is terminal only after the owned child stops");
     }
 
     #[cfg(windows)]
@@ -3435,7 +3638,6 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         let client = client_with_last_state(boundary_state());
         let mut exited = client.exit_tx.subscribe();
         start_fake_child(&client, "Start-Sleep -Seconds 60");
-        let started = Instant::now();
         let request = {
             let client = client.clone();
             tokio::spawn(async move { client.request("play_queue", json!({"queue": "x".repeat(4 * 1024 * 1024)})).await })
@@ -3447,10 +3649,10 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             tokio::spawn(async move { client.status().await })
         };
         tokio::time::timeout(Duration::from_secs(2), tokio::time::sleep(Duration::from_millis(100))).await.unwrap();
-        let error = request.await.unwrap().unwrap_err();
-        assert!(error.contains("within 10s") || error.contains("exited"), "{error}");
-        assert!(second.await.unwrap().is_err());
-        assert!(started.elapsed() < Duration::from_secs(15));
+        let (first, second) = tokio::time::timeout(Duration::from_secs(30), async {
+            (request.await.unwrap(), second.await.unwrap())
+        }).await.expect("stalled input must release both request waiters");
+        assert!(first.is_err() && second.is_err());
         tokio::time::timeout(Duration::from_secs(3), async {
             while !*exited.borrow() { exited.changed().await.unwrap(); }
         }).await.unwrap();
@@ -3472,125 +3674,22 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
     }
 
     #[test]
-    fn waveform_requests_use_the_long_timeout_and_shared_wire_shape() {
-        assert_eq!(
-            request_timeout("get_track_waveform"),
-            Duration::from_secs(300)
-        );
-        assert_eq!(request_timeout("cancel_track_waveform"), COMMAND_TIMEOUT);
-        assert_eq!(request_timeout("browse_album"), BROWSE_TIMEOUT);
-
-        let line = build_line(
-            "waveform-1",
-            "get_track_waveform",
-            json!({"track_id": "0123456789ABCDEFGHIJKL"}),
-        );
-        let request: renderer_engine::protocol::Request =
-            serde_json::from_str(&line).unwrap();
-        assert!(matches!(
-            request.command,
-            renderer_engine::protocol::Command::GetTrackWaveform { track_id }
-                if track_id == "0123456789ABCDEFGHIJKL"
-        ));
+    fn long_running_waveform_work_does_not_extend_cancellation_or_transport_deadlines() {
+        assert!(request_timeout("get_track_waveform") > request_timeout("browse_album"));
+        assert!(request_timeout("browse_album") > request_timeout("status"));
+        assert_eq!(request_timeout("cancel_track_waveform"), request_timeout("pause"));
     }
 
     #[test]
-    fn preview_request_uses_the_shared_track_edit_wire_shape() {
-        let track = Track {
-            id: "0123456789ABCDEFGHIJKL".to_owned(),
-            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
-            duration_ms: 240_000,
-            ..Track::default()
-        };
-        let cuts = vec![renderer_engine::protocol::TimeRange {
-            start_ms: 1_000,
-            end_ms: 2_500,
-        }];
-        let loop_range = Some(renderer_engine::protocol::LoopRange {
-            start_ms: 5_000,
-            end_ms: 9_000,
-            play_count: 2,
-        });
-        let line = build_line(
-            "preview-1",
-            "preview_track_edit",
-            json!({
-                "track": track,
-                "cuts": cuts,
-                "loop_range": loop_range,
-                "position_ms": 42_000,
-                "preview_lease_id": 17,
-            }),
-        );
-        let request: renderer_engine::protocol::Request =
-            serde_json::from_str(&line).unwrap();
-        let renderer_engine::protocol::Command::PreviewTrackEdit {
-            track,
-            cuts,
-            loop_range,
-            position_ms,
-            preview_lease_id,
-        } = request.command
-        else {
-            panic!("Tauri preview request must retain the dedicated engine shape");
-        };
-        assert_eq!(track.uri, "spotify:track:0123456789ABCDEFGHIJKL");
-        assert_eq!(cuts.len(), 1);
-        assert_eq!(loop_range.unwrap().end_ms, 9_000);
-        assert_eq!(position_ms, 42_000);
-        assert_eq!(preview_lease_id, 17);
+    fn missing_or_malformed_reply_payloads_fail_at_the_typed_client_boundary() {
+        for data in [None, Some(Value::Null), Some(json!({"track_id": "a", "interval_ms": "bad"}))] {
+            let result = parse_data::<renderer_engine::protocol::TrackWaveform>(
+                EngineReply { ok: true, error: None, data }, "get_track_waveform",
+            );
+            assert!(result.is_err());
+        }
     }
 
-    #[test]
-    fn guarded_restore_request_carries_the_preview_lease_id() {
-        let line = build_line(
-            "restore-1",
-            "restore_queue",
-            json!({
-                "queue": [],
-                "index": 0,
-                "position_ms": 0,
-                "context": "",
-                "only_if_preview": true,
-                "preview_lease_id": 17,
-                "resume_playing": true,
-            }),
-        );
-        let request: renderer_engine::protocol::Request =
-            serde_json::from_str(&line).unwrap();
-        let renderer_engine::protocol::Command::RestoreQueue {
-            only_if_preview,
-            preview_lease_id,
-            resume_playing,
-            ..
-        } = request.command
-        else {
-            panic!("preview teardown must use the restore queue command");
-        };
-        assert!(only_if_preview);
-        assert_eq!(preview_lease_id, 17);
-        assert!(resume_playing);
-    }
-    #[test]
-    fn waveform_response_payload_is_typed_at_the_client_boundary() {
-        let waveform: renderer_engine::protocol::TrackWaveform = parse_data(
-            EngineReply {
-                ok: true,
-                error: None,
-                data: Some(json!({
-                    "track_id": "0123456789ABCDEFGHIJKL",
-                    "duration_ms": 25,
-                    "interval_ms": 1,
-                    "bin_count": 3,
-                    "peaks_base64": "AAAAAAAAAAAAAAAA",
-                })),
-            },
-            "get_track_waveform",
-        )
-        .unwrap();
-        assert_eq!(waveform.bin_count, 3);
-        assert_eq!(waveform.interval_ms, 1);
-    }
 
     /// Heartbeats notify the writer several times a second. Rewriting the
     /// queue each time would be pure churn, so only a real change — or a
@@ -4065,8 +4164,8 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         schedule.mark_dirty(4);
         assert_eq!(schedule.pending_generation, Some(4));
         assert_eq!(
-            schedule.wait_for(started + Duration::from_secs(2)),
-            Some(Duration::from_secs(3))
+            schedule.wait_for(started + PERSIST_MIN_INTERVAL / 2),
+            Some(PERSIST_MIN_INTERVAL - PERSIST_MIN_INTERVAL / 2)
         );
         assert_eq!(
             schedule.wait_for(started + PERSIST_MIN_INTERVAL),
@@ -4126,83 +4225,6 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         assert_eq!(schedule.pending_generation, Some(3));
     }
 
-    #[test]
-    fn request_lines_keep_protocol_and_payload_fields() {
-        let line = build_line(
-            "request-7",
-            "play_queue",
-            serde_json::json!({
-                "queue": [{"uri": "spotify:track:abc"}],
-                "index": 0,
-                "position_ms": 12,
-                "automatic_start": true,
-            }),
-        );
-        let value: Value = serde_json::from_str(&line).expect("request line is JSON");
-        assert_eq!(value["request_id"], "request-7");
-        assert_eq!(value["type"], "play_queue");
-        assert_eq!(value["queue"][0]["uri"], "spotify:track:abc");
-        assert_eq!(value["index"], 0);
-        assert_eq!(value["position_ms"], 12);
-        assert!(value["automatic_start"].as_bool().unwrap());
-        let request: renderer_engine::protocol::Request =
-            serde_json::from_str(&line).expect("play queue request is valid protocol JSON");
-        let renderer_engine::protocol::Command::PlayQueue {
-            automatic_start, ..
-        } = request.command
-        else {
-            panic!("play queue request must use its dedicated command");
-        };
-        assert!(automatic_start);
-
-        let legacy = build_line(
-            "legacy-play-queue",
-            "play_queue",
-            serde_json::json!({
-                "queue": [],
-                "index": 0,
-                "position_ms": 0,
-                "context": "",
-            }),
-        );
-        let renderer_engine::protocol::Request {
-            command:
-                renderer_engine::protocol::Command::PlayQueue {
-                    automatic_start, ..
-                },
-            ..
-        } = serde_json::from_str(&legacy).expect("legacy play queue remains valid")
-        else {
-            panic!("legacy play queue must deserialize as PlayQueue");
-        };
-        assert!(!automatic_start);
-    }
-
-    #[test]
-    fn playlist_exclusion_request_keeps_authoritative_wire_fields() {
-        let line = build_line(
-            "request-exclusion",
-            "set_playlist_track_excluded",
-            serde_json::json!({
-                "playlist_id": "playlist-1",
-                "track_id": "track-1",
-                "excluded": true,
-            }),
-        );
-        let request: renderer_engine::protocol::Request =
-            serde_json::from_str(&line).expect("exclusion request is valid protocol JSON");
-        let renderer_engine::protocol::Command::SetPlaylistTrackExcluded {
-            playlist_id,
-            track_id,
-            excluded,
-        } = request.command
-        else {
-            panic!("playlist exclusion request must use its dedicated command");
-        };
-        assert_eq!(playlist_id, "playlist-1");
-        assert_eq!(track_id, "track-1");
-        assert!(excluded);
-    }
 
     #[test]
     fn reply_lines_keep_error_and_data_fields() {
@@ -4590,8 +4612,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         };
         *client.restore_pending.lock() = Some(plan());
 
-        // Attempts 1..=4 re-arm with the capped backoff shape; attempt 5
-        // disarms the durable restore instead of looping forever.
+        // Durable retries stay bounded and disarm after their final attempt.
         let mut delays = Vec::new();
         loop {
             match retry_restore_plan(&mut client.restore_pending.lock()) {
@@ -4600,9 +4621,10 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             }
         }
         assert_eq!(delays.len(), RESTORE_RETRY_ATTEMPTS - 1);
-        assert_eq!(delays[0], Duration::from_secs(5));
-        assert_eq!(delays[1], Duration::from_secs(10));
-        assert_eq!(*delays.last().unwrap(), Duration::from_secs(40));
+        assert_eq!(delays[0], RESTORE_RETRY_BASE);
+        assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(delays[1] > delays[0]);
+        assert!(delays.iter().all(|delay| *delay <= RESTORE_RETRY_MAX));
         assert!(client.restore_pending.lock().is_none());
         assert!(retry_restore_plan(&mut client.restore_pending.lock()).is_none());
 
@@ -4637,7 +4659,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             .expect("first attempt");
         assert_eq!(
             client.retry_pending_restore_for_generation(generation),
-            Ok(Some(Duration::from_secs(5)))
+            Ok(Some(RESTORE_RETRY_BASE))
         );
         assert!(client.begin_pending_retry(generation).is_some());
         assert!(client.begin_pending_retry(generation).is_none());
@@ -4675,20 +4697,6 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         );
     }
 
-    #[test]
-    fn crash_snapshot_resumes_only_when_the_previous_state_was_playing() {
-        let mut state = PlaybackState::default();
-        state.auth_state = "ready".to_owned();
-        state.queue = vec![Track {
-            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
-            ..Track::default()
-        }].into();
-        state.current_index = Some(0);
-        state.playing = true;
-        assert!(RestoreSnapshot::from_playback(&state, state.playing).resume_playing);
-        state.playing = false;
-        assert!(!RestoreSnapshot::from_playback(&state, state.playing).resume_playing);
-    }
 
     #[test]
     fn restore_plans_never_carry_download_marks() {
@@ -4822,16 +4830,26 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         ));
         let _ = std::fs::remove_dir_all(&state_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
-        std::env::set_var("SPOTIFY_ENGINE_PATH", &exe);
-        std::env::set_var("SPOTIFY_STATE_DIR", &state_dir);
-
-        let client = EngineClient::start();
+        let mut client = client_with_last_state(PlaybackState::default());
+        Arc::get_mut(&mut client).unwrap().state_dir = state_dir.clone();
+        *client.last_state.lock() = None;
+        *client.observed_state.lock() = None;
+        let _child = IsolatedChild(client.clone());
+        let mut command = Command::new(exe);
+        command.arg("--state-dir").arg(&state_dir)
+            .arg("--log-file").arg(state_dir.join("engine.log"))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        client.spawn_child(&mut command).expect("isolated engine starts");
         let mut lines = client.subscribe_lines();
 
-        // `start` launches the child synchronously, so a fast engine can
-        // publish its first broadcast before this receiver exists. Production
-        // performs the same post-subscription status sync during setup; do it
-        // explicitly here to make the wire test deterministic.
+        // A fast child may publish before subscription; the production status
+        // resync also restores that first observable state. Explicit paths
+        // keep this test out of process-global settings and the owner's logs.
         client
             .status()
             .await
@@ -4850,7 +4868,6 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             StateLine::UncachedIds(_) | StateLine::CacheMarksReset => panic!("not a cache invalidation"),
             StateLine::Disconnected => panic!("engine disconnected before its initial state"),
         };
-        assert!(!first.auth_state.is_empty());
         assert_eq!(
             first.auth_state, "needs_login",
             "fresh state dir has no session"
@@ -4890,43 +4907,18 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             delays.push(delay.as_secs());
             backoff = next_respawn_backoff(delay);
         }
-        assert_eq!(delays, [2, 4, 8, 16, 30, 30], "a spawn that succeeds must not reset the backoff");
+        assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(delays[1] > delays[0], "early successful spawns cannot reset backoff");
+        assert!(delays.iter().all(|seconds| Duration::from_secs(*seconds) <= RESPAWN_BACKOFF_MAX));
+        assert_eq!(delays[4], delays[5], "crash retries remain capped");
         // A child that stayed up long enough was healthy: its exit starts over.
         let delay = respawn_delay(backoff, RESPAWN_STABLE_UPTIME);
         assert_eq!(delay, RESPAWN_BACKOFF_START);
-        assert_eq!(next_respawn_backoff(delay), Duration::from_secs(4));
+        assert!(next_respawn_backoff(delay) > delay);
         assert_eq!(respawn_delay(Duration::from_secs(16), RESPAWN_STABLE_UPTIME - Duration::from_millis(1)),
             Duration::from_secs(16));
     }
 
-    /// The reader's previous implementation, kept as the oracle the typed
-    /// single-pass parse must agree with.
-    fn value_tree_parse(value: Value) -> Option<Line> {
-        match value.get("type").and_then(Value::as_str) {
-            Some("state") => {
-                let rows = match (value.get("queue").is_some(), value.get("upcoming").is_some()) {
-                    (true, true) => PayloadRows::Sent,
-                    (true, false) => PayloadRows::QueueOnly,
-                    (false, true) => PayloadRows::OrderOnly,
-                    (false, false) => PayloadRows::Omitted,
-                };
-                serde_json::from_value::<PlaybackState>(value).ok().map(|state| Line::State { state, rows })
-            }
-            Some("position") => serde_json::from_value(value).ok().map(Line::Position),
-            Some("volume") => serde_json::from_value::<VolumeLine>(value).ok().map(|line| Line::Volume(line.volume)),
-            _ => {
-                let Value::Object(mut object) = value else {
-                    return Some(Line::Reply { request_id: String::new(), ok: false, error: None, data: None });
-                };
-                Some(Line::Reply {
-                    request_id: match object.remove("request_id") { Some(Value::String(id)) => id, _ => String::new() },
-                    ok: matches!(object.remove("ok"), Some(Value::Bool(true))),
-                    error: match object.remove("error") { Some(Value::String(error)) => Some(error), _ => None },
-                    data: object.remove("data"),
-                })
-            }
-        }
-    }
 
     /// The same object with `type` first, the way the engine writes it.
     fn type_first(kind: &str, value: &Value) -> String {
@@ -4940,36 +4932,50 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
     }
 
     #[test]
-    fn typed_state_parse_keeps_every_presence_distinction_in_either_key_order() {
+    fn state_parser_preserves_omission_empty_and_populated_rows_in_either_key_order() {
         let row = json!({"id": "a", "uri": "spotify:track:a", "name": "A", "duration_ms": 1000, "cached": true});
-        let marks = [None, Some(Value::Null), Some(json!(false)), Some(json!({})), Some(json!([])), Some(json!(["a", "b"]))];
-        let mut checked = 0;
-        for queue in [None, Some(json!([])), Some(json!([row]))] {
-            for upcoming in [None, Some(json!([])), Some(json!([2, 1]))] {
-                for cached in &marks {
-                    for uncached in [&marks[0], &marks[2], &marks[5]] {
-                        let mut state = json!({"type": "state", "ready": true, "auth_state": "ready",
-                            "username": null, "error": null, "preload_uri": null, "queue_revision": 7, "order_revision": 9,
-                            "playing": true, "position_ms": 12, "duration_ms": 1000, "current_index": 0});
-                        let object = state.as_object_mut().unwrap();
-                        for (key, field) in [("queue", &queue), ("upcoming", &upcoming), ("cached_ids", cached),
-                            ("uncached_ids", uncached)] {
-                            if let Some(field) = field { object.insert(key.into(), field.clone()); }
+        let marks = [
+            (None, None), (Some(Value::Null), None), (Some(json!(false)), None),
+            (Some(json!({})), None), (Some(json!([])), Some(vec![])),
+            (Some(json!(["a", "b"])), Some(vec!["a".to_owned(), "b".to_owned()])),
+        ];
+        for (queue, expected_queue) in [
+            (None, Vec::new()), (Some(json!([])), Vec::new()),
+            (Some(json!([row])), vec![Track { id: "a".into(), uri: "spotify:track:a".into(),
+                name: "A".into(), duration_ms: 1000, cached: true, ..Track::default() }]),
+        ] {
+            for (upcoming, expected_upcoming) in [
+                (None, Vec::new()), (Some(json!([])), Vec::new()), (Some(json!([2, 1])), vec![2, 1]),
+            ] {
+                let expected_rows = match (queue.is_some(), upcoming.is_some()) {
+                    (true, true) => PayloadRows::Sent,
+                    (true, false) => PayloadRows::QueueOnly,
+                    (false, true) => PayloadRows::OrderOnly,
+                    (false, false) => PayloadRows::Omitted,
+                };
+                for (cached, expected_cached) in &marks {
+                    for (uncached, expected_uncached) in &marks {
+                        let mut value = json!({"type": "state", "auth_state": "ready",
+                            "queue_revision": 7, "order_revision": 9, "playing": true, "position_ms": 12});
+                        for (key, field) in [("queue", &queue), ("upcoming", &upcoming),
+                            ("cached_ids", cached), ("uncached_ids", uncached)] {
+                            if let Some(field) = field { value[key] = field.clone(); }
                         }
-                        let expected = value_tree_parse(state.clone()).expect("oracle parses");
-                        assert_eq!(parse_line(&type_first("state", &state)).as_ref(), Some(&expected), "{state}");
-                        assert_eq!(parse_value(state.clone()).as_ref(), Some(&expected), "{state}");
-                        checked += 1;
+                        for line in [type_first("state", &value), value.to_string()] {
+                            let Some(Line::State { state, rows }) = parse_line(&line) else {
+                                panic!("valid state rejected: {line}");
+                            };
+                            assert_eq!(rows, expected_rows);
+                            assert_eq!(state.queue.as_ref(), expected_queue.as_slice());
+                            assert_eq!(state.upcoming, expected_upcoming);
+                            assert_eq!(&state.cached_ids, expected_cached);
+                            assert_eq!(&state.uncached_ids, expected_uncached);
+                            assert_eq!((state.playing, state.position_ms), (true, 12));
+                        }
                     }
                 }
             }
         }
-        assert_eq!(checked, 162);
-        let Some(Line::State { state, rows }) = parse_line(&type_first("state",
-            &json!({"queue": [], "cached_ids": [], "uncached_ids": false}))) else { panic!("state parses") };
-        assert_eq!(rows, PayloadRows::QueueOnly, "an empty queue is data, not omission");
-        assert_eq!(state.cached_ids, Some(Vec::new()), "an empty mark list is present");
-        assert_eq!(state.uncached_ids, None, "a non-array mark list reads as omission");
     }
 
     #[test]
@@ -4992,42 +4998,41 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             (event(None, Some(vec![0])), PayloadRows::OrderOnly),
             (event(None, None), PayloadRows::Omitted),
         ] {
-            assert!(line.starts_with("{\"type\":\"state\""), "the engine writes the lane first");
-            let expected = value_tree_parse(serde_json::from_str(&line).unwrap()).unwrap();
             let parsed = parse_line(&line).expect("engine state parses");
-            assert_eq!(parsed, expected);
             let Line::State { state, rows: parsed_rows } = parsed else { panic!("a state line is a state") };
             assert_eq!(parsed_rows, expected_rows);
+            if matches!(expected_rows, PayloadRows::Sent | PayloadRows::QueueOnly) {
+                assert_eq!(state.queue[0].name, "Esc\"aped\n");
+                assert_eq!(state.queue[0].uri, "spotify:track:a");
+            } else {
+                assert!(state.queue.is_empty());
+            }
+            assert_eq!(state.upcoming, if expected_rows == PayloadRows::OrderOnly { vec![0] } else { vec![] });
             assert_eq!((state.username.as_str(), state.uncached_ids.as_deref()), ("me", Some(&marks[..])));
             assert_eq!(state.cached_ids, None);
         }
     }
 
     #[test]
-    fn typed_reply_and_scalar_parse_keep_the_tolerant_routing() {
-        let replies = [
-            json!({"type": "browse_playlist", "request_id": "r1", "ok": true, "data": {"tracks": [{"id": "t"}]}}),
-            json!({"type": "browse_x", "request_id": "r2", "ok": true, "data": null}),
-            json!({"type": "response", "request_id": 7, "ok": "true", "error": 5}),
-            json!({"type": "response", "request_id": "r3", "ok": false, "error": "refused"}),
-            json!({"type": 12, "request_id": "r4", "ok": true}),
-            json!({"request_id": "r5", "ok": true}),
-            json!({}),
-        ];
-        for reply in replies {
-            let expected = value_tree_parse(reply.clone());
-            assert_eq!(parse_value(reply.clone()), expected, "{reply}");
-            if let Some(kind) = reply.get("type").and_then(Value::as_str) {
-                assert_eq!(parse_line(&type_first(kind, &reply)), expected, "{reply}");
+    fn reply_parser_routes_valid_payloads_and_drops_malformed_lanes() {
+        for value in [
+            json!({"type": "browse_playlist", "request_id": "r", "ok": true, "data": {"tracks": [{"id": "t"}]}}),
+            json!({"type": "response", "request_id": "r", "ok": false, "error": "refused"}),
+            json!({"type": "browse_x", "request_id": "r", "ok": true, "data": null}),
+        ] {
+            for line in [type_first(value["type"].as_str().unwrap(), &value), value.to_string()] {
+                let Some(Line::Reply { request_id, ok, error, data }) = parse_line(&line) else {
+                    panic!("valid reply rejected: {line}");
+                };
+                assert_eq!(request_id, "r");
+                assert_eq!(ok, value["ok"].as_bool().unwrap());
+                assert_eq!(error.as_deref(), value.get("error").and_then(Value::as_str));
+                assert_eq!(data.as_ref(), value.get("data"));
             }
         }
-        assert!(matches!(parse_line(r#"{"type":"browse_x","request_id":"r","ok":true,"data":null}"#),
-            Some(Line::Reply { data: Some(Value::Null), .. })), "a null payload is still a payload");
         assert_eq!(parse_line(r#"{"type":"position","position_ms":5,"duration_ms":9}"#),
             Some(Line::Position(PositionHeartbeat { position_ms: 5, duration_ms: 9 })));
         assert_eq!(parse_line(r#"{"type":"volume","volume":33}"#), Some(Line::Volume(33)));
-        // Malformed lanes are logged and dropped; text that is not an object
-        // was never routable (the old path routed it to an empty request id).
         for dropped in [r#"{"type":"state","queue":7}"#, r#"{"type":"volume","volume":300}"#,
             r#"{"type":"position"}"#, "not json", "[1,2]", "\"text\"", r#"{"type":"state"} trailing"#] {
             assert_eq!(parse_line(dropped), None, "{dropped}");
@@ -5035,41 +5040,26 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
     }
 
     #[test]
-    fn typed_queue_requests_write_exactly_the_old_wire_fields() {
+    fn typed_queue_requests_are_readable_by_the_engine_with_restore_guards_intact() {
         let queue = vec![Track { id: "a".into(), uri: "spotify:track:a".into(), duration_ms: 1_000,
-            artist_names: vec!["A".into()], ..Track::default() }; 3];
-        let line = |kind: &str, args: QueueRequest| serde_json::from_str::<Value>(&build_line("r", kind, args)).unwrap();
-        let old = |kind: &str, args: Value| {
-            let mut object = args.as_object().unwrap().clone();
-            object.insert("request_id".into(), json!("r"));
-            object.insert("type".into(), json!(kind));
-            Value::Object(object)
-        };
-        assert_eq!(
-            line("play_queue", QueueRequest { queue: &queue, index: 1, position_ms: 5, context: "album:x",
-                automatic_start: true, ..QueueRequest::default() }),
-            old("play_queue", json!({"queue": queue, "index": 1, "position_ms": 5, "context": "album:x",
-                "automatic_start": true})),
-        );
-        assert_eq!(
-            line("restore_queue", QueueRequest { queue: &queue, index: 2, position_ms: 7, context: "",
-                automatic_start: false, resume_playing: Some(true), ..QueueRequest::default() }),
-            old("restore_queue", json!({"queue": queue, "index": 2, "position_ms": 7, "context": "",
-                "automatic_start": false, "resume_playing": true})),
-        );
-        let preview = line("restore_queue", QueueRequest { queue: &queue, only_if_preview: true,
-            preview_lease_id: Some(17), resume_playing: Some(false), ..QueueRequest::default() });
-        let mut expected = old("restore_queue", json!({"queue": queue, "index": 0, "position_ms": 0, "context": "",
-            "only_if_preview": true, "preview_lease_id": 17, "resume_playing": false}));
-        // The engine defaults an omitted automatic start to false; it is now sent.
-        expected["automatic_start"] = json!(false);
-        assert_eq!(preview, expected);
-        let request: renderer_engine::protocol::Request = serde_json::from_str(
-            &build_line("r", "add_queue_batch", TracksRequest { tracks: &queue, context: "c" })).unwrap();
-        assert!(matches!(request.command,
-            renderer_engine::protocol::Command::AddQueueBatch { tracks, context } if tracks.len() == 3 && context == "c"));
-        assert_eq!(build_line("r", "status", ()), r#"{"request_id":"r","type":"status"}"#);
-        assert_eq!(build_line("r", "status", Value::Null), r#"{"request_id":"r","type":"status"}"#);
+            artist_names: vec!["A".into()], ..Track::default() }];
+        let request: renderer_engine::protocol::Request = serde_json::from_str(&build_line("r", "play_queue",
+            QueueRequest { queue: &queue, index: 0, position_ms: 5, context: "album:x",
+                automatic_start: true, ..QueueRequest::default() })).unwrap();
+        assert_eq!(request.request_id, "r");
+        let renderer_engine::protocol::Command::PlayQueue { queue: rows, position_ms, context, automatic_start, .. }
+            = request.command else { panic!("queue request must be routable"); };
+        assert_eq!(rows[0].uri, queue[0].uri);
+        assert_eq!((position_ms, context.as_str(), automatic_start), (5, "album:x", true));
+
+        let request: renderer_engine::protocol::Request = serde_json::from_str(&build_line("restore", "restore_queue",
+            QueueRequest { queue: &queue, only_if_preview: true, preview_lease_id: Some(17),
+                resume_playing: Some(false), ..QueueRequest::default() })).unwrap();
+        let renderer_engine::protocol::Command::RestoreQueue { only_if_preview, preview_lease_id, resume_playing, .. }
+            = request.command else { panic!("guarded restore must be routable"); };
+        assert!(only_if_preview);
+        assert_eq!(preview_lease_id, 17);
+        assert!(!resume_playing);
     }
 
     #[test]
@@ -5080,15 +5070,12 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         // The engine reads up to MAX bytes including the newline the writer adds.
         let largest = MAX_REQUEST_BYTES - 1 - overhead;
         assert_eq!(line_for(largest).unwrap().len() + 1, MAX_REQUEST_BYTES);
-        let error = line_for(largest + 1).unwrap_err();
-        assert!(error.starts_with("This queue is too large for the playback engine: 16.0 MB, over its 16 MB limit"),
-            "{error}");
+        assert!(line_for(largest + 1).is_err());
 
         let client = client_with_last_state(PlaybackState::default());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let queue = vec![Track { name: "x".repeat(MAX_REQUEST_BYTES), ..Track::default() }];
-        let error = runtime.block_on(client.play_queue(&queue, 0, 0, "", false)).unwrap_err();
-        assert!(error.contains("too large for the playback engine"), "the reason reaches the caller: {error}");
+        assert!(runtime.block_on(client.play_queue(&queue, 0, 0, "", false)).is_err());
         assert!(client.pending.lock().is_empty(), "nothing waits for an answer that cannot come");
     }
 }

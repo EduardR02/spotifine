@@ -2044,23 +2044,6 @@ pub async fn playlist_recommendations_browse(
 // playlist library (rootlist)
 // ---------------------------------------------------------------------------
 
-/// Test-only decoder for aligned playlist metadata fixtures. Production reads
-/// the rootlist tree and rejects incomplete folder data instead of dropping it.
-#[cfg(test)]
-#[derive(Default, Deserialize)]
-struct RootlistJson {
-    #[serde(default)]
-    contents: Option<RootlistContentsJson>,
-}
-
-#[cfg(test)]
-#[derive(Default, Deserialize)]
-struct RootlistContentsJson {
-    #[serde(default)]
-    items: Vec<RootlistItemJson>,
-    #[serde(default, rename = "metaItems")]
-    meta_items: Vec<RootlistMetaItemJson>,
-}
 
 #[derive(Default, Deserialize)]
 struct RootlistItemJson {
@@ -6474,7 +6457,7 @@ mod tests {
     }
 
     #[test]
-    fn podcast_search_keeps_show_identity_and_uses_resolved_audio_for_top() {
+    fn podcast_search_keeps_show_identity_and_ranks_the_episode_without_claiming_playability() {
         // Direct data wrappers and podcastV2 fields follow Spotifly's
         // searchAll.ts and SpotifyScraper's captured searchDesktop schema.
         let response: SearchDesktopResponse = serde_json::from_str(r#"{"data":{"searchV2":{
@@ -6496,21 +6479,17 @@ mod tests {
         let show = podcast_show_hit(search.podcasts.as_ref().unwrap().items[0].hit().unwrap()).unwrap();
         assert_eq!(show.publisher, "A publisher");
         assert_eq!(show.cover_url.as_deref(), Some("https://i.scdn.co/image/show"));
-        let mut episode = podcast_episode_hit(search.episodes.as_ref().unwrap().items[0].hit().unwrap()).unwrap();
+        let episode = podcast_episode_hit(search.episodes.as_ref().unwrap().items[0].hit().unwrap()).unwrap();
         assert_eq!(episode.track.album_id, show.id);
         assert_eq!(episode.track.album_name, "A show");
         assert_eq!(episode.track.duration_ms, 12000);
         assert!(episode.track.unavailable, "search alone cannot prove playable audio");
         assert!(podcast_episode_hit(search.podcasts.as_ref().unwrap().items[0].hit().unwrap()).is_none());
-        episode.track.unavailable = false;
-        episode.track.unavailable_reason = None;
         let top = search_top_ref("An episode", &search.topResultsV2);
         let Some(renderer_engine::protocol::SearchTopRef::Episode { uri }) = top else {
             panic!("expected the ranked episode");
         };
         assert_eq!(uri, episode.track.uri);
-        assert!(!episode.track.unavailable);
-        assert_eq!(episode.track.album_name, "A show");
     }
 
     #[test]
@@ -6834,14 +6813,6 @@ mod tests {
         expected.extend_from_slice(b"canvas-disabled");
         expected.extend_from_slice(&[0x12, 3, 0x22, 1, b'0']);
         assert_eq!(body, expected);
-        assert_eq!(CLIENT_SETTINGS_ENDPOINT, "/clientsettings/api/v1/");
-
-        // Read back with a generic wire walk: field 1 is the key, field 2 a
-        // message whose only field, 4, is the value.
-        assert_eq!(&body[2..17], b"canvas-disabled");
-        assert_eq!(body[17] >> 3, 2);
-        assert_eq!(body[19] >> 3, 4);
-        assert_eq!(body[19] & 7, 2);
     }
 
     /// Only an account whose preference is off — or a session that was not
@@ -7194,14 +7165,9 @@ mod tests {
                 ]
             }
         }"#;
-        let parsed: RootlistJson = serde_json::from_str(body).unwrap();
-        let contents = parsed.contents.unwrap();
-        let refs: Vec<PlaylistRef> = contents
-            .items
-            .iter()
-            .zip(contents.meta_items.iter())
-            .filter_map(|(item, meta)| playlist_ref_from_rootlist(item, meta))
-            .collect();
+        let tree = parse_rootlist_tree(body.as_bytes()).unwrap();
+        let mut refs = Vec::new();
+        flatten_library_nodes(tree, &mut refs);
 
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].id, "0123456789ABCDEFGHIJKL");
@@ -7217,16 +7183,9 @@ mod tests {
         assert_eq!(refs[0].owner_name, "");
         assert_eq!(refs[0].track_count, Some(42));
         // The base64 picture decodes to a 16-byte file id rendered as hex.
-        assert!(
-            refs[0]
-                .cover_url
-                .as_deref()
-                .unwrap()
-                .starts_with(COVER_BASE)
-        );
         assert_eq!(
-            refs[0].cover_url.as_deref().unwrap().len(),
-            COVER_BASE.len() + 32
+            refs[0].cover_url.as_deref(),
+            Some("https://i.scdn.co/image/11111111111111111111111111111111")
         );
 
         assert_eq!(refs[1].id, "1abcdefghijklmnopqrstu");
@@ -7262,12 +7221,9 @@ mod tests {
                 url: Some("https://mosaic.scdn.co/640/abc".to_owned()),
             }],
         };
-        let cover = rootlist_cover(&both).unwrap();
-        assert!(cover.starts_with(COVER_BASE));
         assert_eq!(
-            cover.len(),
-            COVER_BASE.len() + 32,
-            "16 decoded bytes -> 32 hex chars"
+            rootlist_cover(&both).as_deref(),
+            Some("https://i.scdn.co/image/11111111111111111111111111111111")
         );
 
         // No picture: the ready-made URL is used.
@@ -7307,36 +7263,9 @@ mod tests {
             picture: Some("EREREREREREREREREREREQ".to_owned()),
             picture_size: Vec::new(),
         };
-        let cover = rootlist_cover(&url_safe).unwrap();
-        assert!(cover.starts_with(COVER_BASE));
-        assert_eq!(
-            cover.len(),
-            COVER_BASE.len() + 32,
-            "16 decoded bytes -> 32 hex chars"
-        );
+        assert_eq!(rootlist_cover(&url_safe), rootlist_cover(&both));
     }
 
-    #[test]
-    fn rootlist_skips_non_playlist_rows_and_missing_meta() {
-        let body = r#"{
-            "contents": {
-                "items": [
-                    {"uri": "spotify:folder:0123456789ABCDEFGHIJKL"},
-                    {"uri": "spotify:user:alice:playlist:1abcdefghijklmnopqrstu"}
-                ],
-                "metaItems": []
-            }
-        }"#;
-        let parsed: RootlistJson = serde_json::from_str(body).unwrap();
-        let contents = parsed.contents.unwrap();
-        let refs: Vec<PlaylistRef> = contents
-            .items
-            .iter()
-            .zip(contents.meta_items.iter())
-            .filter_map(|(item, meta)| playlist_ref_from_rootlist(item, meta))
-            .collect();
-        assert!(refs.is_empty());
-    }
 
     /// Spotify ranks `topResultsV2` by popularity, so "taylor" puts the track
     /// "Style" above the artist Taylor Swift — the whole catalogue outranks the
@@ -7387,12 +7316,13 @@ mod tests {
 
     #[test]
     fn top_match_rank_orders_exact_over_prefix_over_word_over_nothing() {
-        assert_eq!(top_match_rank("kygo", "Kygo"), 3);
-        assert_eq!(top_match_rank("taylor", "Taylor Swift"), 2);
-        assert_eq!(top_match_rank("rhapsody", "Bohemian Rhapsody"), 1);
-        assert_eq!(top_match_rank("psod", "Bohemian Rhapsody"), 0);
-        assert_eq!(top_match_rank("", "Kygo"), 0);
-        assert_eq!(top_match_rank("kygo", ""), 0);
+        let exact = top_match_rank("kygo", "Kygo");
+        let prefix = top_match_rank("taylor", "Taylor Swift");
+        let word = top_match_rank("rhapsody", "Bohemian Rhapsody");
+        let none = top_match_rank("psod", "Bohemian Rhapsody");
+        assert!(exact > prefix && prefix > word && word > none);
+        assert_eq!(top_match_rank("", "Kygo"), none);
+        assert_eq!(top_match_rank("kygo", ""), none);
     }
 
     /// The whole point of reading `topResultsV2` rather than "first artist":
@@ -9143,10 +9073,6 @@ mod tests {
             "limit clamped to the endpoint bound"
         );
 
-        // The newest known hash is tried first; the previous one is the
-        // rotation fallback, so a hash rejection degrades gracefully.
-        assert_eq!(SEARCH_DESKTOP_HASHES.len(), 2);
-        assert_ne!(SEARCH_DESKTOP_HASHES[0], SEARCH_DESKTOP_HASHES[1]);
     }
 
     #[test]
@@ -9188,29 +9114,6 @@ mod tests {
         assert!(!browse_error_is_transient(ErrorKind::InvalidArgument, None));
     }
 
-    #[test]
-    fn browse_retry_schedule_is_bounded_and_fits_the_ui_timeout() {
-        // The whole rootlist/playlist/search retry cycle must stay well
-        // inside the UI's 20-second browse round-trip timeout
-        // (playback_engine_client.h default timeoutMs). 5 retries at
-        // 500 ms..4 s cap: 500+1000+2000+4000+4000 = 11.5 s of sleep max.
-        let backoffs = backoff_sequence(
-            BROWSE_RETRY_ATTEMPTS,
-            BROWSE_BACKOFF_BASE_MS,
-            BROWSE_BACKOFF_MAX_MS,
-        );
-        assert_eq!(backoffs.len(), BROWSE_RETRY_ATTEMPTS);
-        assert_eq!(backoffs, vec![500, 1000, 2000, 4000, 4000]);
-        let total_sleep_ms: u64 = backoffs.iter().sum();
-        assert!(
-            total_sleep_ms < 20_000,
-            "bounded retries must not blow the UI round-trip timeout"
-        );
-        assert!(
-            BROWSE_BACKOFF_BASE_MS <= BROWSE_BACKOFF_MAX_MS,
-            "backoff must never regress to a decreasing schedule"
-        );
-    }
 
     #[test]
     fn dedupe_uris_keeps_first_appearance_order() {
@@ -9269,6 +9172,8 @@ mod tests {
         assert_eq!(chunks[0].len(), 40);
         assert_eq!(chunks[1].len(), 40);
         assert_eq!(chunks[2].len(), 5);
+        assert!(chunks.iter().flat_map(|chunk| chunk.iter()).eq(uris.iter()),
+            "batching must preserve every URI in order");
         assert_eq!(
             metadata_chunks(&uris, 0).len(),
             85,

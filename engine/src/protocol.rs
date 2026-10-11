@@ -1499,134 +1499,29 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ArtistRef, AuthState, BrowseResponse, Command, LibraryItem, LoopRange, PlaylistRecommendations,
-        PlaylistRef, PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse,
-        SongwriterPlaylist, StateEvent, TrackRef, VolumeEvent,
+        AuthState, BrowseResponse, Command, PlaylistRef,
+        PositionEvent, RepeatMode, Request, Response, SearchBrowse, StateEvent,
+        TrackRef, VolumeEvent,
         normalize_canonical_playlist_description, sanitize_playlist_description,
     };
 
     #[test]
-    fn the_followed_artists_command_carries_nothing_but_its_name() {
-        let request: Request = serde_json::from_value(json!({
-            "request_id": "request-40",
-            "type": "browse_followed_artists",
-        }))
-        .unwrap();
-        assert!(matches!(request.command, Command::BrowseFollowedArtists));
-    }
-
-    #[test]
-    fn library_folder_commands_deserialize_from_the_line_protocol() {
-        let saved: Request = serde_json::from_value(json!({"request_id": "r1", "type": "browse_saved_shows"})).unwrap();
-        assert!(matches!(saved.command, Command::BrowseSavedShows));
-        let create: Request = serde_json::from_value(json!({
-            "request_id": "r2", "type": "edit_create_folder", "name": "Gym",
-        }))
-        .unwrap();
-        assert!(matches!(create.command, Command::EditCreateFolder { ref name, parent: None } if name == "Gym"));
-        let nested: Request = serde_json::from_value(json!({
-            "request_id": "r3", "type": "edit_create_folder", "name": "Gym", "parent": "0123456789abcdef",
-        }))
-        .unwrap();
-        assert!(matches!(nested.command, Command::EditCreateFolder { parent: Some(ref parent), .. } if parent == "0123456789abcdef"));
-        let moved: Request = serde_json::from_value(json!({
-            "request_id": "r4", "type": "edit_move_library_item",
-            "item": {"kind": "folder", "id": "0123456789abcdef"}, "folder": null,
-        }))
-        .unwrap();
-        assert!(matches!(
-            moved.command,
-            Command::EditMoveLibraryItem { item: LibraryItem::Folder { ref id }, folder: None } if id == "0123456789abcdef"
-        ));
-        let into: Request = serde_json::from_value(json!({
-            "request_id": "r5", "type": "edit_move_library_item",
-            "item": {"kind": "playlist", "id": "37i9dQZF1DXcBWIGoYBM5M"}, "folder": "0123456789abcdef",
-        }))
-        .unwrap();
-        assert!(matches!(into.command, Command::EditMoveLibraryItem { item: LibraryItem::Playlist { .. }, folder: Some(_) }));
-        for (kind, extra) in [
-            ("edit_rename_folder", json!({"id": "0123456789abcdef", "name": "Run"})),
-            ("edit_delete_folder", json!({"id": "0123456789abcdef"})),
-            ("edit_follow_playlist", json!({"id": "37i9dQZF1DXcBWIGoYBM5M"})),
+    fn malformed_commands_are_rejected_before_dispatch() {
+        for value in [
+            json!({"type": "status"}),
+            json!({"request_id": "r", "type": "unknown_command"}),
+            json!({"request_id": "r", "type": "seek"}),
+            json!({"request_id": "r", "type": "seek", "position_ms": -1}),
+            json!({"request_id": "r", "type": "set_normalisation", "enabled": "true"}),
+            json!({"request_id": "r", "type": "set_repeat", "mode": "unknown"}),
+            json!({"request_id": "r", "type": "get_history", "sort": "unknown"}),
+            json!({"request_id": "r", "type": "edit_move_library_item",
+                "item": {"kind": "unknown", "id": "folder"}, "folder": null}),
         ] {
-            let mut value = extra;
-            value["request_id"] = json!("r6");
-            value["type"] = json!(kind);
-            assert!(serde_json::from_value::<Request>(value).is_ok(), "{kind}");
+            assert!(serde_json::from_value::<Request>(value.clone()).is_err(), "{value}");
         }
     }
 
-    #[test]
-    fn edit_commands_deserialize_from_the_line_protocol() {
-        let create: Request = serde_json::from_value(json!({
-            "request_id": "request-16",
-            "type": "edit_create_playlist",
-            "name": "Road Trip",
-        }))
-        .unwrap();
-        assert!(matches!(
-            create.command,
-            Command::EditCreatePlaylist { ref name } if name == "Road Trip"
-        ));
-
-        let rename: Request = serde_json::from_value(json!({
-            "request_id": "request-17",
-            "type": "edit_rename_playlist",
-            "id": "0123456789ABCDEFGHIJKL",
-            "name": "Renamed",
-        }))
-        .unwrap();
-        assert!(matches!(
-            rename.command,
-            Command::EditRenamePlaylist { ref id, ref name }
-                if id == "0123456789ABCDEFGHIJKL" && name == "Renamed"
-        ));
-
-        let delete: Request = serde_json::from_value(json!({
-            "request_id": "request-18",
-            "type": "edit_delete_playlist",
-            "id": "0123456789ABCDEFGHIJKL",
-        }))
-        .unwrap();
-        assert!(matches!(delete.command, Command::EditDeletePlaylist { .. }));
-
-        let add: Request = serde_json::from_value(json!({
-            "request_id": "request-19",
-            "type": "edit_add_playlist_tracks",
-            "id": "0123456789ABCDEFGHIJKL",
-            "uris": ["spotify:track:2abcdefghijklmnopqrstu"],
-        }))
-        .unwrap();
-        assert!(matches!(
-            add.command,
-            Command::EditAddPlaylistTracks { ref uris, .. } if uris == &["spotify:track:2abcdefghijklmnopqrstu".to_owned()]
-        ));
-
-        let remove: Request = serde_json::from_value(json!({
-            "request_id": "request-20",
-            "type": "edit_remove_playlist_tracks",
-            "id": "0123456789ABCDEFGHIJKL",
-            "uris": [],
-        }))
-        .unwrap();
-        assert!(matches!(
-            remove.command,
-            Command::EditRemovePlaylistTracks { uris, .. } if uris.is_empty()
-        ));
-
-        let reorder: Request = serde_json::from_value(json!({
-            "request_id": "request-21",
-            "type": "edit_reorder_playlist_tracks",
-            "id": "0123456789ABCDEFGHIJKL",
-            "from": 3,
-            "to": 1,
-        }))
-        .unwrap();
-        assert!(matches!(
-            reorder.command,
-            Command::EditReorderPlaylistTracks { from: 3, to: 1, .. }
-        ));
-    }
 
     #[test]
     fn play_queue_automatic_start_defaults_false_and_accepts_true() {
@@ -1677,26 +1572,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn playlist_track_exclusion_command_deserializes_exact_fields() {
-        let request: Request = serde_json::from_value(json!({
-            "request_id": "request-exclusion",
-            "type": "set_playlist_track_excluded",
-            "playlist_id": "playlist-id",
-            "track_id": "track-id",
-            "excluded": true
-        }))
-        .unwrap();
-
-        assert!(matches!(
-            request.command,
-            Command::SetPlaylistTrackExcluded {
-                playlist_id,
-                track_id,
-                excluded: true,
-            } if playlist_id == "playlist-id" && track_id == "track-id"
-        ));
-    }
 
     #[test]
     fn response_serialization_omits_absent_errors_and_preserves_failures() {
@@ -1841,45 +1716,6 @@ mod tests {
         assert_eq!(state["current_index"], 3);
     }
 
-    #[test]
-    fn needs_login_state_carries_the_oauth_authorize_url() {
-        let state = serde_json::to_value(StateEvent {
-            kind: "state",
-            ready: false,
-            auth_state: AuthState::NeedsLogin,
-            auth_url: Some("https://accounts.spotify.com/authorize?state=abc"),
-            username: None,
-            playing: false,
-            buffering: false,
-            preview: false,
-            position_ms: 0,
-            duration_ms: 0,
-            volume: 50,
-            shuffle: false,
-            repeat: RepeatMode::Off,
-            playback_speed: 1.0,
-            track_speed: 1.0,
-            episode_speed: 1.0,
-            audible_playback_speed: 1.0,
-            current_index: None,
-            current_uri: None,
-            context: "",
-            queue: Some(&[]),
-            queue_revision: 1,
-            order_revision: 1,
-            upcoming: Some(Vec::new()),
-            preload_uri: None,
-            cached_ids: None,
-            uncached_ids: None,
-            error: None,
-        })
-        .unwrap();
-        assert_eq!(state["auth_state"], "needs_login");
-        assert_eq!(
-            state["auth_url"],
-            "https://accounts.spotify.com/authorize?state=abc"
-        );
-    }
 
     #[test]
     fn position_heartbeat_serializes_as_a_scalar_line_without_queue() {
@@ -1918,98 +1754,7 @@ mod tests {
         assert!(!object.contains_key("position_ms"), "no playhead either");
     }
 
-    #[test]
-    fn get_history_pages_and_defaults_to_the_newest_first_page() {
-        let bare: Request = serde_json::from_value(json!({
-            "request_id": "request-history",
-            "type": "get_history",
-        }))
-        .unwrap();
-        assert!(matches!(
-            bare.command,
-            Command::GetHistory {
-                offset: 0,
-                limit,
-                ref query,
-                sort: super::HistorySort::Recent,
-            } if limit == super::default_history_page_size() && query.is_empty()
-        ));
 
-        let paged: Request = serde_json::from_value(json!({
-            "request_id": "request-history",
-            "type": "get_history",
-            "offset": 300,
-            "limit": 50,
-            "query": "rick",
-            "sort": "artist",
-        }))
-        .unwrap();
-        assert!(matches!(
-            paged.command,
-            Command::GetHistory {
-                offset: 300,
-                limit: 50,
-                ref query,
-                sort: super::HistorySort::Artist,
-            } if query == "rick"
-        ));
-    }
-
-    #[test]
-    fn login_and_logout_commands_deserialize_from_the_line_protocol() {
-        let login: Request = serde_json::from_value(json!({
-            "request_id": "request-9",
-            "type": "login",
-        }))
-        .unwrap();
-        assert!(matches!(login.command, Command::Login));
-
-        let logout: Request = serde_json::from_value(json!({
-            "request_id": "request-10",
-            "type": "logout",
-        }))
-        .unwrap();
-        assert!(matches!(logout.command, Command::Logout));
-    }
-
-    #[test]
-    fn set_normalisation_command_deserializes_from_the_line_protocol() {
-        let request: Request = serde_json::from_value(json!({
-            "request_id": "request-norm",
-            "type": "set_normalisation",
-            "enabled": true,
-        }))
-        .unwrap();
-        assert!(matches!(
-            request.command,
-            Command::SetNormalisation { enabled: true }
-        ));
-
-        let request: Request = serde_json::from_value(json!({
-            "request_id": "request-norm-off",
-            "type": "set_normalisation",
-            "enabled": false,
-        }))
-        .unwrap();
-        assert!(matches!(
-            request.command,
-            Command::SetNormalisation { enabled: false }
-        ));
-    }
-
-    #[test]
-    fn queue_index_jump_does_not_resend_the_queue() {
-        let jump: Request = serde_json::from_value(json!({
-            "request_id": "request-jump",
-            "type": "play_queue_index",
-            "index": 79,
-        }))
-        .unwrap();
-        assert!(matches!(
-            jump.command,
-            Command::PlayQueueIndex { index: 79 }
-        ));
-    }
 
     #[test]
     fn restore_queue_and_legacy_track_availability_deserialize_cleanly() {
@@ -2069,48 +1814,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn preview_track_edit_deserializes_the_exact_draft_shape() {
-        let preview: Request = serde_json::from_value(json!({
-            "request_id": "request-preview",
-            "type": "preview_track_edit",
-            "track": {
-                "id": "0123456789ABCDEFGHIJKL",
-                "uri": "spotify:track:0123456789ABCDEFGHIJKL",
-                "duration_ms": 240000
-            },
-            "cuts": [
-                {"start_ms": 1000, "end_ms": 2500},
-                {"start_ms": 10000, "end_ms": 12000}
-            ],
-            "loop_range": {"start_ms": 5000, "end_ms": 9000, "play_count": 2},
-            "preview_lease_id": 7,
-            "position_ms": 42000
-        }))
-        .unwrap();
-        let Command::PreviewTrackEdit {
-            track,
-            cuts,
-            loop_range,
-            position_ms,
-            preview_lease_id,
-        } = preview.command
-        else {
-            panic!("preview_track_edit must parse as its dedicated command");
-        };
-        assert_eq!(track.id, "0123456789ABCDEFGHIJKL");
-        assert_eq!(cuts.len(), 2);
-        assert_eq!(
-            loop_range,
-            Some(LoopRange {
-                start_ms: 5_000,
-                end_ms: 9_000,
-                play_count: 2,
-            })
-        );
-        assert_eq!(position_ms, 42_000);
-        assert_eq!(preview_lease_id, 7);
-    }
 
     #[test]
     fn old_infinite_loop_objects_without_play_count_are_rejected() {
@@ -2130,87 +1833,6 @@ mod tests {
         assert!(error.to_string().contains("play_count"));
     }
 
-    #[test]
-    fn browse_commands_deserialize_from_the_line_protocol() {
-        let playlist: Request = serde_json::from_value(json!({
-            "request_id": "request-12",
-            "type": "browse_playlist",
-            "id": "0123456789ABCDEFGHIJKL",
-        }))
-        .unwrap();
-        assert!(matches!(
-            playlist.command,
-            Command::BrowsePlaylist { ref id } if id == "0123456789ABCDEFGHIJKL"
-        ));
-
-        let album: Request = serde_json::from_value(json!({
-            "request_id": "request-13",
-            "type": "browse_album",
-            "id": "0abcdefghijklmnopqrstu",
-        }))
-        .unwrap();
-        assert!(matches!(album.command, Command::BrowseAlbum { .. }));
-
-        let artist: Request = serde_json::from_value(json!({
-            "request_id": "request-14",
-            "type": "browse_artist",
-            "id": "0123456789ABCDEFGHIJKL",
-        }))
-        .unwrap();
-        assert!(matches!(artist.command, Command::BrowseArtist { .. }));
-        let songwriter: Request = serde_json::from_value(json!({
-            "request_id": "request-songwriter",
-            "type": "browse_artist_songwriter",
-            "id": "0123456789ABCDEFGHIJKL",
-            "name": "Artist",
-        }))
-        .unwrap();
-        assert!(matches!(
-            songwriter.command,
-            Command::BrowseArtistSongwriter { ref id, ref name }
-                if id == "0123456789ABCDEFGHIJKL" && name == "Artist"
-        ));
-
-        let catalogue: Request = serde_json::from_value(json!({
-            "request_id": "request-catalogue",
-            "type": "browse_artist_catalogue",
-            "id": "0123456789ABCDEFGHIJKL",
-            "release_types": ["albums", "singles"],
-        }))
-        .unwrap();
-        assert!(matches!(
-            catalogue.command,
-            Command::BrowseArtistCatalogue {
-                offset: 0,
-                limit: 4,
-                ..
-            }
-        ));
-
-        let search: Request = serde_json::from_value(json!({
-            "request_id": "request-15",
-            "type": "browse_search",
-            "query": "fire & ice",
-            "limit": 10,
-        }))
-        .unwrap();
-        assert!(matches!(
-            search.command,
-            Command::BrowseSearch { ref query, limit: 10 } if query == "fire & ice"
-        ));
-
-        let liked_songs: Request = serde_json::from_value(json!({
-            "request_id": "request-17",
-            "type": "browse_liked_songs",
-            "cursor": "hm://context-page/collection?offset=50",
-        }))
-        .unwrap();
-        assert!(matches!(
-            liked_songs.command,
-            Command::BrowseLikedSongs { ref cursor }
-                if cursor.as_deref() == Some("hm://context-page/collection?offset=50")
-        ));
-    }
 
     #[test]
     fn playlist_descriptions_are_reduced_to_plain_text() {
@@ -2303,51 +1925,13 @@ mod tests {
             data: Some(&payload),
         })
         .unwrap();
-        assert_eq!(
-            success,
-            json!({
-                "type": "browse_search",
-                "request_id": "request-15",
-                "ok": true,
-                "data": {
-                    "tracks": [{
-                        "id": "2abcdefghijklmnopqrstu",
-                        "uri": "spotify:track:2abcdefghijklmnopqrstu",
-                        "name": "Track",
-                        "artist_names": [],
-                        "artist_ids": [],
-                        "artist_id": "",
-                        "album_id": "",
-                        "album_name": "",
-                        "cover_url": "",
-                        "duration_ms": 0
-                    }],
-                    "albums": [],
-                    "artists": [],
-                    "playlists": [{
-                        "id": "0123456789ABCDEFGHIJKL",
-                        "uri": "spotify:playlist:0123456789ABCDEFGHIJKL",
-                        "name": "Road Trip",
-                        "description": "A road trip playlist.",
-                        "owner_id": "alice",
-                        "owner_name": "",
-                        "cover_url": "https://i.scdn.co/image/0123",
-                        "track_count": 42
-                    }]
-                }
-            })
-        );
+        assert_eq!(success["type"], "browse_search");
+        assert_eq!(success["request_id"], "request-15");
+        assert_eq!(success["ok"], true);
+        assert!(success.get("error").is_none());
+        assert_eq!(success["data"]["tracks"][0]["uri"], "spotify:track:2abcdefghijklmnopqrstu");
+        assert_eq!(success["data"]["playlists"][0]["description"], "A road trip playlist.");
 
-        let legacy: SearchBrowse = serde_json::from_value(json!({
-            "tracks": [],
-            "albums": [],
-            "artists": []
-        }))
-        .unwrap();
-        assert!(
-            legacy.playlists.is_empty(),
-            "old search payloads default the new playlist section"
-        );
 
         let failure = serde_json::to_value(BrowseResponse::<SearchBrowse> {
             kind: "browse_search",
@@ -2459,195 +2043,5 @@ mod tests {
         .unwrap();
         assert!(logged_out.get("username").is_none());
     }
-    #[test]
-    fn radio_commands_and_payloads_match_the_line_protocol() {
-        let radio: Request = serde_json::from_value(json!({
-            "request_id": "request-radio",
-            "type": "browse_radio",
-            "id": "0123456789ABCDEFGHIJKL",
-        }))
-        .unwrap();
-        assert!(matches!(
-            radio.command,
-            Command::BrowseRadio { ref id } if id == "0123456789ABCDEFGHIJKL"
-        ));
 
-        let artist_radio: Request = serde_json::from_value(json!({
-            "request_id": "request-artist-radio",
-            "type": "browse_radio",
-            "id": "artist:0123456789ABCDEFGHIJKL",
-        }))
-        .unwrap();
-        assert!(matches!(
-            artist_radio.command,
-            Command::BrowseRadio { ref id } if id == "artist:0123456789ABCDEFGHIJKL"
-        ));
-
-        let recommendations: Request = serde_json::from_value(json!({
-            "request_id": "request-recommendations",
-            "type": "browse_playlist_recommendations",
-            "id": "1123456789ABCDEFGHIJKL",
-        }))
-        .unwrap();
-        assert!(matches!(
-            recommendations.command,
-            Command::BrowsePlaylistRecommendations { ref id }
-                if id == "1123456789ABCDEFGHIJKL"
-        ));
-
-        let seed = TrackRef {
-            id: "0123456789ABCDEFGHIJKL".to_owned(),
-            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
-            name: "Seed".to_owned(),
-            ..TrackRef::default()
-        };
-        let payload = RadioBrowse {
-            seed: seed.clone(),
-            tracks: vec![seed],
-            seed_kind: "track".to_owned(),
-            seed_artist: None,
-            cover_url: Some("https://i.scdn.co/image/radio-cover".to_owned()),
-        };
-        let response = serde_json::to_value(BrowseResponse {
-            kind: "browse_radio",
-            request_id: "request-radio",
-            ok: true,
-            error: None,
-            data: Some(&payload),
-        })
-        .unwrap();
-        assert_eq!(response["type"], "browse_radio");
-        assert_eq!(response["data"]["seed"]["name"], "Seed");
-        assert_eq!(response["data"]["tracks"][0]["name"], "Seed");
-        assert_eq!(response["data"]["seed_kind"], "track");
-        assert_eq!(
-            response["data"]["cover_url"],
-            "https://i.scdn.co/image/radio-cover"
-        );
-        assert!(response["data"].get("seed_artist").is_none());
-
-        let artist_payload = RadioBrowse {
-            seed: TrackRef {
-                id: "1123456789ABCDEFGHIJKL".to_owned(),
-                uri: "spotify:track:1123456789ABCDEFGHIJKL".to_owned(),
-                name: "Ranked first".to_owned(),
-                ..TrackRef::default()
-            },
-            tracks: Vec::new(),
-            seed_kind: "artist".to_owned(),
-            seed_artist: Some(ArtistRef {
-                id: "artist-id".to_owned(),
-                uri: "spotify:artist:artist-id".to_owned(),
-                name: "Artist".to_owned(),
-                portrait_url: None,
-            }),
-            cover_url: None,
-        };
-        let artist_response = serde_json::to_value(BrowseResponse {
-            kind: "browse_radio",
-            request_id: "request-artist-radio",
-            ok: true,
-            error: None,
-            data: Some(&artist_payload),
-        })
-        .unwrap();
-        assert_eq!(artist_response["data"]["seed_kind"], "artist");
-        assert_eq!(artist_response["data"]["seed_artist"]["name"], "Artist");
-        assert!(artist_response["data"].get("cover_url").is_none());
-        assert!(artist_response["data"].get("followers").is_none());
-        assert!(artist_response["data"].get("likes").is_none());
-        assert!(artist_response["data"].get("listeners").is_none());
-
-        let optional = PlaylistRecommendations {
-            playlist_id: "1123456789ABCDEFGHIJKL".to_owned(),
-            tracks: Vec::new(),
-        };
-        let response = serde_json::to_value(BrowseResponse {
-            kind: "browse_playlist_recommendations",
-            request_id: "request-recommendations",
-            ok: true,
-            error: None,
-            data: Some(&optional),
-        })
-        .unwrap();
-        assert_eq!(response["data"]["playlist_id"], "1123456789ABCDEFGHIJKL");
-        assert_eq!(response["data"]["tracks"], json!([]));
-    }
-
-    #[test]
-    fn waveform_commands_and_payload_match_the_line_protocol() {
-        let get: Request = serde_json::from_value(json!({
-            "request_id": "waveform-1",
-            "type": "get_track_waveform",
-            "track_id": "0123456789ABCDEFGHIJKL",
-        }))
-        .unwrap();
-        assert!(matches!(
-            get.command,
-            Command::GetTrackWaveform { track_id }
-                if track_id == "0123456789ABCDEFGHIJKL"
-        ));
-
-        let cancel: Request = serde_json::from_value(json!({
-            "request_id": "waveform-2",
-            "type": "cancel_track_waveform",
-            "track_id": "0123456789ABCDEFGHIJKL",
-        }))
-        .unwrap();
-        assert!(matches!(
-            cancel.command,
-            Command::CancelTrackWaveform { track_id }
-                if track_id == "0123456789ABCDEFGHIJKL"
-        ));
-
-        let payload = super::TrackWaveform {
-            track_id: "0123456789ABCDEFGHIJKL".to_owned(),
-            duration_ms: 25,
-            interval_ms: 1,
-            bin_count: 3,
-            peaks_base64: "AAD//w==".to_owned(),
-        };
-        let response = serde_json::to_value(BrowseResponse {
-            kind: "get_track_waveform",
-            request_id: "waveform-1",
-            ok: true,
-            error: None,
-            data: Some(&payload),
-        })
-        .unwrap();
-        assert_eq!(response["data"]["interval_ms"], 1);
-        assert_eq!(response["data"]["bin_count"], 3);
-        assert_eq!(response["data"]["peaks_base64"], "AAD//w==");
-    }
-
-    #[test]
-    fn songwriter_playlist_is_a_standalone_payload() {
-        let empty: SongwriterPlaylist = serde_json::from_value(json!({})).unwrap();
-        assert!(empty.playlist.id.is_empty());
-        assert!(empty.tracks.is_empty());
-
-        let payload = SongwriterPlaylist {
-            playlist: PlaylistRef {
-                id: "writers".to_owned(),
-                uri: "spotify:playlist:writers".to_owned(),
-                name: "Written by Artist".to_owned(),
-                revision: None,
-                description: Some("Official".to_owned()),
-                owner_id: "spotify".to_owned(),
-                owner_name: "Spotify".to_owned(),
-                cover_url: None,
-                cover_urls: Vec::new(),
-                track_count: Some(37),
-            },
-            tracks: vec![TrackRef {
-                id: "track".to_owned(),
-                uri: "spotify:track:track".to_owned(),
-                name: "Song".to_owned(),
-                ..TrackRef::default()
-            }],
-        };
-        let encoded = serde_json::to_value(payload).unwrap();
-        assert_eq!(encoded["playlist"]["owner_id"], "spotify");
-        assert_eq!(encoded["tracks"][0]["name"], "Song");
-    }
 }

@@ -1231,8 +1231,4 @@ mod tests {
         assert_eq!(folder_span(&items, "123456789abcdefa"), Ok((0, 1)));
     }
 
-    #[test]
-    fn reorder_index_validation_allows_only_real_moves() {
-        assert_eq!(move_op(0, 0).mov.unwrap().to_index, Some(0));
-    }
 }

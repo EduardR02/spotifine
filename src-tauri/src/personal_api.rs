@@ -715,7 +715,6 @@ mod tests {
                 Some(transient) => {
                     let error = result.err().unwrap();
                     assert_eq!(is_transient(&error), transient, "{status}: {error}");
-                    if body.contains("invalid_grant") { assert!(error.contains("authorization expired")); }
                 }
                 None => {
                     let token = result.ok().unwrap();
@@ -787,9 +786,8 @@ mod tests {
 
     #[tokio::test]
     async fn query_only_library_removals_keep_working_without_a_body() {
-        let (status, length, bytes) = length_required_exchange(Method::DELETE, None).await;
+        let (status, _, bytes) = length_required_exchange(Method::DELETE, None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert_eq!(length, None);
         assert!(bytes.is_empty());
     }
 

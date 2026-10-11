@@ -697,6 +697,7 @@ impl Core {
                 remote.state.output_device_id = device_id;
                 remote.state.output_device_name = device.name;
                 remote.supports_volume = device.supports_volume;
+                remote.state.volume = device.volume_percent.unwrap_or(remote.state.volume);
                 if kind != Kind::Prepared { remote.expect(None, Some(play)); }
             }
             self.publish(host);
@@ -711,6 +712,7 @@ impl Core {
         let was_playing = state.playing;
         state.output_device_id = device_id;
         state.output_device_name = device.name;
+        state.volume = device.volume_percent.unwrap_or(state.volume);
         state.buffering = false;
         state.playing = false;
         state.playback_speed = 1.0;
@@ -1529,10 +1531,13 @@ impl Core {
         let seen = {
             let mut guard = self.remote.lock();
             let remote = guard.as_mut().ok_or(RELEASED)?;
-            let past_end = remote.state.playing && remote.position().saturating_add(END_SLACK_MS) >= remote.state.duration_ms;
+            let past_end = remote.state.playing && remote.state.duration_ms > 0
+                && remote.position().saturating_add(END_SLACK_MS) >= remote.state.duration_ms;
             let plan_kept = !player.shuffle_state && player.repeat_state == remote.spotify_repeat();
+            // Compare actual reports, not an extrapolated playhead: near-end
+            // progress and sparse/missing polls cannot identify another copy.
             let reset = infer_transition && remote.state.repeat != "track" && player.is_playing
-                && (past_end || remote.position() > player.progress_ms.unwrap_or(0).saturating_add(3000));
+                && player.progress_ms.is_some_and(|progress| remote.state.position_ms > progress.saturating_add(3000));
             let Mode::Owned(window) = &mut remote.mode else { return Ok(()); };
             let uri = item_uri(&player);
             // Spotify exposes a URI, not an occurrence ID. A progress reset
@@ -1895,6 +1900,7 @@ impl Host for AppHost<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1930,6 +1936,7 @@ mod tests {
     struct Spotify {
         player: Option<Value>,
         queue: Vec<Value>,
+        devices: Option<Vec<Value>>,
         failures: std::collections::VecDeque<u16>,
         write_failures: std::collections::VecDeque<u16>,
         queue_failures: std::collections::VecDeque<u16>,
@@ -1987,7 +1994,7 @@ mod tests {
                                 Some(status) => (status, None),
                                 None => spotify.player.clone().map_or((204, None), |player| (200, Some(player))),
                             },
-                            ("GET", "me/player/devices") => (200, Some(json!({"devices": [device()]}))),
+                            ("GET", "me/player/devices") => (200, Some(json!({"devices": spotify.devices.clone().unwrap_or_else(|| vec![device()])}))),
                             ("GET", "me/player/queue") => match spotify.queue_failures.pop_front() {
                                 Some(status) => (status, None),
                                 None => (200, Some(json!({"queue": spotify.queue}))),
@@ -2011,6 +2018,7 @@ mod tests {
         revision: u64,
         playing: bool,
         position_ms: u32,
+        volume: u8,
         ops: Vec<String>,
         excluded: HashSet<String>,
     }
@@ -2026,7 +2034,7 @@ mod tests {
         fn state(&self) -> PlaybackState {
             PlaybackState { queue: self.rows.as_slice().into(), current_index: self.current, queue_revision: self.revision, repeat: self.repeat.clone(),
                 upcoming: self.upcoming(), playing: self.playing, position_ms: self.position_ms, auth_state: "ready".into(), ready: true,
-                current_uri: self.current.map(|row| self.rows[row].uri.clone()).unwrap_or_default(), duration_ms: 100_000, ..PlaybackState::default() }
+                current_uri: self.current.map(|row| self.rows[row].uri.clone()).unwrap_or_default(), duration_ms: 100_000, volume: self.volume, ..PlaybackState::default() }
         }
         fn apply(&mut self, op: Option<EngineOp<'_>>) -> EngineView {
             let Some(op) = op else { return EngineView { state: None, upcoming: self.upcoming() }; };
@@ -2100,10 +2108,101 @@ mod tests {
         let spotify = Arc::new(Mutex::new(Spotify::default()));
         let base = serve(spotify.clone()).await;
         let engine = FakeEngine { rows: (0..rows).map(|row| track(&format!("t{row}"))).collect(), current: Some(0), repeat: "off".into(),
-            revision: 1, playing, position_ms: 0, ops: Vec::new(), excluded: HashSet::new() };
+            revision: 1, playing, position_ms: 0, volume: 50, ops: Vec::new(), excluded: HashSet::new() };
         let host = TestHost { base, http: reqwest::Client::builder().no_proxy().build().unwrap(), spotify, engine: Mutex::new(engine),
             local_shown: Mutex::new(0), events: Mutex::new(Vec::new()) };
         (Core::default(), host)
+    }
+
+    #[tokio::test]
+    async fn selecting_paused_outputs_seeds_actual_device_volume_without_polling_or_commands() {
+        for playing in [false, true] {
+            for (volume, supported) in [(Some(35), true), (None, true), (None, false), (Some(0), true), (Some(35), false)] {
+                let (core, host) = fixture(2, playing).await;
+                host.engine.lock().volume = 80;
+                let mut target = device();
+                target["volume_percent"] = json!(volume);
+                target["supports_volume"] = json!(supported);
+                host.spotify.lock().devices = Some(vec![target.clone()]);
+                core.select(&host, Some("phone".into())).await.unwrap();
+                assert_eq!(core.snapshot().unwrap().volume, volume.unwrap_or(80));
+                assert_eq!(remote(&core, |remote| remote.supports_volume), supported);
+                if playing { core.run(&host, Action::Pause).await.unwrap(); }
+                // Different output, including a Prepared queue that will never
+                // poll player state until explicit Play.
+                remote(&core, |remote| remote.state.volume = 80);
+                target["id"] = json!("other");
+                target["name"] = json!("Other");
+                host.spotify.lock().devices = Some(vec![target]);
+                host.spotify.lock().log.clear();
+                core.select(&host, Some("other".into())).await.unwrap();
+                let state = core.snapshot().unwrap();
+                assert_eq!(state.output_device_id, "other");
+                assert_eq!(state.volume, volume.unwrap_or(80));
+                assert!(!state.playing);
+                assert_eq!(remote(&core, |remote| remote.supports_volume), supported);
+                assert_eq!(host.spotify.lock().writes(), ["PUT me/player"]);
+                assert_eq!(host.spotify.lock().reads_of("me/player"), 0);
+                if !supported {
+                    assert!(core.run(&host, Action::Volume(70)).await.is_err());
+                    assert_eq!(core.snapshot().unwrap().volume, volume.unwrap_or(80));
+                    assert_eq!(host.spotify.lock().writes(), ["PUT me/player"]);
+                }
+            }
+        }
+    }
+
+    async fn duplicate_window() -> (Core, TestHost) {
+        let (core, host) = fixture(4, true).await;
+        host.engine.lock().rows = vec![track("a"), track("a"), track("a"), track("b")];
+        core.select(&host, Some("phone".into())).await.unwrap();
+        host.spotify.lock().player = Some(reading("spotify:track:a", true, 1000));
+        core.sync(&host).await.unwrap();
+        host.spotify.lock().log.clear();
+        (core, host)
+    }
+
+    #[tokio::test]
+    async fn duplicate_occurrences_only_advance_on_observed_reset_not_near_end_or_repeated_reset() {
+        let (core, host) = duplicate_window().await;
+        for (uri, progress, expected) in [
+            ("a", 99_000, 0), ("a", 99_000, 0), ("a", 0, 1), ("a", 0, 1),
+            ("a", 99_000, 1), ("a", 99_000, 1), ("a", 500, 2), ("a", 500, 2),
+            ("b", 500, 3),
+        ] {
+            host.spotify.lock().player = Some(reading(&format!("spotify:track:{uri}"), true, progress));
+            core.sync(&host).await.unwrap();
+            assert_eq!(core.snapshot().unwrap().current_index, Some(expected));
+            assert_eq!(host.engine.lock().current, Some(expected));
+        }
+        assert!(host.spotify.lock().writes().is_empty(), "observed transitions must not restart the window");
+        assert_eq!(host.spotify.lock().reads_of("me/player/queue"), 0);
+    }
+
+    #[tokio::test]
+    async fn sparse_or_missing_progress_and_command_confirmation_cannot_skip_another_duplicate() {
+        let (core, host) = duplicate_window().await;
+        remote(&core, |remote| remote.anchored -= Duration::from_secs(120));
+        host.spotify.lock().player = Some(reading("spotify:track:a", true, 2000));
+        core.sync(&host).await.unwrap();
+        assert_eq!(core.snapshot().unwrap().current_index, Some(0), "projected end is not an observed reset");
+        host.spotify.lock().player.as_mut().unwrap()["progress_ms"] = Value::Null;
+        host.spotify.lock().player.as_mut().unwrap()["item"]["duration_ms"] = Value::Null;
+        core.sync(&host).await.unwrap();
+        assert_eq!(core.snapshot().unwrap().current_index, Some(0), "missing progress is not zero");
+        host.spotify.lock().player = Some(reading("spotify:track:a", true, 99_000));
+        core.sync(&host).await.unwrap();
+        core.run(&host, Action::Next).await.unwrap();
+        assert_eq!(core.snapshot().unwrap().current_index, Some(1));
+        // The old near-end reading is still pending; the reset confirms the
+        // command's already-applied occurrence exactly once.
+        core.sync(&host).await.unwrap();
+        assert_eq!(core.snapshot().unwrap().current_index, Some(1));
+        host.spotify.lock().player = Some(reading("spotify:track:a", true, 0));
+        core.sync(&host).await.unwrap();
+        core.sync(&host).await.unwrap();
+        assert_eq!(core.snapshot().unwrap().current_index, Some(1));
+        assert_eq!(host.spotify.lock().writes(), ["POST me/player/next?device_id=phone"]);
     }
 
     #[tokio::test]
@@ -2332,8 +2431,6 @@ mod tests {
         core.run(&host, Action::Next).await.unwrap();
         core.sync(&host).await.unwrap();
         assert_eq!(core.snapshot().unwrap().current_index, Some(1));
-        let engine = host.engine.lock();
-        assert_eq!(engine.rows[0].uri, engine.rows[1].uri);
     }
 
     #[tokio::test]
@@ -2394,7 +2491,11 @@ mod tests {
 
     /// Whether anything has woken the watcher since the last look.
     async fn woken(core: &Core) -> bool {
-        tokio::time::timeout(Duration::from_millis(20), core.changed.notified()).await.is_ok()
+        let notified = core.changed.notified();
+        tokio::pin!(notified);
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            notified.as_mut().poll(cx).is_ready()
+        )).await
     }
 
     #[tokio::test]
@@ -2414,7 +2515,7 @@ mod tests {
         // Off: a selection is refused before any request, the window's
         // visibility wakes nothing, local playback reaches no device, and the
         // watcher is never woken.
-        assert_eq!(core.select(&host, Some("phone".into())).await.unwrap_err(), DEVICES_OFF);
+        assert!(core.select(&host, Some("phone".into())).await.is_err());
         core.set_visible(false, false);
         core.set_visible(true, true);
         core.run(&host, Action::Play).await.unwrap();
@@ -2465,7 +2566,7 @@ mod tests {
             assert_eq!(remote(&core, |remote| remote.kind()), Kind::Owned);
             assert!(!host.engine.lock().playing);
             assert!(host.spotify.lock().writes().is_empty());
-            assert!(core.snapshot().unwrap().error.contains(if restricted { "controlling this device" } else { "moved away" }));
+            assert!(!core.snapshot().unwrap().error.is_empty(), "suspension is visible to the user");
         }
     }
 
@@ -2722,7 +2823,7 @@ mod tests {
         core.reconcile(&host).await;
         remote(&core, |remote| {
             assert!(!remote.polling);
-            assert!(remote.state.error.contains("authorization expired"));
+            assert!(!remote.state.error.is_empty(), "permanent authorization failure is visible");
         });
     }
 

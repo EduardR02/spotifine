@@ -1,4 +1,6 @@
 <script>
+  import { untrack } from "svelte";
+
   /**
    * Pointer-driven slider for seek and volume. Holds a local value while
    * dragging; callers choose live drag updates or a release-only commit.
@@ -19,6 +21,8 @@
     onDragStart = null,
     onDragChange = null,
     formatValue = null,
+    gestureKey = null,
+    onDragCancel = null,
   } = $props();
 
   let track = $state(null);
@@ -27,6 +31,7 @@
   let drag = $state(null);
   let hover = $state(null);
   let pointerId = null;
+  let dragIdentity = null;
   /**
    * Whether the slider was last focused by a pointer rather than by the
    * keyboard. `:focus-visible` is not enough on its own here: `onPointerDown`
@@ -75,15 +80,36 @@
     resizeObserver.observe(element);
     return () => {
       resizeObserver.disconnect();
-      const capturedPointer = pointerId;
-      pointerId = null;
-      drag = null;
-      if (capturedPointer !== null && element.hasPointerCapture(capturedPointer)) {
-        element.releasePointerCapture(capturedPointer);
-      }
+      cancelDrag(element);
       trackGeometry = null;
       trackWidth = 0;
     };
+  });
+
+  // Call the identity getter at event time too: a pointer event can arrive
+  // before the reactive cancellation effect has run.
+  function gestureIsCurrent() {
+    return Object.is(dragIdentity, gestureKey?.());
+  }
+
+  function cancelDrag(element = track) {
+    const capturedPointer = pointerId;
+    if (capturedPointer === null) return;
+    pointerId = null;
+    dragIdentity = null;
+    drag = null;
+    hover = null;
+    onDragCancel?.();
+    if (element?.hasPointerCapture(capturedPointer)) {
+      element.releasePointerCapture(capturedPointer);
+    }
+  }
+
+  $effect(() => {
+    const identity = gestureKey?.();
+    if (pointerId !== null && !Object.is(identity, dragIdentity)) {
+      untrack(() => cancelDrag());
+    }
   });
 
   function commit(v) {
@@ -97,6 +123,7 @@
     pointerFocus = true;
     track.focus({ preventScroll: true });
     pointerId = e.pointerId;
+    dragIdentity = gestureKey?.();
     drag = fromClientX(e.clientX);
     hover = drag;
     onDragStart?.(drag);
@@ -105,6 +132,10 @@
 
   function onPointerMove(e) {
     if (pointerId !== null && e.pointerId !== pointerId) return;
+    if (pointerId !== null && !gestureIsCurrent()) {
+      cancelDrag();
+      return;
+    }
     hover = fromClientX(e.clientX);
     if (drag === null) return;
     drag = hover;
@@ -117,16 +148,26 @@
 
   function onPointerUp(e) {
     if (drag === null || e.pointerId !== pointerId) return;
-    const v = e.type === "pointerup" ? fromClientX(e.clientX) : drag;
+    if (!gestureIsCurrent()) {
+      cancelDrag();
+      return;
+    }
+    const v = fromClientX(e.clientX);
     drag = null;
     pointerId = null;
+    dragIdentity = null;
     if (track.hasPointerCapture(e.pointerId)) track.releasePointerCapture(e.pointerId);
     commit(v);
+  }
+
+  function onPointerCancel(e) {
+    if (e.pointerId === pointerId) cancelDrag();
   }
 
   function onKeyDown(e) {
     // A key means this is keyboard navigation, so the ring belongs.
     pointerFocus = false;
+    if ((e.ctrlKey || e.metaKey || e.altKey) && e.key.startsWith("Arrow")) return;
     const span = max - min;
     const small = step ?? Math.max(1, span / 20);
     const big = span / 5;
@@ -162,8 +203,8 @@
   onpointerenter={onPointerEnter}
   onpointerleave={() => (hover = null)}
   onpointerup={onPointerUp}
-  onpointercancel={onPointerUp}
-  onlostpointercapture={onPointerUp}
+  onpointercancel={onPointerCancel}
+  onlostpointercapture={onPointerCancel}
   onkeydown={onKeyDown}
   onblur={() => (pointerFocus = false)}
 >

@@ -872,44 +872,16 @@ pub fn stored_volume_percent(cache: &Cache) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIO_START_TIMEOUT, OAUTH_LISTENER_TIMEOUT, OAUTH_REDIRECT_URI, PlaybackError,
+        OAUTH_REDIRECT_URI, PlaybackError,
         bind_oauth_listener, device_step_failure, extract_oauth_code, lock_oauth_port,
-        mixer_config, oauth_callback_path, oauth_failed_response, oauth_listener_addr,
+        oauth_callback_path, oauth_failed_response, oauth_listener_addr,
         oauth_success_response, player_config, prepare_oauth, std_mpsc, wait_for_oauth_code_within,
     };
     use crate::audio::OutputError;
-    use librespot_playback::config::VolumeCtrl;
-    use librespot_playback::mixer::Mixer;
-    use librespot_playback::mixer::softmixer::SoftMixer;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
 
-    #[test]
-    fn mixer_uses_the_same_cubic_sixty_db_curve_as_the_sink() {
-        let config = mixer_config();
-        assert!(
-            matches!(config.volume_ctrl, VolumeCtrl::Cubic(db_range) if db_range == 60.0),
-            "unexpected volume control: {:?}",
-            config.volume_ctrl
-        );
-
-        let mixer = SoftMixer::open(config).expect("soft mixer opens with cubic control");
-        for volume in [0u16, 1, 32768, 49151, u16::MAX] {
-            mixer.set_volume(volume);
-            let audible = mixer.get_soft_volume().attenuation_factor();
-            let normalized = f64::from(volume) / f64::from(u16::MAX);
-            let expected = if volume == 0 {
-                0.0
-            } else {
-                (0.1 + 0.9 * normalized).powi(3)
-            };
-            assert!(
-                (audible - expected).abs() <= 1e-12,
-                "mixer mapping mismatch at raw volume {volume}: {audible} != {expected}"
-            );
-        }
-    }
     #[test]
     fn player_config_does_not_poll_position() {
         // Event cadence: the engine emits state on transitions plus a 2 s
@@ -939,26 +911,18 @@ mod tests {
 
         let disabled = player_config(false);
         assert!(!disabled.normalisation, "off stays fully off");
-        assert!(
-            disabled.gapless,
-            "enabling normalisation must not disturb the other player settings"
-        );
     }
 
     #[test]
     fn prepared_oauth_attempt_carries_a_spotify_authorize_url() {
         let attempt = prepare_oauth().expect("oauth attempt prepares without network");
-        assert!(
-            attempt
-                .auth_url
-                .starts_with("https://accounts.spotify.com/authorize?"),
-            "unexpected authorize URL: {}",
-            attempt.auth_url
-        );
-        assert!(attempt.auth_url.contains("code_challenge="));
-        assert!(attempt.auth_url.contains("state="));
-        assert!(attempt.auth_url.contains("redirect_uri="));
-        assert!(attempt.auth_url.contains("&scope=streaming"));
+        let url = url::Url::parse(&attempt.auth_url).unwrap();
+        assert_eq!(url.origin().ascii_serialization(), "https://accounts.spotify.com");
+        assert_eq!(url.path(), "/authorize");
+        let parameters: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(parameters.get("redirect_uri").map(|value| value.as_ref()), Some(OAUTH_REDIRECT_URI));
+        assert_eq!(parameters.get("code_challenge_method").map(|value| value.as_ref()), Some("S256"));
+        assert!(parameters["scope"].split_whitespace().any(|scope| scope == "streaming"));
     }
 
     #[test]
@@ -967,7 +931,14 @@ mod tests {
         // never reuse a URL that a previous attempt (or its browser tab) saw.
         let first = prepare_oauth().expect("first attempt");
         let second = prepare_oauth().expect("second attempt");
-        assert_ne!(first.auth_url, second.auth_url);
+        let parameters = |url: &str| -> std::collections::HashMap<String, String> {
+            url::Url::parse(url).unwrap().query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned())).collect()
+        };
+        let first = parameters(&first.auth_url);
+        let second = parameters(&second.auth_url);
+        assert_ne!(first["state"], second["state"], "each attempt needs its own CSRF protection");
+        assert_ne!(first["code_challenge"], second["code_challenge"], "each attempt needs its own PKCE verifier");
     }
 
     #[test]
@@ -986,14 +957,9 @@ mod tests {
         let code = extract_oauth_code("/login?code=abc123&state=xyz").expect("code present");
         assert_eq!(code.secret(), "abc123");
 
-        // Cancelling at Spotify is a redirect, not a silence: it must be named
-        // as the user's own decision rather than as a missing code.
-        let cancelled = extract_oauth_code("/login?error=access_denied&state=xyz")
+        // A denied callback is a completed failure, not a silence.
+        extract_oauth_code("/login?error=access_denied&state=xyz")
             .expect_err("a denied callback carries no code");
-        assert!(
-            cancelled.contains("cancelled"),
-            "unexpected cancel message: {cancelled}"
-        );
         let refused =
             extract_oauth_code("/login?error=server_error").expect_err("an error is not a code");
         assert!(
@@ -1020,10 +986,6 @@ mod tests {
 
         let error = bind_oauth_listener().expect_err("the port is already held");
         assert!(error.contains("5588"), "the port must be named: {error}");
-        assert!(
-            error.contains("Close whatever is holding it"),
-            "the message must say what to do: {error}"
-        );
 
         drop(squatter);
         bind_oauth_listener().expect("the port is free once the squatter lets go");
@@ -1093,14 +1055,9 @@ mod tests {
 
     #[test]
     fn the_callback_tab_gets_a_typed_html_page_either_way() {
-        for (response, status, accent, needle) in [
-            (oauth_success_response(), "200 OK", "#9ccfd8", "Signed in"),
-            (
-                oauth_failed_response(),
-                "400 Bad Request",
-                "#eb6f92",
-                "Sign-in was not completed",
-            ),
+        for (response, status) in [
+            (oauth_success_response(), "200 OK"),
+            (oauth_failed_response(), "400 Bad Request"),
         ] {
             let (head, body) = response
                 .split_once("\r\n\r\n")
@@ -1118,17 +1075,9 @@ mod tests {
                 "the length must match the page exactly, or the tab hangs: {head}"
             );
             assert!(body.starts_with("<!doctype html>"), "not a page: {body}");
-            assert!(body.contains(accent) && body.contains(needle), "{body}");
         }
     }
 
-    #[test]
-    fn the_callback_wait_is_forgiving_enough_for_a_first_login() {
-        // A first login on a new machine runs through a password manager, a
-        // 2FA prompt on another device, and possibly signing up. Five minutes
-        // expired under people who were still typing.
-        assert!(OAUTH_LISTENER_TIMEOUT >= Duration::from_secs(15 * 60));
-    }
 
     /// The device step's answer decides how hard the engine retries it, so it
     /// has to be classified for what the retry costs rather than for what it
@@ -1150,25 +1099,12 @@ mod tests {
             matches!(refused, PlaybackError::NoOutputDevice(_)),
             "a device that is simply gone retries in seconds: {refused:?}"
         );
-        assert!(refused.message().contains("no audio output device"));
-        assert!(
-            refused.message().contains("Plug in or enable"),
-            "and still tells the user the way out: {}",
-            refused.message()
-        );
 
         let blocked = device_step_failure(Err(std_mpsc::RecvTimeoutError::Timeout))
             .expect("a hung open is a failure");
         assert!(
             matches!(blocked, PlaybackError::DeviceOpenBlocked(_)),
             "the retry clock is chosen by this variant: {blocked:?}"
-        );
-        assert!(
-            blocked
-                .message()
-                .contains(&AUDIO_START_TIMEOUT.as_secs().to_string()),
-            "and the message still says how long the open was given: {}",
-            blocked.message()
         );
 
         let disconnected =

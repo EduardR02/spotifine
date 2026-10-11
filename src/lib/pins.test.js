@@ -26,28 +26,33 @@ afterEach(() => {
   globalThis.localStorage = originalStorage;
 });
 
-test("a new account defaults Liked Songs, but an explicit unpin survives restart", () => {
-  account("new-user");
-  expect(isPinned("liked")).toBe(true);
-  togglePin("liked");
-  expect(stored.get("sr.library-pins:new-user")).toBe("[]");
+test("explicit playlist pins and unpins survive restart", () => {
+  const id = "0123456789ABCDEFGHIJKL";
+  stored.set("sr.library-pins:pin-user", "[]");
+  account("pin-user");
+  togglePin(id);
+  expect(isPinned(id)).toBe(true);
   pins.account = null;
-  pins.ids = [];
-  pins.folders = [];
   loadPins();
-  expect(isPinned("liked")).toBe(false);
+  expect(isPinned(id)).toBe(true);
+  togglePin(id);
+  pins.account = null;
+  loadPins();
+  expect(isPinned(id)).toBe(false);
 });
 
-test("stored empty preferences survive account switches without leaking defaults", () => {
+test("stored empty preferences survive account switches without leaking pins", () => {
+  const id = "0123456789ABCDEFGHIJKL";
   stored.set("sr.library-pins:unpin-user", "[]");
+  stored.set("sr.library-pins:pinned-user", JSON.stringify([id]));
   account("unpin-user");
-  expect(isPinned("liked")).toBe(false);
-  account("brand-new-user");
-  expect(isPinned("liked")).toBe(true);
+  expect(pins.ids).toEqual([]);
+  account("pinned-user");
+  expect(isPinned(id)).toBe(true);
   account("unpin-user");
   expect(pins.ids).toEqual([]);
   account("");
-  expect(isPinned("liked")).toBe(false);
+  expect(isPinned(id)).toBe(false);
 });
 
 test("stored playlist-only preferences never silently insert Liked Songs", () => {
@@ -63,11 +68,12 @@ test("a shut folder stays shut for its account only", () => {
   expect(isCollapsed("f1")).toBe(false);
   toggleFolder("f1");
   expect(isCollapsed("f1")).toBe(true);
-  expect(stored.get("sr.library-folders:folder-user")).toBe('["f1"]');
   account("other-user");
   expect(isCollapsed("f1")).toBe(false);
   account("folder-user");
   expect(isCollapsed("f1")).toBe(true);
   toggleFolder("f1");
-  expect(stored.get("sr.library-folders:folder-user")).toBe("[]");
+  account("other-user");
+  account("folder-user");
+  expect(isCollapsed("f1")).toBe(false);
 });

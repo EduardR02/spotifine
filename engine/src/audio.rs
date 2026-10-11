@@ -2391,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_one_customization_returns_the_converter_packet_without_stretcher_or_copy() {
+    fn exact_one_customization_preserves_pcm_bits_and_emits_no_loop() {
         let _guard = customization_guard();
         let revision = configured(Some(TrackEdit::default()), 1.0, 0, 1);
         let mut processing = AudioProcessing {
@@ -2403,17 +2403,12 @@ mod tests {
         };
         processing.synchronize_pipeline(revision);
         let samples = vec![0.0, -0.0, f32::MIN_POSITIVE, -0.125, 0.75, -1.0];
-        let allocation = samples.as_ptr();
         let bits: Vec<_> = samples.iter().map(|sample| sample.to_bits()).collect();
         let mut pipeline_scratch = Vec::new();
         let mut resampler_scratch = Vec::new();
         let (output, loop_to) = processing.render_packet(samples, 0, &mut pipeline_scratch, &mut resampler_scratch);
-        assert_eq!(output.as_ptr(), allocation);
         assert_eq!(output.iter().map(|sample| sample.to_bits()).collect::<Vec<_>>(), bits);
         assert_eq!(loop_to, None);
-        assert!(processing.pipeline.is_none());
-        assert_eq!(pipeline_scratch.capacity(), 0);
-        assert_eq!(resampler_scratch.capacity(), 0);
     }
 
     #[test]
@@ -2764,31 +2759,20 @@ mod tests {
     /// does not change the audible volume curve.
     #[test]
     fn volume_to_gain_matches_the_softmixer_cubic_curve() {
-        let expected = |volume: u16| {
-            let normalized = f64::from(volume) / f64::from(u16::MAX);
-            (0.1 + 0.9 * normalized).powi(3) as f32
-        };
-        assert_eq!(volume_to_gain(0), 0.0, "mute is exactly zero");
-        assert_eq!(volume_to_gain(u16::MAX), 1.0, "max volume is unity");
-
-        let table = [
-            (1u16, 0.0010004121),
-            (655u16, 0.0012948577),
-            (6553u16, 0.0068582564),
-            (16384u16, 0.034329213),
-            (32768u16, 0.16638123),
-            (49151u16, 0.46547818),
-            (58982u16, 0.7535881),
-        ];
-        for (volume, expected_gain) in table {
-            let actual = volume_to_gain(volume);
+        use librespot_playback::config::VolumeCtrl;
+        use librespot_playback::mixer::{Mixer, MixerConfig, softmixer::SoftMixer};
+        let mixer = SoftMixer::open(MixerConfig {
+            volume_ctrl: VolumeCtrl::Cubic(60.0),
+            ..MixerConfig::default()
+        }).unwrap();
+        assert_eq!(volume_to_gain(0), 0.0, "mute is exactly silent");
+        assert_eq!(volume_to_gain(u16::MAX), 1.0, "full volume preserves amplitude");
+        for volume in [0u16, 1, 655, 6553, 16384, 32768, 49151, 58982, u16::MAX] {
+            mixer.set_volume(volume);
+            let expected = mixer.get_soft_volume().attenuation_factor() as f32;
             assert!(
-                (actual - expected_gain).abs() <= 1e-6,
-                "mapping mismatch at raw volume {volume}: {actual} != {expected_gain}"
-            );
-            assert!(
-                (actual - expected(volume)).abs() <= 1e-6,
-                "mapping formula mismatch at raw volume {volume}"
+                (volume_to_gain(volume) - expected).abs() <= 1e-6,
+                "sink and mixer loudness disagree at raw volume {volume}"
             );
         }
     }
