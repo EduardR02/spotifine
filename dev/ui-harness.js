@@ -1270,7 +1270,7 @@ const mock = {
           playback.playing = false;
         } else {
           setCurrent(startedIndex);
-          playback.playing = true;
+          playback.playing = !(args.startPaused ?? args.start_paused);
         }
         // An automatic shuffle start has already drawn and consumed its first
         // row; redrawing here would replace the remaining published order.

@@ -435,13 +435,14 @@ function contextForQueueSource(source) {
   return "";
 }
 
-async function startLazyQueue(tracks, source, cursor, index = 0, generation) {
+async function startLazyQueue(tracks, source, cursor, index = 0, generation, startPaused = false) {
   if (!tracks?.length) throw new Error("No playable tracks were returned.");
   const context = contextForQueueSource(source);
   await invoke("play_queue", {
     queue: contextTracks(tracks, context),
     index,
     context,
+    startPaused,
   });
   if (generation !== lazyQueue.generation) return;
   lazyQueue.source = cursor == null ? null : source;
@@ -484,15 +485,17 @@ export function loadCataloguePage(id, releaseTypes = ["albums", "singles"], offs
   return request;
 }
 
-/** The catalogue start still on its way to the engine, or null: the choice
-    it was made under and a promise that settles once its queue has been sent
-    or it has given way. A Play/Pause pressed meanwhile is for the playback
-    that starts, so it is sent after this (`requestPlaying`). */
+/** The catalogue start still on its way to the engine, or null. A Play/Pause
+    pressed meanwhile is for the playback that starts (`requestPlaying`):
+    until the queue is sent the press rides on it as `startPaused`, and once
+    it has been sent the press follows it. `generation` is the choice the
+    start was made under; `settled` settles once the start has landed, failed
+    or given way; `landed` says its queue reached the engine. */
 let pendingStart = null;
 
 export function playCatalogueContext(releases, id, releaseTypes, nextOffset, index) {
   const generation = beginPlayback();
-  const pending = { generation, settled: null };
+  const pending = { generation, settled: null, startPaused: false, queueSent: false, landed: false };
   pendingStart = pending;
   const start = (async () => {
     try {
@@ -500,13 +503,16 @@ export function playCatalogueContext(releases, id, releaseTypes, nextOffset, ind
       // deliberately does not fetch, so this context is sequential.
       if (playback.shuffle) await invoke("set_shuffle", { enabled: false });
       if (generation !== lazyQueue.generation) return;
+      pending.queueSent = true;
       await startLazyQueue(
         catalogueTracks(releases),
         { kind: "catalogue", id, releaseTypes: [...releaseTypes] },
         nextOffset,
         index,
         generation,
+        pending.startPaused,
       );
+      pending.landed = true;
     } finally {
       if (pendingStart === pending) pendingStart = null;
     }
@@ -2656,11 +2662,14 @@ function decodeTrackWaveform(payload) {
  *
  * Neither is a choice of what plays, so neither cancels anything: not a
  * catalogue start still on its way, nor a skip waiting for its page. A press
- * while a start is pending is for the playback that starts: it is sent once
- * the start's queue has been, so the start goes ahead and then pauses or
- * plays as pressed, and the shuffle it switched off belongs to a playback
- * that exists. A start that gives way to a newer choice takes its press with
- * it; that choice owns playback.
+ * while a start is pending is for the playback that starts, and the start
+ * goes ahead, so the shuffle it switched off belongs to a playback that
+ * exists. Pressed before the start has sent its queue, the press travels
+ * with it: the queue loads paused or playing as pressed, in one command, and
+ * nothing sounds or flickers on the way. Pressed after, it is sent once the
+ * queue has landed. A start that fails leaves its press to the playback
+ * already there; one that gives way to a newer choice takes its press with
+ * it, and that choice owns playback.
  */
 function requestPlaying(target) {
   const previous = playback.playing;
@@ -2682,11 +2691,14 @@ function requestPlaying(target) {
   const command = target ? "play" : "pause";
   // A start that has already given way to a newer choice is not pending.
   const start = pendingStart?.generation === lazyQueue.generation ? pendingStart : null;
+  const carried = start !== null && !start.queueSent;
+  if (carried) start.startPaused = !target;
   const sent = start
     ? start.settled.then(() => {
       if (generation !== playingRequestGeneration) return;
-      if (start.generation === lazyQueue.generation) return invoke(command);
-      rollback();
+      if (start.generation !== lazyQueue.generation) return rollback();
+      if (carried && start.landed) return;
+      return invoke(command);
     })
     : invoke(command);
   return sent.catch((error) => {

@@ -711,8 +711,8 @@ for (const wasPlaying of [true, false]) {
       const start = state.playCatalogueContext([{ tracks: [row("press-start")] }], "press-artist", ["albums"], null, 0);
       const identity = state.playbackIdentity();
       state.togglePlay();
-      // Shown at once; sent once the start has sent its queue, so it neither
-      // cancels the start nor lands on the playback being replaced.
+      // Shown at once and sent with the start's queue, so it neither cancels
+      // the start nor lands on the playback being replaced.
       expect(state.playback.playing).toBe(!wasPlaying);
       expect(state.playbackIdentity()).toBe(identity);
       expect(pending.map((request) => request.command)).toEqual(["set_shuffle"]);
@@ -720,16 +720,58 @@ for (const wasPlaying of [true, false]) {
       await settle();
       expect(pending[1].command).toBe("play_queue");
       expect(pending[1].args.queue[0].id).toBe("press-start");
+      expect(pending[1].args.startPaused).toBe(wasPlaying);
       pending[1].resolve(null);
       await start;
       await settle();
-      expect(pending.map((request) => request.command)).toEqual(["set_shuffle", "play_queue", wasPlaying ? "pause" : "play"]);
-      pending[2].resolve(null);
-      await settle();
+      // One command: no play-then-pause, nothing after the queue.
+      expect(pending.map((request) => request.command)).toEqual(["set_shuffle", "play_queue"]);
       expect(state.playback.playing).toBe(!wasPlaying);
     });
   });
 }
+
+test("a Pause pressed once the start's queue has gone out follows it", async () => {
+  await withDeferredCommands(async (pending) => {
+    const current = row("press-late-current");
+    state.applyPlayback({ queue: [current], queue_revision: 0, current_index: 0, current_uri: current.uri,
+      playing: true, shuffle: false });
+    // Shuffle already off: the queue goes out at once, before the press.
+    const start = state.playCatalogueContext([{ tracks: [row("press-late")] }], "press-late", ["albums"], null, 0);
+    expect(pending[0].command).toBe("play_queue");
+    expect(pending[0].args.startPaused).toBe(false);
+    state.togglePlay();
+    expect(pending).toHaveLength(1);
+    pending[0].resolve(null);
+    await start;
+    await settle();
+    expect(pending.map((request) => request.command)).toEqual(["play_queue", "pause"]);
+    pending[1].resolve(null);
+    await settle();
+    expect(state.playback.playing).toBe(false);
+  });
+});
+
+test("a Pause carried by a start that fails pauses the playback already there", async () => {
+  await withDeferredCommands(async (pending) => {
+    const current = row("press-failed-current");
+    state.applyPlayback({ queue: [current], queue_revision: 0, current_index: 0, current_uri: current.uri,
+      playing: true, shuffle: true });
+    const start = state.playCatalogueContext([{ tracks: [row("press-failed")] }], "press-failed", ["albums"], null, 0)
+      .catch((error) => error);
+    state.togglePlay();
+    pending[0].resolve(null);
+    await settle();
+    expect(pending[1].args.startPaused).toBe(true);
+    pending[1].reject(new Error("The device went away."));
+    expect(await start).toBeInstanceOf(Error);
+    await settle();
+    expect(pending.map((request) => request.command)).toEqual(["set_shuffle", "play_queue", "pause"]);
+    pending[2].resolve(null);
+    await settle();
+    expect(state.playback.playing).toBe(false);
+  });
+});
 
 test("a newer choice of what plays takes a waiting Play/Pause with the start it was for", async () => {
   await withDeferredCommands(async (pending) => {
@@ -747,6 +789,7 @@ test("a newer choice of what plays takes a waiting Play/Pause with the start it 
     // The replacement plays; nothing pauses it on behalf of a start that never happened.
     expect(pending.map((request) => request.command)).toEqual(["set_shuffle", "play_queue"]);
     expect(pending[1].args.context).toBe("playlist:press-replacement");
+    expect(pending[1].args.startPaused).toBeUndefined();
     expect(state.playback.playing).toBe(true);
   });
 });
