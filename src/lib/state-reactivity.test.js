@@ -190,6 +190,52 @@ test("a background refresh keeps the open list when nothing moved and replaces o
   }
 });
 
+test("the queue is held as the plain rows the engine sent, and what shows it still follows it", () => {
+  const rows = [row("raw-q1", { name: "First" }), row("raw-q2", { name: "Second" }), row("raw-q3", { name: "Third" })];
+  state.applyPlayback({ queue: rows, queue_revision: 900, upcoming: [1, 2], order_revision: 900, current_index: 0 });
+  expect(state.playback.queue).toBe(rows);
+  expect(types.isProxy(state.playback.queue)).toBe(false);
+  expect(types.isProxy(state.playback.queue[0])).toBe(false);
+  expect(types.isProxy(state.playback.upcoming)).toBe(false);
+
+  // The player bar's track, the panel's "next" and the marks on queue rows.
+  const nowPlaying = watch(() => state.playback.queue[state.playback.current_index]?.name);
+  const upNext = watch(() => state.playback.queue[state.playback.upcoming[0]]?.name ?? null);
+  const marks = watch(() => state.playback.queue.map((track) => state.isCached(track)));
+  try {
+    expect(nowPlaying.seen.at(-1)).toBe("First");
+    expect(upNext.seen.at(-1)).toBe("Second");
+    expect(marks.seen.at(-1)).toEqual([false, false, false]);
+
+    // A download mark is written into the held row and still re-renders it.
+    state.applyPlayback({ cached_ids: ["raw-q2"] });
+    $.flush();
+    expect(marks.seen.at(-1)).toEqual([false, true, false]);
+    expect(state.playback.queue).toBe(rows);
+
+    // The same generation again keeps the rows; a new one replaces them whole.
+    state.applyPlayback({ queue: rows.map((track) => ({ ...track })), queue_revision: 900, position_ms: 1_000 });
+    expect(state.playback.queue).toBe(rows);
+    const fresh = [row("raw-q4", { name: "Fourth" }), row("raw-q2", { name: "Second", cached: true })];
+    state.applyPlayback({ queue: fresh, queue_revision: 901, upcoming: [0], order_revision: 901, current_index: 1 });
+    $.flush();
+    expect(state.playback.queue).toBe(fresh);
+    expect(nowPlaying.seen.at(-1)).toBe("Second");
+    expect(upNext.seen.at(-1)).toBe("Fourth");
+    expect(marks.seen.at(-1)).toEqual([false, true]);
+
+    // An order-only change moves "next" and leaves the rows alone.
+    state.applyPlayback({ upcoming: [], order_revision: 902 });
+    $.flush();
+    expect(upNext.seen.at(-1)).toBeNull();
+    expect(state.playback.queue).toBe(fresh);
+  } finally {
+    nowPlaying.stop();
+    upNext.stop();
+    marks.stop();
+  }
+});
+
 /* The playhead clock: a fake interval and a fake monotonic clock, so the test
    can see how many tickers run and what the progress bar would show. */
 function withFakeClock(run) {
@@ -656,18 +702,150 @@ test("a next waiting for catalogue backfill cannot skip the replacement playlist
   });
 });
 
-test("pause cancels a pending catalogue start without changing the current seek target", async () => {
+for (const wasPlaying of [true, false]) {
+  test(`${wasPlaying ? "Pause" : "Play"} pressed while an artist play-all is starting applies to the playback that starts`, async () => {
+    await withDeferredCommands(async (pending) => {
+      const current = row(`press-current-${wasPlaying}`);
+      state.applyPlayback({ queue: [current], queue_revision: 0, current_index: 0, current_uri: current.uri,
+        playing: wasPlaying, shuffle: true });
+      const start = state.playCatalogueContext([{ tracks: [row("press-start")] }], "press-artist", ["albums"], null, 0);
+      const identity = state.playbackIdentity();
+      state.togglePlay();
+      // Shown at once; sent once the start has sent its queue, so it neither
+      // cancels the start nor lands on the playback being replaced.
+      expect(state.playback.playing).toBe(!wasPlaying);
+      expect(state.playbackIdentity()).toBe(identity);
+      expect(pending.map((request) => request.command)).toEqual(["set_shuffle"]);
+      pending[0].resolve(null);
+      await settle();
+      expect(pending[1].command).toBe("play_queue");
+      expect(pending[1].args.queue[0].id).toBe("press-start");
+      pending[1].resolve(null);
+      await start;
+      await settle();
+      expect(pending.map((request) => request.command)).toEqual(["set_shuffle", "play_queue", wasPlaying ? "pause" : "play"]);
+      pending[2].resolve(null);
+      await settle();
+      expect(state.playback.playing).toBe(!wasPlaying);
+    });
+  });
+}
+
+test("a newer choice of what plays takes a waiting Play/Pause with the start it was for", async () => {
   await withDeferredCommands(async (pending) => {
-    state.playback.shuffle = true;
-    const obsolete = state.playCatalogueContext([{ tracks: [row("obsolete")] }], "pause-artist", ["albums"], null, 0);
-    const identity = state.playbackIdentity();
-    const pause = state.api.pause();
-    expect(state.playbackIdentity()).toBe(identity);
+    const current = row("press-superseded-current");
+    state.applyPlayback({ queue: [current], queue_revision: 0, current_index: 0, current_uri: current.uri,
+      playing: true, shuffle: true });
+    const start = state.playCatalogueContext([{ tracks: [row("press-superseded")] }], "press-superseded", ["albums"], null, 0);
+    state.togglePlay();
+    const replacement = state.api.playQueue([row("press-replacement")], 0, "playlist:press-replacement");
     pending[1].resolve(null);
-    await pause;
+    await replacement;
     pending[0].resolve(null);
-    await obsolete;
-    expect(pending.map((request) => request.command)).toEqual(["set_shuffle", "pause"]);
+    await start;
+    await settle();
+    // The replacement plays; nothing pauses it on behalf of a start that never happened.
+    expect(pending.map((request) => request.command)).toEqual(["set_shuffle", "play_queue"]);
+    expect(pending[1].args.context).toBe("playlist:press-replacement");
+    expect(state.playback.playing).toBe(true);
+  });
+});
+
+for (const outcome of ["arrives", "fails"]) {
+  test(`a Next from the last loaded row is sent after its page ${outcome}, whatever is pressed meanwhile`, async () => {
+    await withDeferredCommands(async (pending) => {
+      const id = `next-page-${outcome}`;
+      const last = row(`${id}-last`);
+      state.applyPlayback({ queue: [last], queue_revision: 0, current_index: 0, current_uri: last.uri, playing: true });
+      const setup = state.playCatalogueContext([{ tracks: [last] }], id, ["albums"], 4, 0);
+      pending[0].resolve(null);
+      await setup;
+      expect(pending[1].command).toBe("browse_artist_catalogue");
+      state.ui.error = null;
+      try {
+        const next = state.api.next();
+        // Space while the Next waits: paused at once, and the Next still stands.
+        const pause = state.api.pause();
+        expect(pending.map((request) => request.command)).toEqual(["play_queue", "browse_artist_catalogue", "pause"]);
+        pending[2].resolve(null);
+        await pause;
+        if (outcome === "arrives") {
+          pending[1].resolve({ releases: [{ tracks: [row(`${id}-page`)] }], next_offset: null });
+          await settle();
+          expect(pending[3].command).toBe("add_queue_batch");
+          pending[3].resolve(null);
+        } else {
+          pending[1].reject(new Error("The network is unreachable."));
+        }
+        await settle();
+        expect(pending.at(-1).command).toBe("next");
+        pending.at(-1).resolve(null);
+        await next;
+        if (outcome === "fails") expect(state.ui.error).toContain("The network is unreachable.");
+        else expect(state.ui.error).toBeNull();
+      } finally {
+        state.ui.error = null;
+      }
+    });
+  });
+}
+
+test("skips pressed while a Next waits for its page are each sent, in the order pressed", async () => {
+  await withDeferredCommands(async (pending) => {
+    const last = row("skip-order-last");
+    state.applyPlayback({ queue: [last], queue_revision: 0, current_index: 0, current_uri: last.uri });
+    const setup = state.playCatalogueContext([{ tracks: [last] }], "skip-order", ["albums"], 4, 0);
+    pending[0].resolve(null);
+    await setup;
+    const presses = [state.api.next(), state.api.next(), state.api.previous()];
+    expect(pending.map((request) => request.command)).toEqual(["play_queue", "browse_artist_catalogue"]);
+    pending[1].resolve({ releases: [{ tracks: [row("skip-order-a"), row("skip-order-b")] }], next_offset: null });
+    await settle();
+    pending[2].resolve(null);
+    await settle();
+    expect(pending.map((request) => request.command)).toEqual([
+      "play_queue", "browse_artist_catalogue", "add_queue_batch", "next", "next", "previous",
+    ]);
+    for (const request of pending.slice(3)) request.resolve(null);
+    await Promise.all(presses);
+    // Once the backlog has drained, a skip goes straight out again.
+    const later = state.api.previous();
+    expect(pending.at(-1).command).toBe("previous");
+    expect(pending).toHaveLength(7);
+    pending.at(-1).resolve(null);
+    await later;
+  });
+});
+
+test("removing or moving a queued song keeps an artist play-all loading the rest", async () => {
+  await withDeferredCommands(async (pending) => {
+    const tracks = Array.from({ length: 12 }, (_, i) => row(`edit-tail-${i}`));
+    state.applyPlayback({ queue: tracks, queue_revision: 0, current_index: 0, current_uri: tracks[0].uri,
+      context: "artist:edit-tail" });
+    const play = state.playCatalogueContext([{ tracks }], "edit-tail", ["albums"], 6, 0);
+    pending[0].resolve(null);
+    await play;
+    const removal = state.api.removeQueue(3);
+    pending[1].resolve(null);
+    await removal;
+    const kept = tracks.filter((_, i) => i !== 3);
+    state.applyPlayback({ queue: kept, queue_revision: 0 });
+    const move = state.api.moveQueue(5, 2);
+    pending[2].resolve(null);
+    await move;
+    // Playback reaches the last rows loaded: the next releases still come.
+    state.applyPlayback({ current_index: 10, current_uri: kept[10].uri });
+    const tail = state.maybeBackfillLazyQueue();
+    expect(pending[3].command).toBe("browse_artist_catalogue");
+    expect(pending[3].args.id).toBe("edit-tail");
+    expect(pending[3].args.offset).toBe(6);
+    pending[3].resolve({ releases: [{ tracks: [row("edit-tail-next")] }], next_offset: null });
+    await settle();
+    expect(pending[4].command).toBe("add_queue_batch");
+    expect(pending[4].args.tracks.map((track) => track.id)).toEqual(["edit-tail-next"]);
+    expect(pending[4].args.context).toBe("artist:edit-tail");
+    pending[4].resolve(null);
+    await tail;
   });
 });
 

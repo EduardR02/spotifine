@@ -285,39 +285,62 @@ export function focusSearch() {
 
 /* ---------------- Playback ---------------- */
 
-export const playback = $state({
-  ready: false,
-  auth_state: null,
-  auth_url: null,
-  playing: false,
-  buffering: false,
-  output_device_id: "",
-  output_device_name: "",
-  username: null,
-  position_ms: 0,
-  duration_ms: 0,
-  volume: 100,
-  shuffle: false,
-  repeat: "off",
-  playback_speed: 1,
-  audible_playback_speed: 1,
-  current_index: -1,
-  current_uri: null,
-  context: "",
-  queue: [],
-  queue_revision: 0,
-  order_revision: 0,
+/**
+ * The engine's playback state as the webview last heard it.
+ *
+ * `queue` and `upcoming` are raw, like the detail payloads (`detail`): a
+ * payload that moves them hands over whole new arrays, which are adopted as
+ * they arrive and never edited in place (`applyPlayback`). A deep proxy would
+ * wrap every row of a 10,000-song queue, and every reader would walk those
+ * proxies: the download marks on each delta, the queue view's keys on each
+ * change. Marks are the one write into a row, and they announce themselves
+ * through `isCached`.
+ */
+class PlaybackState {
+  ready = $state(false);
+  auth_state = $state(null);
+  auth_url = $state(null);
+  playing = $state(false);
+  buffering = $state(false);
+  output_device_id = $state("");
+  output_device_name = $state("");
+  username = $state(null);
+  position_ms = $state(0);
+  duration_ms = $state(0);
+  volume = $state(100);
+  shuffle = $state(false);
+  repeat = $state("off");
+  playback_speed = $state(1);
+  audible_playback_speed = $state(1);
+  current_index = $state(-1);
+  current_uri = $state(null);
+  context = $state("");
+  queue = $state.raw([]);
+  queue_revision = $state(0);
+  order_revision = $state(0);
   /* Queue indexes in the order automatic playback will actually reach them,
      current row excluded. Only the engine knows this: it holds the live
      shuffle bag and the per-playlist exclusions, so index order is a guess. */
-  upcoming: [],
+  upcoming = $state.raw([]);
   /* The row the engine is fetching ahead for a gapless start, from about
      thirty seconds before the end until the next load; "" otherwise. The
      only time the app does anything for a track before it plays: the panel
      warms its Canvas (NowPlayingPanel). */
-  preload_uri: "",
-  error: null,
-});
+  preload_uri = $state("");
+  error = $state(null);
+}
+export const playback = new PlaybackState();
+
+/** The fields a payload's value is copied into as it arrives: all of them but
+    `queue` and `upcoming`, which are adopted by revision (`applyPlayback`). A
+    compiled class keeps its state behind accessors, so the names are listed
+    rather than read off the object. */
+const PLAYBACK_FIELDS = new Set([
+  "ready", "auth_state", "auth_url", "playing", "buffering", "output_device_id",
+  "output_device_name", "username", "position_ms", "duration_ms", "volume", "shuffle",
+  "repeat", "playback_speed", "audible_playback_speed", "current_index", "current_uri",
+  "context", "queue_revision", "order_revision", "preload_uri", "error",
+]);
 
 /** Source identity comes from the engine's active row, never queue contents. */
 export function isPlayingSource(context) {
@@ -340,12 +363,20 @@ export function playbackIdentity() {
   return playbackIdentityGeneration;
 }
 
-const lazyQueue = $state({ generation: 0, source: null, cursor: null, loading: false, retryAfter: 0, suspendedLease: null });
+/* A catalogue queue's tail: the source it pages from and where the next page
+   starts. Plain, not reactive: it is read only from commands and from the
+   App's low-water effect, which reads it untracked. `generation` counts
+   choices of what plays; a catalogue start still on its way yields to any
+   newer one. */
+const lazyQueue = { generation: 0, source: null, cursor: null, retryAfter: 0, suspendedLease: null };
 const QUEUE_BACKFILL_LOW_WATER = 8;
 let lazyBackfillPromise = null;
 const cataloguePageCache = new Map();
 const CATALOGUE_PAGE_CACHE_MAX = 64;
 const cataloguePagePending = new Map();
+/* Counts the choices a skip still waiting to be sent yields to: every choice
+   of what plays except another skip, and an account change (`skip`). */
+let skipGeneration = 0;
 
 function clearLazyQueue(keepSource = false) {
   lazyQueue.generation += 1;
@@ -354,13 +385,16 @@ function clearLazyQueue(keepSource = false) {
   if (keepSource) return;
   lazyQueue.source = null;
   lazyQueue.cursor = null;
-  lazyQueue.loading = false;
   lazyQueue.retryAfter = 0;
   lazyQueue.suspendedLease = null;
   lazyBackfillPromise = null;
 }
-function beginPlayback(keepLazySource = false) {
+/** A new choice of what plays. It supersedes a catalogue start still on its
+    way and, unless it is itself a skip, the skips still waiting to be sent:
+    those were aimed at the queue as it stood. */
+function beginPlayback(keepLazySource = false, { skip = false } = {}) {
   clearLazyQueue(keepLazySource);
+  if (!skip) skipGeneration += 1;
   playbackIdentityGeneration += 1;
   return lazyQueue.generation;
 }
@@ -374,8 +408,7 @@ function beginPlayback(keepLazySource = false) {
  * from the command's own `context` argument (`fill_queue_context` in the
  * engine), so a row the caller never labelled does not need a copy carrying the
  * label. Building those copies was the whole cost of a click on a long list —
- * one fresh object per row, and with them a fresh Svelte proxy per row for
- * every consumer of the queue. Only a row that already claims a different
+ * one fresh object per row. Only a row that already claims a different
  * context is rewritten here, because that is the one thing the engine will not
  * decide for it.
  */
@@ -451,19 +484,35 @@ export function loadCataloguePage(id, releaseTypes = ["albums", "singles"], offs
   return request;
 }
 
-export async function playCatalogueContext(releases, id, releaseTypes, nextOffset, index) {
+/** The catalogue start still on its way to the engine, or null: the choice
+    it was made under and a promise that settles once its queue has been sent
+    or it has given way. A Play/Pause pressed meanwhile is for the playback
+    that starts, so it is sent after this (`requestPlaying`). */
+let pendingStart = null;
+
+export function playCatalogueContext(releases, id, releaseTypes, nextOffset, index) {
   const generation = beginPlayback();
-  // would require enumerating the very catalogue this path intentionally does
-  // not fetch, so this context is explicitly sequential.
-  if (playback.shuffle) await invoke("set_shuffle", { enabled: false });
-  if (generation !== lazyQueue.generation) return;
-  await startLazyQueue(
-    catalogueTracks(releases),
-    { kind: "catalogue", id, releaseTypes: [...releaseTypes] },
-    nextOffset,
-    index,
-    generation,
-  );
+  const pending = { generation, settled: null };
+  pendingStart = pending;
+  const start = (async () => {
+    try {
+      // Shuffling would mean enumerating the very catalogue this path
+      // deliberately does not fetch, so this context is sequential.
+      if (playback.shuffle) await invoke("set_shuffle", { enabled: false });
+      if (generation !== lazyQueue.generation) return;
+      await startLazyQueue(
+        catalogueTracks(releases),
+        { kind: "catalogue", id, releaseTypes: [...releaseTypes] },
+        nextOffset,
+        index,
+        generation,
+      );
+    } finally {
+      if (pendingStart === pending) pendingStart = null;
+    }
+  })();
+  pending.settled = start.then(() => {}, () => {});
+  return start;
 }
 
 async function backfillLazyQueue(force = false) {
@@ -473,7 +522,6 @@ async function backfillLazyQueue(force = false) {
   if (!source || cursor == null || lazyQueue.suspendedLease !== null) return;
   if (!force && (performance.now() < lazyQueue.retryAfter || playback.current_index < 0 || playback.queue.length - playback.current_index > QUEUE_BACKFILL_LOW_WATER)) return;
   if (lazyBackfillPromise) return lazyBackfillPromise;
-  lazyQueue.loading = true;
   const request = (async () => {
     try {
       const page = await loadCataloguePage(source.id, source.releaseTypes, cursor);
@@ -494,10 +542,7 @@ async function backfillLazyQueue(force = false) {
       if (source === lazyQueue.source) lazyQueue.retryAfter = performance.now() + 5000;
       throw error;
     } finally {
-      if (lazyBackfillPromise === request) {
-        lazyQueue.loading = false;
-        lazyBackfillPromise = null;
-      }
+      if (lazyBackfillPromise === request) lazyBackfillPromise = null;
     }
   })();
   lazyBackfillPromise = request;
@@ -674,11 +719,11 @@ export function applyPlayback(payload) {
   const incomingOrderRevision = namedQueueRevision(payload.order_revision);
   const orderHeld = incomingOrder === null ||
     (orderRevision !== null && incomingOrderRevision === orderRevision);
-  for (const key of Object.keys(playback)) {
-    if (key === "queue" || key === "upcoming") continue;
+  for (const key of Object.keys(payload)) {
+    if (!PLAYBACK_FIELDS.has(key)) continue;
     // A full state for an older drag position must not undo the live intent.
     if (key === "volume" && volumePendingGeneration !== null) continue;
-    if (key in payload) playback[key] = payload[key];
+    playback[key] = payload[key];
   }
   if (loggedOut) {
     playback.username = null;
@@ -1306,6 +1351,7 @@ function observeSearchSession(payload) {
       followed.error = "";
       invalidateSavedIn();
       clearLazyQueue();
+      skipGeneration += 1;
       cataloguePageCache.clear();
       cataloguePagePending.clear();
       clearPlaylistRecommendationsCache();
@@ -2605,10 +2651,18 @@ function decodeTrackWaveform(payload) {
     peaks,
   };
 }
+/**
+ * Play or pause, shown at once.
+ *
+ * Neither is a choice of what plays, so neither cancels anything: not a
+ * catalogue start still on its way, nor a skip waiting for its page. A press
+ * while a start is pending is for the playback that starts: it is sent once
+ * the start's queue has been, so the start goes ahead and then pauses or
+ * plays as pressed, and the shuffle it switched off belongs to a playback
+ * that exists. A start that gives way to a newer choice takes its press with
+ * it; that choice owns playback.
+ */
 function requestPlaying(target) {
-  // A later resume/pause intent cancels a pending catalogue start, not its
-  // already-installed tail or the logical target of a seek gesture.
-  clearLazyQueue(true);
   const previous = playback.playing;
   const at = positionMs();
   const generation = ++playingRequestGeneration;
@@ -2617,15 +2671,81 @@ function requestPlaying(target) {
   playback.playing = target;
   anchorPlayhead(at);
   syncPlayheadTicker();
-  return invoke(target ? "play" : "pause").catch((error) => {
-    if (generation === playingRequestGeneration && authority === playingAuthorityGeneration) {
-      const rollbackAt = positionMs();
-      playback.playing = previous;
-      anchorPlayhead(rollbackAt);
-      syncPlayheadTicker();
-    }
+  // Only the newest press, and only while no engine state has answered it.
+  const rollback = () => {
+    if (generation !== playingRequestGeneration || authority !== playingAuthorityGeneration) return;
+    const rollbackAt = positionMs();
+    playback.playing = previous;
+    anchorPlayhead(rollbackAt);
+    syncPlayheadTicker();
+  };
+  const command = target ? "play" : "pause";
+  // A start that has already given way to a newer choice is not pending.
+  const start = pendingStart?.generation === lazyQueue.generation ? pendingStart : null;
+  const sent = start
+    ? start.settled.then(() => {
+      if (generation !== playingRequestGeneration) return;
+      if (start.generation === lazyQueue.generation) return invoke(command);
+      rollback();
+    })
+    : invoke(command);
+  return sent.catch((error) => {
+    rollback();
     throw error;
   });
+}
+
+/** Settles when the last skip still waiting has been sent or withdrawn; null when none waits. */
+let skipBacklog = null;
+
+/** A Next from the last loaded row of a catalogue queue, which has more to load. */
+function atLoadedTail() {
+  return !!lazyQueue.source && playback.current_index >= playback.queue.length - 1;
+}
+
+/**
+ * Next or Previous. Every press becomes its command, sent in the order the
+ * presses came.
+ *
+ * The one press that waits is a Next from the last loaded row of a catalogue
+ * queue: it asks for the next page first, so the skip lands on that page's
+ * first track instead of off the end. Whatever that page does — arrives,
+ * fails, gives way to a preview — the skip is sent after it; a failed page is
+ * reported, and playback goes on as far as the loaded rows reach. A skip
+ * pressed meanwhile waits behind it rather than overtaking it, until it has
+ * been sent. Only a newer choice of what plays (a row, a list, an output; not
+ * another skip, nor Play or Pause) or an account change withdraws a skip not
+ * yet sent: it was aimed at the queue as it stood.
+ */
+function skip(command) {
+  beginPlayback(true, { skip: true });
+  const generation = skipGeneration;
+  const ahead = skipBacklog;
+  if (!ahead && !(command === "next" && atLoadedTail())) return invoke(command);
+  let sent;
+  const turn = new Promise((resolve) => { sent = resolve; });
+  skipBacklog = turn;
+  turn.then(() => {
+    if (skipBacklog === turn) skipBacklog = null;
+  });
+  return (async () => {
+    try {
+      if (ahead) await ahead;
+      if (command === "next" && atLoadedTail()) {
+        try {
+          await backfillLazyQueue(true);
+        } catch (error) {
+          if (generation === skipGeneration) {
+            ui.error = `Could not load more of this artist. ${error instanceof Error ? error.message : String(error ?? "")}`.trim();
+          }
+        }
+      }
+      if (generation !== skipGeneration) return;
+      return invoke(command);
+    } finally {
+      sent();
+    }
+  })();
 }
 
 function requestVolume(percent) {
@@ -2664,18 +2784,8 @@ export const api = {
   play: () => requestPlaying(true),
   pause: () => requestPlaying(false),
   setWindowVisible: (visible, refresh = false) => invoke("set_window_visible", { visible, refresh }),
-  next: async () => {
-    const generation = beginPlayback(true);
-    if (lazyQueue.source && playback.current_index >= playback.queue.length - 1) {
-      await backfillLazyQueue(true);
-    }
-    if (generation !== lazyQueue.generation) return;
-    return invoke("next");
-  },
-  previous: () => {
-    beginPlayback(true);
-    return invoke("previous");
-  },
+  next: () => skip("next"),
+  previous: () => skip("previous"),
   seek: (ms) => {
     const target = Math.max(0, Math.round(ms));
     const generation = ++seekRequestGeneration;
@@ -2746,14 +2856,11 @@ export const api = {
       context: source,
     });
   },
-  removeQueue: (index) => {
-    clearLazyQueue();
-    return invoke("remove_queue", { index });
-  },
-  moveQueue: (from, to) => {
-    clearLazyQueue();
-    return invoke("move_queue", { from, to });
-  },
+  /* Edits of the queue, not choices of what plays: a catalogue queue's tail
+     only ever appends, so removing or moving a row leaves its source and
+     cursor, and a start or a skip still on its way, as they were. */
+  removeQueue: (index) => invoke("remove_queue", { index }),
+  moveQueue: (from, to) => invoke("move_queue", { from, to }),
   /**
    * One window of the listening archive. The filter and the order travel with
    * the request because the engine holds the archive and the view holds only

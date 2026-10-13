@@ -93,16 +93,19 @@
 
   const VOLUME_INTERVAL_MS = 50;
   let volumeControl = $state(null);
-  let volumeDraft = $state(null);
   let volumeError = $state("");
   let restoreVolume = $state(70);
-  let pendingVolume = null;
+  /* The newest value still waiting for its send slot. Once sent it is the
+     store's: `api.setVolume` shows it in `playback.volume` at once and holds
+     it there against older engine states until the engine confirms it, so
+     the bar keeps no optimistic copy of its own. */
+  let pendingVolume = $state(null);
   let activeVolume = null;
   let volumeTimer = null;
   let volumeUrgent = false;
   let volumeSentAt = -Infinity;
   let volumeDisposed = false;
-  const volumePercent = $derived(volumeDraft ?? playback.volume);
+  const volumePercent = $derived(pendingVolume ?? playback.volume);
 
   $effect(() => {
     const percent = playback.volume;
@@ -133,10 +136,7 @@
       }
     } finally {
       activeVolume = null;
-      if (!volumeDisposed) {
-        if (pendingVolume === null) volumeDraft = null;
-        else flushVolume();
-      }
+      if (!volumeDisposed && pendingVolume !== null) flushVolume();
     }
   }
 
@@ -144,11 +144,9 @@
     if (!Number.isFinite(percent)) return;
     const next = Math.min(100, Math.max(0, Math.round(percent)));
     volumeError = "";
-    volumeDraft = next;
     pendingVolume = next === activeVolume
       || (activeVolume === null && next === playback.volume) ? null : next;
     volumeUrgent = final;
-    if (pendingVolume === null && activeVolume === null) volumeDraft = null;
     flushVolume();
   }
 

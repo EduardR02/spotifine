@@ -12,11 +12,11 @@ function track(id, cached = false) {
   return { id, uri: `spotify:track:${id}`, name: `Track ${id}`, duration_ms: 180_000, cached };
 }
 
+/* That the store holds the very rows the engine sent, as plain objects, is a
+   question for the real runtime: see state-reactivity.test.js. */
 test("rows whose generation did not move keep their identity", () => {
-  const rows = [track("a"), track("b")];
-  applyPlayback({ queue: rows, queue_revision: 5, current_index: 0 });
+  applyPlayback({ queue: [track("a"), track("b")], queue_revision: 5, current_index: 0 });
   const held = playback.queue;
-  expect(held[0]).toBe(rows[0]);
 
   // The same generation again: a payload carrying an equal array must not
   // replace the rows every consumer of the queue is keyed on.
@@ -39,9 +39,8 @@ test("a new generation adopts the rows it names, an empty one included", () => {
 });
 
 test("a payload with no revision at all is adopted as it arrives", () => {
-  const rows = [track("c")];
-  applyPlayback({ queue: rows, current_index: 0 });
-  expect(playback.queue[0]).toBe(rows[0]);
+  applyPlayback({ queue: [track("c")], current_index: 0 });
+  expect(playback.queue.map((row) => row.id)).toEqual(["c"]);
 });
 
 test("a payload that keeps the queue still updates everything else", () => {

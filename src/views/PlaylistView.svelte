@@ -41,6 +41,7 @@
   import { coverTone } from "../lib/covertone.svelte.js";
   import { formatTotal } from "../lib/time.js";
   import { detailArtSize } from "../lib/layout.js";
+  import { occurrenceKeys, occurrenceIdentity } from "../lib/occurrence-keys.js";
   import HeaderMenu from "../components/HeaderMenu.svelte";
   import PlaylistActions, { playlistRequest } from "../components/PlaylistActions.svelte";
 
@@ -202,7 +203,7 @@
     // A known local MOV carries occurrence tokens with its rows. A new
     // authoritative array cannot inherit that proof merely by matching URIs.
     const tokens = reorderSession?.rows === tracks
-      ? reorderSession.tokens : trackTokens(tracks);
+      ? reorderSession.tokens : occurrenceKeys(tracks);
     const byTrack = new Map();
     for (let i = 0; i < tracks.length; i++) {
       const keys = byTrack.get(tracks[i]) ?? [];
@@ -257,16 +258,6 @@
    */
   let reorderSession = null;
   let reorderBlocked = $state(false);
-
-  function trackTokens(list) {
-    const counts = new Map();
-    return list.map((track) => {
-      const key = `${track.uri ?? track.id}\u0000${track.added_at ?? ""}`;
-      const occurrence = counts.get(key) ?? 0;
-      counts.set(key, occurrence + 1);
-      return `${key}\u0000${occurrence}`;
-    });
-  }
 
   function move(list, from, to) {
     const [item] = list.splice(from, 1);
@@ -354,13 +345,12 @@
             return;
           }
           const list = fresh.tracks.slice();
-          const freshTokens = trackTokens(list);
+          const freshTokens = occurrenceKeys(list);
           // Keep duplicate rows' tokens attached to their confirmed storage
           // positions when the server reports the order of successful MOVs.
           session.tokens = freshTokens.length === session.confirmedTokens.length &&
             freshTokens.every((token, index) =>
-              token.slice(0, token.lastIndexOf("\u0000")) ===
-              session.confirmedTokens[index].slice(0, session.confirmedTokens[index].lastIndexOf("\u0000")))
+              occurrenceIdentity(token) === occurrenceIdentity(session.confirmedTokens[index]))
             ? session.confirmedTokens.slice()
             : freshTokens;
           session.confirmedTokens = session.tokens.slice();
@@ -404,7 +394,7 @@
     const actualTo = mirrored ? last - to : to;
     if (!reorderSession || reorderSession.id !== id ||
         (!reorderSession.pending.length && reorderSession.rows !== list)) {
-      const tokens = trackTokens(list);
+      const tokens = occurrenceKeys(list);
       reorderSession = {
         id, tokens, confirmedTokens: tokens.slice(), pending: [], running: false,
         startSnapshot: pl.snapshot_id, successes: 0, refreshGeneration: 0, cancelRefresh: null,
@@ -432,7 +422,7 @@
     untrack(() => {
       const session = reorderSession;
       if (!session?.pending.length || !activeReorder(session) || session.rows === list) return;
-      const incoming = trackTokens(list);
+      const incoming = occurrenceKeys(list);
       if (incoming.length !== session.tokens.length ||
         incoming.every((token, index) => token === session.tokens[index])) return;
       const rows = new Map(incoming.map((token, index) => [token, list[index]]));
@@ -1022,7 +1012,7 @@
       <div style="margin-top:var(--s6)">
         <TrackList
           tracks={sortedTracks}
-          occurrenceKeys={sortedTrackKeys}
+          trackKeys={sortedTrackKeys}
           {playFrom}
           playlistId={editable ? pl.id : null}
           queueContext={`playlist:${pl?.id ?? ""}`}

@@ -28,10 +28,13 @@
   import { scrollbar } from "../lib/scrollbar.js";
   import { vuMeter } from "../lib/vu-meter.js";
   import { pressTrack, justDragged, registerReorderZone, trackDrag } from "../lib/dnd.svelte.js";
+  import { occurrenceKeys, occurrences } from "../lib/occurrence-keys.js";
 
   let {
     tracks = [],
-    occurrenceKeys = null,
+    /** `tracks`' occurrence keys, when the page holds a proof of them that a
+        fresh count cannot give (a local reorder carries its rows' keys). */
+    trackKeys = null,
     playFrom,
     showAlbum = true,
     showArt = true,
@@ -153,7 +156,7 @@
     sortKey;
     sortDirection;
     tracks;
-    occurrenceKeys;
+    trackKeys;
     return registerReorderZone(zoneEl, () => ({
       length: tracks.length,
       source: `${queueSource}\u0000${playlistId ?? ""}\u0000${sessionEpoch()}`,
@@ -743,35 +746,15 @@
   let seenPlaylistId = null;
   let seenLength = -1;
 
-  // Keys are computed on list changes, never on scroll. URI plus insertion
-  // identity distinguishes duplicate playlist occurrences across snapshots.
-  const rowKeys = $derived.by(() => {
-    if (occurrenceKeys) return occurrenceKeys;
-    const counts = new Map();
-    return tracks.map((track) => {
-      const identity = `${track.uri ?? track.id}\u0000${track.added_at ?? ""}`;
-      const occurrence = counts.get(identity) ?? 0;
-      counts.set(identity, occurrence + 1);
-      return `${identity}\u0000${occurrence}`;
-    });
-  });
-  const rowIdentity = $derived.by(() => {
-    const indices = new Map();
-    const counts = new Map();
-    for (let i = 0; i < rowKeys.length; i++) {
-      const key = rowKeys[i];
-      indices.set(key, i);
-      const base = key.slice(0, key.lastIndexOf("\u0000"));
-      counts.set(base, (counts.get(base) ?? 0) + 1);
-    }
-    return { indices, counts };
-  });
+  // Keys are computed on list changes, never on scroll (occurrence-keys.js).
+  const rowKeys = $derived(trackKeys ?? occurrenceKeys(tracks));
+  const rowIdentity = $derived(occurrences(rowKeys));
   function keyMultiplicity(key) {
-    return rowIdentity.counts.get(key.slice(0, key.lastIndexOf("\u0000"))) ?? 0;
+    return rowIdentity.multiplicity(key);
   }
   function occurrenceIndex(key, multiplicity) {
     if (multiplicity !== undefined && keyMultiplicity(key) !== multiplicity) return -1;
-    return rowIdentity.indices.get(key) ?? -1;
+    return rowIdentity.indexOf(key);
   }
   let focusedKey = $state(null);
   let focusedMultiplicity = $state(0);

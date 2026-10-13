@@ -8,6 +8,7 @@
   import { observeStuck } from "../lib/sticky.js";
   import { rowWindow } from "../lib/virtual.js";
   import { vuMeter } from "../lib/vu-meter.js";
+  import { occurrenceKeys, occurrences } from "../lib/occurrence-keys.js";
   const queue = $derived(playback.queue);
 
   /* Two index spaces live in this file. `qi` is a queue index — the only thing
@@ -90,19 +91,10 @@
   let seenQueue = null;
   let seenLength = -1;
 
-  const queueIdentity = $derived.by(() => {
-    const counts = new Map();
-    const keys = queue.map((track) => {
-      const identity = JSON.stringify([track.uri, track.added_at ?? null, track.context ?? ""]);
-      const occurrence = counts.get(identity) ?? 0;
-      counts.set(identity, occurrence + 1);
-      return `${identity}:${occurrence}`;
-    });
-    return { keys, counts };
-  });
+  const queueIdentity = $derived(occurrences(occurrenceKeys(queue)));
   const queueKeys = $derived(queueIdentity.keys);
   function keyMultiplicity(key) {
-    return queueIdentity.counts.get(key.slice(0, key.lastIndexOf(":"))) ?? 0;
+    return queueIdentity.multiplicity(key);
   }
   let focusedKey = $state(null);
   let focusedMultiplicity = $state(0);
@@ -111,7 +103,7 @@
   // is replaced, discard its focus rather than trusting a regenerated ordinal.
   const focusedRow = $derived(
     focusedKey === null || keyMultiplicity(focusedKey) !== focusedMultiplicity
-      ? -1 : rows.findIndex((qi) => queueKeys[qi] === focusedKey),
+      ? -1 : rows.indexOf(queueIdentity.indexOf(focusedKey)),
   );
   const visible = $derived.by(() => {
     const positions = [];
@@ -125,8 +117,7 @@
     if (row) {
       focusedKey = row.dataset.queueKey;
       focusedMultiplicity = keyMultiplicity(focusedKey);
-      const index = queueKeys.indexOf(focusedKey);
-      focusedTrack = queue[index];
+      focusedTrack = queue[queueIdentity.indexOf(focusedKey)];
     }
   }
   function releaseRowFocus(event) {

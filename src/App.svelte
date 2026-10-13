@@ -481,23 +481,23 @@
       }
       if (e.key === "MediaTrackNext") {
         e.preventDefault();
-        api.next();
+        api.next().catch(() => {});
         return;
       }
       if (e.key === "MediaTrackPrevious") {
         e.preventDefault();
-        api.previous();
+        api.previous().catch(() => {});
         return;
       }
       if (typing) return;
       if ((e.ctrlKey || e.metaKey) && e.key === "ArrowRight") {
         e.preventDefault();
-        api.next();
+        api.next().catch(() => {});
         return;
       }
       if ((e.ctrlKey || e.metaKey) && e.key === "ArrowLeft") {
         e.preventDefault();
-        api.previous();
+        api.previous().catch(() => {});
         return;
       }
       if (spaceControlsPlayback(e)) {
