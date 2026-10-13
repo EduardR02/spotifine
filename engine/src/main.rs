@@ -1,6 +1,7 @@
 mod audio;
 mod auth;
 mod browse;
+mod cache_index;
 mod collection;
 mod customization;
 mod edits;
@@ -25,7 +26,7 @@ use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use librespot_core::Session;
-use renderer_engine::protocol::{Command, HistoryQuery, Response, TrackWaveform};
+use renderer_engine::protocol::{Command, HistoryQuery, PlaylistRead, Response, TrackWaveform};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use waveform::WaveformService;
@@ -157,7 +158,7 @@ fn main() -> ExitCode {
     install_panic_hook(log_file);
 
     let (cache, temporary_directory, credentials_file) =
-        match create_state(&state_directory, audio_cache_limit_bytes) {
+        match create_state(&state_directory) {
             Ok(state) => state,
             Err(error) => {
                 eprintln!("PlaybackEngine: {error}");
@@ -185,6 +186,7 @@ fn main() -> ExitCode {
         credentials_file,
         state_directory,
         normalisation,
+        audio_cache_limit_bytes,
     ));
     runtime.shutdown_timeout(Duration::from_secs(1));
     match result {
@@ -201,6 +203,8 @@ fn drain_audio_cache_events(engine: &mut Engine, receiver: &mut mpsc::UnboundedR
     while let Ok(event) = receiver.try_recv() {
         changed |= engine.on_audio_cache_event(event);
     }
+    // One write for the whole burst: a save and the prunes it caused.
+    cache_index::save_if_dirty();
     changed
 }
 
@@ -211,6 +215,7 @@ async fn run(
     credentials_file: PathBuf,
     state_directory: PathBuf,
     normalisation: bool,
+    audio_cache_limit_bytes: Option<u64>,
 ) -> Result<(), String> {
     let (input_sender, mut input_receiver) = mpsc::unbounded_channel();
     let (auth_sender, mut auth_receiver) = mpsc::unbounded_channel::<AuthSignal>();
@@ -224,6 +229,10 @@ async fn run(
     configure_audio_fetch();
     audio::install_signal_sender(audio_sender);
     librespot_audio::install_cache_event_sender(audio_cache_sender);
+    // After the sender, so a prune for a lowered limit is announced like any
+    // other; the files left seed the index of which tracks they hold.
+    let cached_files = librespot_audio::install_audio_cache(&cache, audio_cache_limit_bytes);
+    cache_index::install(state_directory.join("audio-index.json"), cached_files);
     let (mut waveform_service, mut waveform_receiver) =
         WaveformService::new(cache.clone(), &state_directory)?;
 
@@ -397,14 +406,20 @@ async fn run(
                                 let result = engine.queue_metadata(context.as_deref());
                                 engine.writer().send_browse(&request_id, "queue_metadata", &result)?;
                             }
-                            Command::BrowsePlaylist { id } => {
+                            Command::BrowsePlaylist { id, tracks_key } => {
                                 // Exclusions are engine state, so they are read
                                 // here and joined to the browse when it lands.
+                                // No revision covers them: an unchanged read
+                                // carries them too.
                                 let excluded = engine.playlist_excluded_track_ids(&id);
                                 spawn_browse(&engine, request_id, "browse_playlist", move |session| async move {
-                                    let mut browse = browse::playlist_browse(&session, &id).await?;
-                                    browse.excluded_track_ids = excluded?;
-                                    Ok(browse)
+                                    let mut read = browse::playlist_browse(&session, &id, tracks_key.as_deref()).await?;
+                                    let excluded = excluded?;
+                                    match &mut read {
+                                        PlaylistRead::Changed(browse) => browse.excluded_track_ids = excluded,
+                                        PlaylistRead::Unchanged(held) => held.excluded_track_ids = excluded,
+                                    }
+                                    Ok(read)
                                 });
                             }
                             Command::BrowsePlaylistMembership { id } => {
@@ -629,7 +644,9 @@ async fn run(
                 if engine.on_cache_signal(signal) { engine.emit_state()?; }
             }
             Some(event) = audio_cache_receiver.recv() => {
-                if engine.on_audio_cache_event(event) { engine.emit_state()?; }
+                let mut changed = engine.on_audio_cache_event(event);
+                changed |= drain_audio_cache_events(&mut engine, &mut audio_cache_receiver);
+                if changed { engine.emit_state()?; }
             }
             outcome = waveform_receiver.recv() => {
                 if let Some(outcome) = outcome {
@@ -866,9 +883,11 @@ fn version_audio_cache(state_directory: &std::path::Path) -> Result<(), String> 
     Ok(())
 }
 
+/// The cache carries no size limit of its own: librespot-audio bounds the
+/// audio directory (`install_audio_cache` in `run`) so each pruned file is
+/// reported rather than silently gone.
 fn create_state(
     state_directory: &std::path::Path,
-    audio_cache_limit_bytes: Option<u64>,
 ) -> Result<(Cache, PathBuf, PathBuf), String> {
     std::fs::create_dir_all(state_directory)
         .map_err(|error| format!("could not create state directory: {error}"))?;
@@ -884,7 +903,7 @@ fn create_state(
         Some(credentials),
         Some(volume),
         Some(audio),
-        audio_cache_limit_bytes,
+        None,
     )
     .map_err(|error| format!("could not initialize the app-owned cache: {error}"))?;
     // librespot stores credentials as credentials.json inside the credentials

@@ -29,7 +29,7 @@ use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail, CacheStats, EpisodeDetail, HistoryPageDetail, LibraryNodeDetail, LikedSongsDetail, PlaybackEvent, PlaybackState, Playlist, PlaylistDetail, PlaylistRecommendationsDetail, ProfileDetail, RadioDetail, SearchResult, Show, ShowDetail, SongwriterPlaylist, Track, TrackCreditsDetail, TrackPlaylistRef, TrackWaveform
 };
 use parking_lot::Mutex;
-use renderer_engine::protocol::LibraryItem;
+use renderer_engine::protocol::{LibraryItem, PlaylistRead};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -127,6 +127,9 @@ pub async fn set_playback_speed(
 
 /// `automatic_start` is optional so clients built before the preference
 /// existed keep direct-play semantics (`false`) when they omit it.
+/// `start_paused` (default `false`) installs the queue with its chosen row
+/// loaded paused, in one step: a start the user paused before it landed never
+/// sounds, here or on a Spotify device.
 #[tauri::command]
 pub async fn play_queue(
     app: AppHandle,
@@ -135,8 +138,10 @@ pub async fn play_queue(
     index: usize,
     context: String,
     automatic_start: Option<bool>,
+    start_paused: Option<bool>,
 ) -> Result<(), String> {
-    router.run(&app, PlaybackAction::Queue(queue, index, context, automatic_start.unwrap_or(false))).await
+    router.run(&app, PlaybackAction::Queue(queue, index, context,
+        automatic_start.unwrap_or(false), start_paused.unwrap_or(false))).await
 }
 
 #[tauri::command]
@@ -373,7 +378,10 @@ pub async fn browse_playlist(
         spawn_refresh_playlist(app, id, RefreshCause::Reopen);
         return Ok(detail);
     }
-    let mut result = fetch_playlist(&app, &state, &client, &id, None).await?;
+    // No rows are held here, so the read is always a full one.
+    let PlaylistFetched::Changed(mut result) = fetch_playlist(&app, &state, &client, &id, None, false).await? else {
+        return Err("the engine vouched for rows that were never offered".to_owned());
+    };
     let current = {
         let guard = state.lock();
         result.applied && library_generation_is_current(&guard, result.generation)
@@ -1569,14 +1577,13 @@ async fn run_restore_attempt(
 /// `position` number, and a volume step as a partial `state` carrying only the
 /// volume — the playhead is projected in the frontend between heartbeats and a
 /// drag is optimistic there, so neither needs the queue.
-pub async fn consume_states(app: AppHandle) {
+///
+/// `lines` was subscribed before the engine was spawned (see
+/// [`EngineClient::start`]), so the engine's own startup state is the first
+/// thing it hears; nothing here asks for one.
+pub async fn consume_states(app: AppHandle, mut lines: tokio::sync::broadcast::Receiver<StateLine>) {
     // Owned handle so spawned tasks do not borrow the AppHandle.
     let client = app.state::<Arc<EngineClient>>().inner().clone();
-    let mut lines = client.subscribe_lines();
-    if let Err(error) = client.status().await {
-        log::warn(&format!("could not request initial engine state: {error}"));
-    }
-
 
     let mut previous_identity: Option<(String, String)> = None;
     let mut last_error = String::new();
@@ -1647,7 +1654,7 @@ pub async fn consume_states(app: AppHandle) {
                 // window is minimized, which hears it once on restore.
                 if !app.state::<Arc<PlaybackRouter>>().is_remote() {
                     let managed = app.state::<Mutex<AppState>>();
-                    let forward = forward_position_heartbeat(&mut managed.lock(), heartbeat);
+                    let forward = forward_position_heartbeat(&mut managed.lock(), heartbeat, std::time::Instant::now());
                     if forward {
                         let _ = app.emit("position", heartbeat.position_ms);
                     }
@@ -1841,8 +1848,8 @@ pub async fn consume_states(app: AppHandle) {
             // The mark lanes are one-shot: forwarded with this line, never
             // replayed from the snapshot by `get_state` or a later publish.
             guard.playback = PlaybackState { cached_ids: None, uncached_ids: None, ..state.clone() };
-            // A full state carries the exact playhead.
-            guard.position_withheld = false;
+            // A full state carries the exact playhead, minimized or not.
+            guard.withheld_heartbeat_at = None;
         }
         if session_changed && (state.auth_state == "ready" || state.auth_state == "logged_out") {
             let router = app.state::<Arc<PlaybackRouter>>();
@@ -1948,39 +1955,56 @@ fn spawn_session_refresh(app: &AppHandle) {
 }
 
 /// Freshens the snapshot's playhead and says whether the window should hear
-/// the heartbeat: not while the native window is minimized.
-fn forward_position_heartbeat(snapshot: &mut AppState, heartbeat: PositionHeartbeat) -> bool {
+/// the heartbeat: not while the native window is minimized. A withheld one is
+/// stamped with its arrival, which is what restoring projects it from.
+fn forward_position_heartbeat(snapshot: &mut AppState, heartbeat: PositionHeartbeat, now: std::time::Instant) -> bool {
     apply_position_heartbeat(snapshot, heartbeat);
     if snapshot.window_minimized {
-        snapshot.position_withheld = true;
+        snapshot.withheld_heartbeat_at = Some(now);
         return false;
     }
     true
 }
 
-/// Records the native minimized state; true when the window has come back
-/// after heartbeats were withheld from it. Only Windows reports the state
-/// (see `report_window_state`); elsewhere the window is never minimized here.
+/// Records the native minimized state. A window coming back after heartbeats
+/// were withheld from it is owed one playhead: the newest withheld heartbeat,
+/// projected to `now` the way the window projects between heartbeats. `None`
+/// when nothing was withheld — the window's own projection then runs from an
+/// exact anchor, a full state or a heartbeat it did hear. Only Windows reports
+/// the state (see `report_window_state`); elsewhere it is never minimized here.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn record_window_minimized(snapshot: &mut AppState, minimized: bool) -> bool {
+fn record_window_minimized(snapshot: &mut AppState, minimized: bool, now: std::time::Instant) -> Option<u32> {
     snapshot.window_minimized = minimized;
-    !minimized && std::mem::take(&mut snapshot.position_withheld)
+    if minimized { return None; }
+    let at = snapshot.withheld_heartbeat_at.take()?;
+    Some(projected_playhead(&snapshot.playback, at, now))
+}
+
+/// Where a playhead sampled at `at` stands at `now`: it runs at the audible
+/// speed while playing and holds still while paused or buffering, clamped to
+/// the duration — the window's own projection (`positionMs`), on the shell's
+/// clock.
+fn projected_playhead(playback: &PlaybackState, at: std::time::Instant, now: std::time::Instant) -> u32 {
+    if !playback.playing || playback.buffering { return playback.position_ms; }
+    let speed = playback.audible_playback_speed;
+    let speed = if speed.is_finite() && speed > 0.0 { f64::from(speed) } else { 1.0 };
+    let elapsed_ms = now.saturating_duration_since(at).as_secs_f64() * 1000.0 * speed;
+    let projected = (f64::from(playback.position_ms) + elapsed_ms).round().min(f64::from(u32::MAX)) as u32;
+    if playback.duration_ms > 0 { projected.min(playback.duration_ms) } else { projected }
 }
 
 /// Called from the native window-state watcher. A restored window whose
-/// heartbeats were withheld gets one exact playhead: the engine re-sends its
-/// state, which carries no rows the window already holds.
+/// heartbeats were withheld hears the shell's projection of the newest one,
+/// as the scalar `position` a heartbeat would have been: no engine round trip
+/// and no queue.
 #[cfg(windows)]
 pub(crate) fn window_minimized_changed(app: &AppHandle, minimized: bool) {
     let Some(state) = app.try_state::<Mutex<AppState>>() else { return };
-    if !record_window_minimized(&mut state.lock(), minimized) { return; }
-    let Some(client) = app.try_state::<Arc<EngineClient>>() else { return };
-    let client = client.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = client.status().await {
-            log::warn(&format!("could not resync the playhead after restore: {error}"));
-        }
-    });
+    let Some(position_ms) = record_window_minimized(&mut state.lock(), minimized, std::time::Instant::now())
+    else { return };
+    // A Spotify device owns the window's playhead; the engine's is not news.
+    if app.try_state::<Arc<PlaybackRouter>>().is_some_and(|router| router.is_remote()) { return; }
+    let _ = app.emit("position", position_ms);
 }
 
 /// Restore may fetch the library before its first ready state is publishable.
@@ -2238,9 +2262,11 @@ fn spawn_refresh_playlist(app: AppHandle, id: String, cause: RefreshCause) {
         let client = app.state::<Arc<EngineClient>>();
         let state = app.state::<Mutex<AppState>>();
         loop {
+            // The rows already held name themselves, so an unchanged playlist
+            // costs its header and no rows, here or in the engine.
             let Some((result, again)) = playlist_refresh_pass(
                 &state, &id, owner,
-                fetch_playlist(&app, &state, &client, &id, Some(owner.library_generation)),
+                fetch_playlist(&app, &state, &client, &id, Some(owner.library_generation), true),
             ).await else { return; };
 
             match result {
@@ -2251,8 +2277,9 @@ fn spawn_refresh_playlist(app: AppHandle, id: String, cause: RefreshCause) {
                 when the track cache is loaded from disk, deliberately, since
                 a pruned audio cache must not leave phantom marks behind — so
                 a cache-served open showed none, the refresh quietly learned
-                the real ones, and they appeared on the second open. */
-                Ok(mut result) if result.applied => {
+                the real ones, and they appeared on the second open. An
+                unchanged read publishes those marks as it adopts them. */
+                Ok(PlaylistFetched::Changed(mut result)) if result.applied => {
                     // A trigger landed while this fetch was out, so what we
                     // just read may predate the newest committed edit; the
                     // queued pass below speaks instead of this payload.
@@ -2266,6 +2293,18 @@ fn spawn_refresh_playlist(app: AppHandle, id: String, cause: RefreshCause) {
                     if !again && current {
                         client.reconcile_cached_rows(&mut result.detail.tracks, result.cache_generation);
                         let _ = app.emit("playlist", &result.detail);
+                    }
+                }
+                Ok(PlaylistFetched::Unchanged(Some(held))) => {
+                    let persistence = state.lock().playlist_persistence.clone();
+                    let _serialize = persistence.lock();
+                    let current = {
+                        let guard = state.lock();
+                        library_generation_is_current(&guard, held.generation)
+                            && guard.playlist_read_is_current(&id, held.playlist_generation)
+                    };
+                    if !again && current {
+                        let _ = app.emit("playlist", &held.detail);
                     }
                 }
                 Ok(_) => {}
@@ -2315,6 +2354,63 @@ struct PlaylistFetchResult {
     playlist_generation: u64,
     cache_generation: u64,
     applied: bool,
+}
+
+/// One engine read of a playlist.
+enum PlaylistFetched {
+    /// The playlist as the engine resolved it, rows and all.
+    Changed(PlaylistFetchResult),
+    /// The held rows still stand. Their marks were published as they were
+    /// adopted; the detail is here only when something shown beside the rows
+    /// moved, and the refresh owner decides whether the window hears it.
+    Unchanged(Option<HeldPlaylistDetail>),
+}
+
+struct HeldPlaylistDetail {
+    detail: PlaylistDetail,
+    generation: u64,
+    playlist_generation: u64,
+}
+
+/// What an unchanged read changed in the held entry.
+#[derive(Debug, PartialEq)]
+struct HeldPlaylistUpdate {
+    /// Rows now marked that were not: the window's marks-only update.
+    marked: Vec<String>,
+    /// The exclusions moved: the entry is due on disk and the window owes a
+    /// full detail.
+    exclusions_changed: bool,
+}
+
+/// Applies an unchanged read to the entry it vouched for. `None` when that
+/// read is no longer the current one — a newer library or playlist read, or
+/// an entry whose rows were replaced while it was out (another key). The
+/// marks are positive only, already fenced: withdrawing one is the removal
+/// lanes' job, and an id the engine did not name may simply be unknown to it.
+fn adopt_held_playlist(
+    state: &mut AppState,
+    id: &str,
+    generation: u64,
+    playlist_generation: u64,
+    tracks_key: &str,
+    cached_ids: &[String],
+    excluded_track_ids: Vec<String>,
+) -> Option<HeldPlaylistUpdate> {
+    if !library_generation_is_current(state, generation)
+        || !state.playlist_read_is_current(id, playlist_generation) { return None; }
+    let entry = state.tracks_cache.iter_mut()
+        .find(|entry| entry.id == id && entry.tracks_key.as_deref() == Some(tracks_key))?;
+    let cached: HashSet<&str> = cached_ids.iter().map(String::as_str).collect();
+    let mut marked: Vec<String> = entry.tracks.iter()
+        .filter(|track| !track.cached && cached.contains(track.id.as_str()))
+        .map(|track| track.id.clone())
+        .collect();
+    marked.sort_unstable();
+    marked.dedup();
+    let exclusions_changed = entry.excluded_track_ids != excluded_track_ids;
+    entry.excluded_track_ids = excluded_track_ids;
+    apply_cached_ids(state, &marked);
+    Some(HeldPlaylistUpdate { marked, exclusions_changed })
 }
 
 fn library_generation_is_current(state: &AppState, generation: u64) -> bool {
@@ -2385,6 +2481,7 @@ fn adopt_playlist_detail(
     generation: u64,
     playlist_generation: u64,
     detail: &PlaylistDetail,
+    tracks_key: Option<String>,
     fetched_at: i64,
 ) -> Option<(bool, bool, bool)> {
     if !library_generation_is_current(state, generation)
@@ -2395,6 +2492,7 @@ fn adopt_playlist_detail(
         revision: detail.playlist.snapshot_id.clone(),
         tracks: detail.tracks.clone(),
         excluded_track_ids: detail.excluded_track_ids.clone(),
+        tracks_key,
     });
     let library_changed = is_followed_playlist(&state.playlists, id)
         && upsert_playlist(&mut state.playlists, detail.playlist.clone());
@@ -2410,19 +2508,44 @@ fn adopt_playlist_detail(
 /// cache, and — for a playlist the user created — the membership index the
 /// saved mark reads. Only a playlist already present in the rootlist-backed
 /// library also updates and persists the library entry.
+///
+/// With `held`, a followed playlist whose cached rows carry the engine's key
+/// sends it: while the playlist still answers to it the engine resolves no
+/// rows and the read is [`PlaylistFetched::Unchanged`]. Everything else —
+/// no key, a moved revision, a playlist outside the library — reads in full.
 async fn fetch_playlist(
     app: &AppHandle,
     state: &Mutex<AppState>,
     client: &EngineClient,
     id: &str,
     refresh_generation: Option<u64>,
-) -> Result<PlaylistFetchResult, String> {
-    let (generation, playlist_generation) = {
+    held: bool,
+) -> Result<PlaylistFetched, String> {
+    let (generation, playlist_generation, held_key) = {
         let guard = state.lock();
-        (refresh_generation.unwrap_or(guard.library_generation), guard.playlist_generation(id))
+        // Followed only: an unchanged read is answered from the cached rows
+        // plus the library's metadata, which only a followed playlist has.
+        let held_key = if held && is_followed_playlist(&guard.playlists, id) {
+            guard.tracks_cache.iter().find(|entry| entry.id == id).and_then(|entry| entry.tracks_key.clone())
+        } else {
+            None
+        };
+        (refresh_generation.unwrap_or(guard.library_generation), guard.playlist_generation(id), held_key)
     };
     let cache_generation = client.cache_generation();
-    let mut detail = PlaylistDetail::from(client.browse_playlist(id).await?);
+    let browse = match client.browse_playlist(id, held_key.as_deref()).await? {
+        PlaylistRead::Changed(browse) => browse,
+        PlaylistRead::Unchanged(read) => {
+            let Some(held_key) = held_key else {
+                return Err("the engine vouched for rows that were never offered".to_owned());
+            };
+            return Ok(PlaylistFetched::Unchanged(adopt_unchanged_playlist(
+                app, state, client, id, generation, playlist_generation, cache_generation, &held_key, read,
+            )));
+        }
+    };
+    let tracks_key = browse.tracks_key.clone();
+    let mut detail = PlaylistDetail::from(browse);
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
@@ -2431,15 +2554,15 @@ async fn fetch_playlist(
         guard.finish_library_import()?;
         client.reconcile_cached_rows(&mut detail.tracks, cache_generation);
         let Some((tracks_changed, should_persist_library, membership_changed)) =
-            adopt_playlist_detail(&mut guard, id, generation, playlist_generation, &detail, fetched_at)
+            adopt_playlist_detail(&mut guard, id, generation, playlist_generation, &detail, tracks_key, fetched_at)
         else {
-            return Ok(PlaylistFetchResult {
+            return Ok(PlaylistFetched::Changed(PlaylistFetchResult {
                 detail,
                 generation,
                 playlist_generation,
                 cache_generation,
                 applied: false,
-            });
+            }));
         };
         let membership = membership_changed.then(|| guard.memberships.clone());
         // A browse that only confirmed what the cache already held owes the
@@ -2481,13 +2604,60 @@ async fn fetch_playlist(
         let _ = app.emit("memberships_changed", json!({"saved_tracks": false}));
     }
     let _ = app.emit("playlist_summary", &detail.playlist);
-    Ok(PlaylistFetchResult {
+    Ok(PlaylistFetched::Changed(PlaylistFetchResult {
         detail,
         generation,
         playlist_generation,
         cache_generation,
         applied: true,
-    })
+    }))
+}
+
+/// An unchanged read, adopted under the same serialization as a full one:
+/// its marks are fenced like a browse's rows, published at once on the marks
+/// lane (as a `CachedIds` line would be), and the exclusions — which no
+/// revision covers — are persisted when they moved. Nothing else is written
+/// or emitted: the rows, the library entry and the membership all stand.
+#[allow(clippy::too_many_arguments)]
+fn adopt_unchanged_playlist(
+    app: &AppHandle,
+    state: &Mutex<AppState>,
+    client: &EngineClient,
+    id: &str,
+    generation: u64,
+    playlist_generation: u64,
+    cache_generation: u64,
+    tracks_key: &str,
+    read: renderer_engine::protocol::PlaylistUnchanged,
+) -> Option<HeldPlaylistDetail> {
+    let mut cached_ids = read.cached_ids;
+    client.reconcile_cached_ids(&mut cached_ids, cache_generation);
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    let (update, dir, bytes, detail) = {
+        let mut guard = state.lock();
+        if let Err(error) = guard.finish_library_import() {
+            log::warn(&format!("could not adopt the unchanged read of playlist {id}: {error}"));
+            return None;
+        }
+        let update = adopt_held_playlist(&mut guard, id, generation, playlist_generation,
+            tracks_key, &cached_ids, read.excluded_track_ids)?;
+        let bytes = update.exclusions_changed.then(|| tracks_cache_bytes(&guard.tracks_cache)).flatten();
+        let detail = update.exclusions_changed.then(|| {
+            let entry = guard.tracks_cache.iter().find(|entry| entry.id == id).cloned()
+                .expect("the adopted entry is held");
+            playlist_detail_from_cache(&guard, entry)
+        });
+        (update, guard.library_dir(), bytes, detail)
+    };
+    if let Some(bytes) = bytes {
+        tokio::task::block_in_place(|| write_tracks_cache_bytes(&dir, &bytes));
+    }
+    if !update.marked.is_empty() {
+        app.state::<Arc<PlaybackRouter>>().apply_cache_marks(false, &[], &update.marked);
+        let _ = app.emit("state", json!({"cached_ids": update.marked}));
+    }
+    detail.map(|detail| HeldPlaylistDetail { detail, generation, playlist_generation })
 }
 
 #[cfg(test)]
@@ -2706,6 +2876,45 @@ mod tests {
         }
     }
 
+    /// An unchanged read moves only what can move under rows that stand: new
+    /// download marks (positive only) and the exclusions. It lands only on the
+    /// entry whose key it vouched for, and only while its read is current.
+    #[test]
+    fn an_unchanged_read_marks_and_excludes_only_the_entry_it_vouched_for() {
+        let mut state = AppState::new(std::path::PathBuf::new());
+        state.me_id = "owner".into();
+        state.playlists.push(playlist_payload("Playlist", "r", &[]).playlist);
+        let generation = state.library_generation;
+        let mut detail = playlist_payload("Playlist", "r", &["a", "b", "a", "c"]);
+        detail.tracks[1].cached = true;
+        assert!(adopt_playlist_detail(&mut state, "p", generation, 0, &detail, None, 1).is_some());
+        assert!(adopt_playlist_detail(&mut state, "p", generation, 0, &detail, Some("key".into()), 2).unwrap().0,
+            "a key arriving for the same rows is due on disk, or the next launch cannot send it");
+        assert!(!adopt_playlist_detail(&mut state, "p", generation, 0, &detail, Some("key".into()), 3).unwrap().0);
+        assert_eq!(state.tracks_cache[0].tracks_key.as_deref(), Some("key"));
+
+        // Marks only: "a" is new (both of its rows), "b" was already marked,
+        // and "c", which the engine did not name, is left as it was.
+        let update = adopt_held_playlist(&mut state, "p", generation, 0, "key",
+            &["a".into(), "b".into()], Vec::new()).unwrap();
+        assert_eq!(update, HeldPlaylistUpdate { marked: vec!["a".into()], exclusions_changed: false });
+        let marks: Vec<bool> = state.tracks_cache[0].tracks.iter().map(|track| track.cached).collect();
+        assert_eq!(marks, [true, true, true, false]);
+        assert_eq!(adopt_held_playlist(&mut state, "p", generation, 0, "key", &["a".into()], Vec::new()).unwrap(),
+            HeldPlaylistUpdate { marked: Vec::new(), exclusions_changed: false }, "nothing moved: nothing to send");
+
+        // Exclusions are local, so no revision covers them.
+        let update = adopt_held_playlist(&mut state, "p", generation, 0, "key", &[], vec!["c".into()]).unwrap();
+        assert!(update.exclusions_changed);
+        assert_eq!(state.tracks_cache[0].excluded_track_ids, ["c"]);
+
+        // Another key's rows, or a read a newer one superseded, are not its to touch.
+        assert!(adopt_held_playlist(&mut state, "p", generation, 0, "other", &["c".into()], Vec::new()).is_none());
+        state.record_playlist_edit("p");
+        assert!(adopt_held_playlist(&mut state, "p", generation, 0, "key", &["c".into()], Vec::new()).is_none());
+        assert!(state.tracks_cache.iter().flat_map(|entry| &entry.tracks).all(|track| track.id != "c" || !track.cached));
+    }
+
     #[test]
     fn landed_track_edit_refuses_cached_old_queue_until_new_detail_arrives() {
         let mut state = AppState::new(std::path::PathBuf::new());
@@ -2713,15 +2922,15 @@ mod tests {
         state.playlists.push(playlist_payload("Playlist", "before", &[]).playlist);
         let generation = state.library_generation;
         assert!(adopt_playlist_detail(&mut state, "p", generation, 0,
-            &playlist_payload("Playlist", "before", &["a", "b"]), 1).is_some());
+            &playlist_payload("Playlist", "before", &["a", "b"]), None, 1).is_some());
         assert_eq!(cached_playlist_detail(&state, "p").unwrap().1.tracks.len(), 2);
         state.record_playlist_edit("p");
         assert!(cached_playlist_detail(&state, "p").is_none(), "card play must not queue removed rows");
         assert!(adopt_playlist_detail(&mut state, "p", generation, 0,
-            &playlist_payload("Playlist", "before", &["a", "b"]), 2).is_none());
+            &playlist_payload("Playlist", "before", &["a", "b"]), None, 2).is_none());
         let edited = state.playlist_generation("p");
         assert!(adopt_playlist_detail(&mut state, "p", generation, edited,
-            &playlist_payload("Playlist", "after", &["a"]), 3).is_some());
+            &playlist_payload("Playlist", "after", &["a"]), None, 3).is_some());
         let cached = cached_playlist_detail(&state, "p").unwrap().1;
         assert_eq!(cached.playlist.snapshot_id, "after");
         assert_eq!(cached.tracks.iter().map(|track| track.id.as_str()).collect::<Vec<_>>(), ["a"]);
@@ -2734,13 +2943,13 @@ mod tests {
         state.playlists.push(playlist_payload("Old name", "r", &[]).playlist);
         let generation = state.library_generation;
         adopt_playlist_detail(&mut state, "p", generation, 0,
-            &playlist_payload("Old name", "r", &["a"]), 1).unwrap();
+            &playlist_payload("Old name", "r", &["a"]), None, 1).unwrap();
         state.record_playlist_rename("p", " New name ");
         let cached = cached_playlist_detail(&state, "p").unwrap().1;
         assert_eq!(cached.playlist.name, "New name");
         assert_eq!(cached.tracks[0].id, "a", "rename does not invalidate unchanged tracks");
         assert!(adopt_playlist_detail(&mut state, "p", generation, 0,
-            &playlist_payload("Old name", "r", &["a"]), 2).is_none());
+            &playlist_payload("Old name", "r", &["a"]), None, 2).is_none());
         assert_eq!(state.playlists[0].name, "New name");
     }
 
@@ -2751,11 +2960,11 @@ mod tests {
         state.playlists.push(playlist_payload("Offline", "r", &[]).playlist);
         let generation = state.library_generation;
         adopt_playlist_detail(&mut state, "p", generation, 0,
-            &playlist_payload("Offline", "r", &["a"]), 1).unwrap();
+            &playlist_payload("Offline", "r", &["a"]), None, 1).unwrap();
         state.fence_library_reads();
         assert_eq!(cached_playlist_detail(&state, "p").unwrap().1.tracks[0].id, "a");
         assert!(adopt_playlist_detail(&mut state, "p", generation, 0,
-            &playlist_payload("Stale", "old", &["b"]), 2).is_none());
+            &playlist_payload("Stale", "old", &["b"]), None, 2).is_none());
         state.select_library_account("");
         assert!(cached_playlist_detail(&state, "p").is_none());
     }
@@ -2767,8 +2976,8 @@ mod tests {
         state.playlists.push(playlist_payload("Playlist", "r", &[]).playlist);
         let generation = state.library_generation;
         let detail = playlist_payload("Playlist", "r", &["a"]);
-        adopt_playlist_detail(&mut state, "p", generation, 0, &detail, 1).unwrap();
-        assert_eq!(adopt_playlist_detail(&mut state, "p", generation, 0, &detail, 2), Some((false, false, false)));
+        adopt_playlist_detail(&mut state, "p", generation, 0, &detail, None, 1).unwrap();
+        assert_eq!(adopt_playlist_detail(&mut state, "p", generation, 0, &detail, None, 2), Some((false, false, false)));
         assert_eq!(cached_playlist_detail(&state, "p").unwrap().1.tracks[0].id, "a");
     }
 
@@ -2805,8 +3014,8 @@ mod tests {
         };
         state.record_playlist_edit("p");
         let current = state.playlist_generation("p");
-        assert!(adopt_playlist_detail(&mut state, "p", generation, current, &detail("new", &["a", "b"]), 2).is_some());
-        assert!(adopt_playlist_detail(&mut state, "p", generation, old_generation, &detail("old", &["a"]), 1).is_none());
+        assert!(adopt_playlist_detail(&mut state, "p", generation, current, &detail("new", &["a", "b"]), None, 2).is_some());
+        assert!(adopt_playlist_detail(&mut state, "p", generation, old_generation, &detail("old", &["a"]), None, 1).is_none());
         assert_eq!(state.tracks_cache[0].revision, "new");
         assert_eq!(state.playlists[0].name, "new");
         assert!(state.memberships[0].uris.contains("spotify:track:b"));
@@ -2817,7 +3026,7 @@ mod tests {
         let mut state = AppState::new(std::path::PathBuf::new());
         state.playback.queue = vec![Track { id: "a".into(), cached: true, ..Default::default() }].into();
         state.tracks_cache.push(PlaylistTracksEntry { id: "p".into(), fetched_at: None, revision: String::new(),
-            tracks: vec![Track { id: "b".into(), cached: true, ..Default::default() }], excluded_track_ids: Vec::new() });
+            tracks: vec![Track { id: "b".into(), cached: true, ..Default::default() }], excluded_track_ids: Vec::new(), tracks_key: None });
         apply_uncached_ids(&mut state, &["b".into()]);
         assert!(!state.tracks_cache[0].tracks[0].cached);
         assert!(state.playback.queue[0].cached);
@@ -2920,21 +3129,44 @@ mod tests {
     }
 
     #[test]
-    fn a_minimized_window_hears_no_heartbeats_and_one_resync_on_restore() {
+    fn a_minimized_window_hears_no_heartbeats_and_one_projected_playhead_on_restore() {
         let mut snapshot = AppState::new(std::path::PathBuf::new());
         snapshot.playback = playing_state(1_000);
+        snapshot.playback.audible_playback_speed = 1.5;
+        let start = std::time::Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
         let beat = |position_ms| PositionHeartbeat { position_ms, duration_ms: 200_000 };
-        assert!(forward_position_heartbeat(&mut snapshot, beat(3_000)));
-        assert!(!record_window_minimized(&mut snapshot, true), "minimizing needs no resync");
-        assert!(!forward_position_heartbeat(&mut snapshot, beat(5_000)));
-        assert!(!forward_position_heartbeat(&mut snapshot, beat(7_000)));
+        assert!(forward_position_heartbeat(&mut snapshot, beat(3_000), at(0)));
+        assert_eq!(record_window_minimized(&mut snapshot, true, at(100)), None, "minimizing owes nothing");
+        assert!(!forward_position_heartbeat(&mut snapshot, beat(5_000), at(2_000)));
+        assert!(!forward_position_heartbeat(&mut snapshot, beat(7_000), at(4_000)));
         assert_eq!(snapshot.playback.position_ms, 7_000, "the shell's own snapshot stays current");
-        assert!(record_window_minimized(&mut snapshot, false), "restoring after withheld beats resyncs");
-        assert!(!record_window_minimized(&mut snapshot, false), "once");
-        assert!(forward_position_heartbeat(&mut snapshot, beat(9_000)));
-        // Paused while minimized: nothing was withheld, so nothing to resync.
-        record_window_minimized(&mut snapshot, true);
-        assert!(!record_window_minimized(&mut snapshot, false));
+        // Restored 1.2 s after the newest withheld beat, at 1.5x.
+        assert_eq!(record_window_minimized(&mut snapshot, false, at(5_200)), Some(8_800),
+            "the newest withheld beat, projected to now at the audible speed");
+        assert_eq!(record_window_minimized(&mut snapshot, false, at(5_300)), None, "once");
+        assert!(forward_position_heartbeat(&mut snapshot, beat(9_000), at(6_000)));
+
+        // Paused while minimized: nothing was withheld, so nothing is owed.
+        record_window_minimized(&mut snapshot, true, at(7_000));
+        assert_eq!(record_window_minimized(&mut snapshot, false, at(60_000)), None);
+
+        // A full state reached the window while it was down: its anchor is
+        // exact, and a beat withheld before it is no longer news.
+        record_window_minimized(&mut snapshot, true, at(61_000));
+        assert!(!forward_position_heartbeat(&mut snapshot, beat(11_000), at(62_000)));
+        snapshot.withheld_heartbeat_at = None; // what installing a full state does
+        assert_eq!(record_window_minimized(&mut snapshot, false, at(63_000)), None);
+
+        // A held playhead does not run, and none runs past the end.
+        record_window_minimized(&mut snapshot, true, at(64_000));
+        snapshot.playback.buffering = true;
+        assert!(!forward_position_heartbeat(&mut snapshot, beat(12_000), at(65_000)));
+        assert_eq!(record_window_minimized(&mut snapshot, false, at(90_000)), Some(12_000));
+        record_window_minimized(&mut snapshot, true, at(91_000));
+        snapshot.playback.buffering = false;
+        assert!(!forward_position_heartbeat(&mut snapshot, beat(199_000), at(92_000)));
+        assert_eq!(record_window_minimized(&mut snapshot, false, at(120_000)), Some(200_000));
     }
 
     /// A volume step reaches the window as a partial `state`: the one key that

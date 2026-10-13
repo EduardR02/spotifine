@@ -36,7 +36,9 @@ fn remove_leased_cache_files(cache: &Cache, files: &[librespot_core::FileId], le
     let active = lease.lock();
     if !*active { return; }
     for file_id in files {
-        if let Err(error) = cache.remove_file(*file_id) {
+        // Through librespot-audio, which keeps the size bound, so an evicted
+        // file stops counting against it.
+        if let Err(error) = librespot_audio::remove_audio_file(cache, *file_id) {
             if cache.file_path(*file_id).is_some_and(|path| std::fs::exists(path).unwrap_or(false)) {
                 eprintln!("could not evict cached audio file {file_id}: {error}");
             }
@@ -2132,12 +2134,14 @@ impl Engine {
                 position_ms,
                 context,
                 automatic_start,
+                start_paused,
             } => self.play_queue_with_automatic_start(
                 queue,
                 index,
                 position_ms,
                 context,
                 automatic_start,
+                !start_paused,
             ),
             Command::RestoreQueue {
                 queue,
@@ -2270,6 +2274,8 @@ impl Engine {
         self.positive_cache_ids.clear();
         self.selected_cache_files.clear();
         self.invalidated_cache_ids.clear();
+        crate::cache_index::clear();
+        crate::cache_index::save_if_dirty();
         self.loaded_track_id = None;
         self.current_needs_load = false;
         self.current_load_produced_audio = false;
@@ -2282,35 +2288,36 @@ impl Engine {
 
     /// Cache commits can land after the start/track-change probes. Publish
     /// their badge delta without touching playback or republishing queue rows.
+    ///
+    /// Removals arrive one file at a time — the size bound announces each file
+    /// it prunes, a decoder rejection the one it deletes — so only the marks
+    /// that file could have carried are checked, never every known positive.
     pub fn on_audio_cache_event(&mut self, event: librespot_audio::AudioCacheEvent) -> bool {
-        let (track_uri, file_id, downloaded, removed, epoch) = match event {
+        let (track_uri, file_id, downloaded, epoch) = match event {
             librespot_audio::AudioCacheEvent::Stored { track_uri, file_id, downloaded, epoch } =>
-                (track_uri, file_id, downloaded, false, epoch),
-            librespot_audio::AudioCacheEvent::Removed { track_uri, file_id, epoch } =>
-                (track_uri, file_id, false, true, epoch),
-            librespot_audio::AudioCacheEvent::Revalidate { epoch } => {
-                return epoch == librespot_audio::cache_epoch() && self.revalidate_cache_marks();
+                (track_uri, file_id, downloaded, epoch),
+            librespot_audio::AudioCacheEvent::Removed { track_uri, file_id, epoch } => {
+                if epoch != librespot_audio::cache_epoch() { return false; }
+                return self.on_audio_file_removed(track_uri, file_id);
             }
         };
         if epoch != librespot_audio::cache_epoch() || !matches!(track_uri, SpotifyUri::Track { .. }) {
             return false;
         }
         let Ok(id) = track_uri.to_id() else { return false; };
-        if !removed { self.selected_cache_files.insert(id.clone(), file_id); }
+        self.selected_cache_files.insert(id.clone(), file_id);
         crate::browse::remember_cached_file(&id, file_id);
-        // A completed save can prune other files. A decoder rejection removes
-        // one file directly. Revalidate retained positives at those boundaries.
-        let removals = (downloaded || removed) && self.revalidate_cache_marks();
-        if removed || self.invalidated_cache_ids.contains(&id)
+        if self.invalidated_cache_ids.contains(&id)
             || !self.cache.file_path(file_id)
                 .is_some_and(|path| std::fs::exists(path).unwrap_or(false))
         {
-            return removals;
+            return false;
         }
+        crate::cache_index::record(&id, file_id);
         self.positive_cache_ids.insert(id.clone());
         let held_mark = self.cached_marks.contains(&id);
         let mut known = held_mark;
-        let mut changed = downloaded || removals;
+        let mut changed = downloaded;
         for track in &mut self.state.queue {
             if track.id == id && track.uri.starts_with("spotify:track:") {
                 known |= track.cached;
@@ -2337,6 +2344,44 @@ impl Engine {
             self.emitted_cached_marks = 0;
         }
         true
+    }
+
+    /// One cached file is gone. Withdraws only the marks it could have carried
+    /// — the positives whose known files include it, which covers the song a
+    /// decoder rejection names and a pruned file that names none — each
+    /// re-checked on disk, since another of its files may still hold the audio.
+    /// Memory to find them; a disk check only for those few.
+    fn on_audio_file_removed(&mut self, track_uri: Option<SpotifyUri>, file_id: librespot_core::FileId) -> bool {
+        crate::cache_index::forget_file(file_id);
+        if let Some(id) = track_uri.filter(|uri| matches!(uri, SpotifyUri::Track { .. }))
+            .and_then(|uri| uri.to_id().ok())
+        {
+            crate::browse::remember_cached_file(&id, file_id);
+        }
+        let mut owners = {
+            let queue = self.state.queue.iter()
+                .filter(|track| track.cached && track.uri.starts_with("spotify:track:"))
+                .map(|track| &track.id);
+            crate::browse::ids_holding_file(
+                self.positive_cache_ids.iter().chain(&self.cached_marks).chain(queue), file_id,
+            )
+        };
+        owners.extend(self.selected_cache_files.iter()
+            .filter(|(id, held)| **held == file_id && self.holds_cache_mark(id))
+            .map(|(id, _)| id.clone()));
+        owners.sort_unstable();
+        owners.dedup();
+        let missing = crate::browse::missing_cached_track_ids(&owners, &self.cache);
+        for id in &missing {
+            self.remove_cache_mark(id);
+        }
+        !missing.is_empty()
+    }
+
+    fn holds_cache_mark(&self, id: &str) -> bool {
+        self.positive_cache_ids.contains(id)
+            || self.cached_marks.iter().any(|held| held == id)
+            || self.state.queue.iter().any(|track| track.id == id && track.cached)
     }
 
     fn revalidate_cache_marks(&mut self) -> bool {
@@ -2622,6 +2667,8 @@ impl Engine {
         // cache file is the engine's only copy — the shell's snapshot is a
         // different file with a different clock.
         self.flush_pending_volume();
+        // Files that browses found on disk since the last cache event.
+        crate::cache_index::save_if_dirty();
         self.state.ready = false;
         self.state.playing = false;
     }
@@ -2850,9 +2897,12 @@ impl Engine {
         position_ms: u32,
         context: String,
     ) -> Result<bool, String> {
-        self.play_queue_with_automatic_start(queue, index, position_ms, context, false)
+        self.play_queue_with_automatic_start(queue, index, position_ms, context, false, true)
     }
 
+    /// `start_playing` false loads the chosen row paused, exactly as a track
+    /// change made while paused does: the queue lands in one command and
+    /// nothing sounds.
     fn play_queue_with_automatic_start(
         &mut self,
         mut queue: Vec<TrackRef>,
@@ -2860,6 +2910,7 @@ impl Engine {
         position_ms: u32,
         context: String,
         automatic_start: bool,
+        start_playing: bool,
     ) -> Result<bool, String> {
         fill_queue_context(&mut queue, &context);
         self.resolve_queue_edits(&mut queue);
@@ -2871,6 +2922,7 @@ impl Engine {
             false,
             0,
             automatic_start,
+            start_playing,
         )
     }
 
@@ -2900,6 +2952,7 @@ impl Engine {
             true,
             preview_lease_id,
             false,
+            true,
         )
     }
 
@@ -2934,6 +2987,7 @@ impl Engine {
         preview: bool,
         preview_lease_id: u64,
         automatic_start: bool,
+        start_playing: bool,
     ) -> Result<bool, String> {
         Self::validate_queue(&queue, index)?;
         let candidate = if automatic_start {
@@ -2985,7 +3039,7 @@ impl Engine {
         // The first load starts a fresh pacing window for subsequent
         // command-driven changes.
         self.last_track_change = Some(Instant::now());
-        self.load_current(true)?;
+        self.load_current(start_playing)?;
         Ok(true)
     }
 
@@ -5265,33 +5319,58 @@ mod tests {
         assert!(fixture.cache.file_path(fixture.file_id).unwrap().exists());
     }
 
+    /// A removal is announced one file at a time, by the size bound (no song)
+    /// or by a decoder rejection (its song). Exactly the marks that file
+    /// carried are withdrawn — no quarantine, and no re-check of every other
+    /// positive: a completed download in between checks nothing on disk.
     #[tokio::test(flavor = "current_thread")]
-    async fn completed_save_pruning_and_decoder_removal_publish_negatives_without_quarantine() {
-        let mut fixture = AudioCacheFixture::new();
-        fixture.cache = librespot_core::cache::Cache::new(
-            None::<PathBuf>, None::<PathBuf>, Some(fixture.directory.join("limited-audio")), Some(32),
-        ).unwrap();
-        fixture.cache.save_file(fixture.file_id, &mut std::io::Cursor::new([1u8; 16])).unwrap();
+    async fn a_pruned_or_rejected_file_withdraws_only_the_marks_it_carried() {
+        let fixture = AudioCacheFixture::new();
+        fixture.write_file();
         let (mut engine, buffer) = fixture.engine();
         engine.on_audio_cache_event(fixture.event(false));
+        // Another positive, whose file then disappears without an announcement.
+        let other_id = "2unannounced0000000000".to_owned();
+        let other_file = librespot_core::FileId::from_raw(&[0x93; 20]);
+        let other_path = fixture.cache.file_path(other_file).unwrap();
+        std::fs::create_dir_all(other_path.parent().unwrap()).unwrap();
+        std::fs::write(&other_path, b"another song").unwrap();
+        let other_uri = SpotifyUri::from_uri(&format!("spotify:track:{other_id}")).unwrap();
+        assert!(engine.on_audio_cache_event(librespot_audio::AudioCacheEvent::Stored {
+            track_uri: other_uri, file_id: other_file, downloaded: true, epoch: librespot_audio::cache_epoch(),
+        }));
+        std::fs::remove_file(&other_path).unwrap();
         engine.emit_state().unwrap();
         captured_messages(&buffer);
-        std::thread::sleep(Duration::from_millis(20));
-        let other = librespot_core::FileId::from_raw(&[0x93; 20]);
-        fixture.cache.save_file(other, &mut std::io::Cursor::new([2u8; 24])).unwrap();
-        assert!(!fixture.cache.file_path(fixture.file_id).unwrap().exists());
-        assert!(engine.on_audio_cache_event(librespot_audio::AudioCacheEvent::Stored {
+
+        // A download completes: nothing else is re-checked on disk.
+        let third = librespot_core::FileId::from_raw(&[0x95; 20]);
+        let third_path = fixture.cache.file_path(third).unwrap();
+        std::fs::create_dir_all(third_path.parent().unwrap()).unwrap();
+        std::fs::write(&third_path, b"third song").unwrap();
+        engine.on_audio_cache_event(librespot_audio::AudioCacheEvent::Stored {
             track_uri: SpotifyUri::from_uri("spotify:track:0123456789ABCDEFGHIJKL").unwrap(),
-            file_id: other, downloaded: true, epoch: librespot_audio::cache_epoch(),
+            file_id: third, downloaded: true, epoch: librespot_audio::cache_epoch(),
+        });
+        assert!(engine.positive_cache_ids.contains(&other_id), "a download does not revalidate other marks");
+        engine.emit_state().unwrap();
+        assert!(captured_messages(&buffer)[0].get("uncached_ids").is_none());
+
+        // The bound prunes the queue row's file and names no song.
+        std::fs::remove_file(fixture.cache.file_path(fixture.file_id).unwrap()).unwrap();
+        assert!(engine.on_audio_cache_event(librespot_audio::AudioCacheEvent::Removed {
+            track_uri: None, file_id: fixture.file_id, epoch: librespot_audio::cache_epoch(),
         }));
         assert!(!engine.state.queue[0].cached);
         assert!(!engine.invalidated_cache_ids.contains(&fixture.id));
+        assert!(engine.positive_cache_ids.contains(&other_id), "only the pruned file's mark goes");
         engine.emit_state().unwrap();
         let messages = captured_messages(&buffer);
         assert_eq!(messages[0]["uncached_ids"], serde_json::json!([fixture.id]));
         assert!(messages[0].get("queue").is_none());
 
-        fixture.cache.save_file(fixture.file_id, &mut std::io::Cursor::new([3u8; 16])).unwrap();
+        // A decoder rejection names its song.
+        fixture.write_file();
         engine.on_audio_cache_event(fixture.event(true));
         engine.emit_state().unwrap();
         captured_messages(&buffer);
@@ -5299,12 +5378,16 @@ mod tests {
         let uri = SpotifyUri::from_uri(&fixture.track().uri).unwrap();
         librespot_audio::remove_cached_audio(&session, &uri, fixture.file_id, librespot_audio::cache_epoch()).unwrap();
         assert!(engine.on_audio_cache_event(librespot_audio::AudioCacheEvent::Removed {
-            track_uri: uri, file_id: fixture.file_id, epoch: librespot_audio::cache_epoch(),
+            track_uri: Some(uri), file_id: fixture.file_id, epoch: librespot_audio::cache_epoch(),
         }));
         assert!(!engine.state.queue[0].cached);
         assert!(!engine.invalidated_cache_ids.contains(&fixture.id));
         engine.emit_state().unwrap();
         assert_eq!(captured_messages(&buffer)[0]["uncached_ids"], serde_json::json!([fixture.id]));
+        // A removal of a file no mark rests on changes nothing.
+        assert!(!engine.on_audio_cache_event(librespot_audio::AudioCacheEvent::Removed {
+            track_uri: None, file_id: librespot_core::FileId::from_raw(&[0x96; 20]), epoch: librespot_audio::cache_epoch(),
+        }));
     }
 
     #[test]
@@ -5731,6 +5814,26 @@ mod tests {
         (engine, probe)
     }
 
+    /// A start the user paused before it landed installs and loads its row in
+    /// one command, paused; the default is unchanged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queue_start_can_land_paused_in_one_command() {
+        for start_paused in [true, false] {
+            let (mut engine, _probe) = engine_with_player();
+            let (auth_sender, _) = tokio::sync::mpsc::unbounded_channel();
+            let command = Command::PlayQueue {
+                queue: two_track_state().queue, index: 1, position_ms: 0,
+                context: "playlist:p".into(), automatic_start: false, start_paused,
+            };
+            assert_eq!(engine.process_command(command, &auth_sender).await, Ok(true));
+            assert_eq!(engine.state.current_index, Some(1));
+            assert_eq!(engine.state.playing, !start_paused);
+            assert!(engine.play_request_id.is_some(), "the chosen row is loaded either way");
+            assert_eq!(engine.state.queue[1].context, "playlist:p");
+            engine.shutdown();
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn idle_reconnect_accepts_the_first_selection_and_only_loads_the_latest_target() {
         for (new_queue, supersede) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -5743,7 +5846,7 @@ mod tests {
             let command = if new_queue {
                 Command::PlayQueue {
                     queue: engine.state.queue.clone(), index: 1, position_ms: 0,
-                    context: String::new(), automatic_start: false,
+                    context: String::new(), automatic_start: false, start_paused: false,
                 }
             } else {
                 Command::PlayQueueIndex { index: 1 }
@@ -6705,7 +6808,7 @@ mod tests {
             assert!(
                 engine
                     .play_queue_with_automatic_start(
-                        queue.clone(), 0, 0, "playlist:playlist".to_owned(), true,
+                        queue.clone(), 0, 0, "playlist:playlist".to_owned(), true, true,
                     )
                     .is_err(),
                 "the capture engine has no player"
@@ -6787,6 +6890,7 @@ mod tests {
                     0,
                     12_000,
                     "playlist:playlist".to_owned(),
+                    true,
                     true,
                 )
                 .is_err(),

@@ -679,12 +679,14 @@ mod tests {
         assert!(is_transient(&error));
         disconnected.await.unwrap();
 
-        for (status, body, transient) in [
-            (502, "", Some(true)),
-            (429, "", Some(true)),
-            (400, r#"{"error":"invalid_grant"}"#, Some(false)),
-            (400, r#"{"error":"invalid_client"}"#, Some(false)),
-            (200, r#"{"access_token":"","token_type":"Bearer","expires_in":3600}"#, Some(false)),
+        // The reason is what Settings shows: an expired grant must say to
+        // reconnect, not just fail.
+        for (status, body, failure) in [
+            (502, "", Some((true, UNAVAILABLE))),
+            (429, "", Some((true, RATE_LIMITED))),
+            (400, r#"{"error":"invalid_grant"}"#, Some((false, "Spotify authorization expired; reconnect the developer app"))),
+            (400, r#"{"error":"invalid_client"}"#, Some((false, "Spotify rejected the developer authorization request"))),
+            (200, r#"{"access_token":"","token_type":"Bearer","expires_in":3600}"#, Some((false, "Spotify returned an invalid token response"))),
             (200, r#"{"access_token":"renewed","token_type":"Bearer","expires_in":3600}"#, None),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -711,10 +713,11 @@ mod tests {
                 stream.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             });
             let result = request_token(&http, &endpoint, &[("grant_type", "refresh_token")]).await;
-            match transient {
-                Some(transient) => {
+            match failure {
+                Some((transient, reason)) => {
                     let error = result.err().unwrap();
                     assert_eq!(is_transient(&error), transient, "{status}: {error}");
+                    assert_eq!(error, reason, "{status} {body}");
                 }
                 None => {
                     let token = result.ok().unwrap();

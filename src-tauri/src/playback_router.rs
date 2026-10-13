@@ -53,7 +53,8 @@ const DEVICES_OFF: &str = "Spotify devices are turned off in Settings";
 
 pub enum Action {
     Play, Pause, Next, Previous, Seek(u32), Volume(u8), Shuffle(bool), Repeat(String), Speed(f32),
-    Queue(Vec<Track>, usize, String, bool), Index(usize), Add(Track, String), AddBatch(Vec<Track>, String), Remove(usize), Move(usize, usize),
+    /// Rows, start index, context, automatic start, start paused.
+    Queue(Vec<Track>, usize, String, bool, bool), Index(usize), Add(Track, String), AddBatch(Vec<Track>, String), Remove(usize), Move(usize, usize),
     Preview(Track, Vec<renderer_engine::protocol::TimeRange>, Option<renderer_engine::protocol::LoopRange>, u32, u64),
     RestorePreview(u64),
 }
@@ -576,10 +577,16 @@ impl Core {
     }
 
     async fn engine_recovered<H: Host>(&self, host: &H, state: &PlaybackState) {
-        if state.auth_state != "ready" { return; }
+        // Only a device that lost its engine waits for this one, and only
+        // `engine_disconnected` (on the same consumer, before this state) can
+        // start that wait. So the question is asked before the operation lock:
+        // `run` holds it across whole engine commands, and every ready state,
+        // local mode above all, would otherwise queue behind them.
+        let awaits = |remote: &Remote| remote.engine_recovery && remote.state.username == state.username;
+        if state.auth_state != "ready" || !self.remote.lock().as_ref().is_some_and(awaits) { return; }
         let _operation = self.operation.lock().await;
         let eligible = self.remote.lock().as_mut().is_some_and(|remote| {
-            if !remote.engine_recovery || remote.state.username != state.username { return false; }
+            if !awaits(remote) { return false; }
             remote.polling = true;
             remote.recovery_ready = true;
             remote.failures = 0;
@@ -823,7 +830,7 @@ impl Core {
                 if !matches!(mode.as_str(), "off" | "context" | "track") { return Err("invalid repeat mode".into()); }
                 if foreign { self.foreign_setting(host, "repeat", mode).await } else { self.edit(host, kind, EngineOp::Repeat(&mode)).await }
             }
-            Action::Queue(queue, index, context, automatic) => self.play_queue(host, queue, index, context, automatic).await,
+            Action::Queue(queue, index, context, automatic, paused) => self.play_queue(host, queue, index, context, automatic, paused).await,
             Action::Index(index) if foreign => self.play_foreign_row(host, index).await,
             Action::Index(index) => self.jump(host, index).await,
             Action::Add(track, _) if foreign => self.queue_on_spotify(host, std::slice::from_ref(&track)).await,
@@ -1036,7 +1043,7 @@ impl Core {
         self.start(host, index, 0).await
     }
 
-    async fn play_queue<H: Host>(&self, host: &H, queue: Vec<Track>, index: usize, context: String, automatic: bool) -> Result<(), String> {
+    async fn play_queue<H: Host>(&self, host: &H, queue: Vec<Track>, index: usize, context: String, automatic: bool, paused: bool) -> Result<(), String> {
         if queue.is_empty() {
             let view = host.engine(Some(EngineOp::Restore { queue: &queue, index: 0, position_ms: 0, context: &context, automatic: false })).await?;
             {
@@ -1070,6 +1077,9 @@ impl Core {
         let current = {
             let mut guard = self.remote.lock();
             let remote = guard.as_mut().ok_or(RELEASED)?;
+            // A paused start stages the queue the way a paused selection does:
+            // the device only has to stop what it was playing.
+            let needs_pause = remote.kind() != Kind::Prepared || remote.pause_dirty || remote.start_intent.is_some();
             remote.adopt_engine(view);
             remote.consumed.clear();
             // Old URIs remain on the device until the write succeeds, but they
@@ -1084,8 +1094,18 @@ impl Core {
             remote.state.playing = false;
             remote.anchored = Instant::now();
             remote.set_order(remote.plan.clone());
+            if paused {
+                remote.mode = Mode::Prepared;
+                remote.start_intent = None;
+                remote.pause_dirty = needs_pause;
+                remote.polling = needs_pause;
+            }
             remote.anchor
         };
+        if paused {
+            self.publish(host);
+            return self.apply_pause(host).await;
+        }
         // Either way publishes once, with the state Spotify's answer settles.
         match current {
             Some(current) => self.start(host, current, 0).await,
@@ -1816,7 +1836,7 @@ async fn run_local(client: &EngineClient, action: Action) -> Result<(), String> 
         Action::Shuffle(enabled) => client.set_shuffle(enabled).await,
         Action::Repeat(mode) => client.set_repeat(&mode).await,
         Action::Speed(speed) => client.set_playback_speed(speed).await,
-        Action::Queue(queue, index, context, automatic) => client.play_queue(&queue, index, 0, &context, automatic).await,
+        Action::Queue(queue, index, context, automatic, paused) => client.play_queue(&queue, index, 0, &context, automatic, paused).await,
         Action::Index(index) => client.play_queue_index(index).await,
         Action::Add(track, context) => client.add_queue(&track, &context).await,
         Action::AddBatch(tracks, context) => client.add_queue_batch(&tracks, &context).await,
@@ -2236,7 +2256,7 @@ mod tests {
     async fn a_failed_replacement_retains_intent_without_relabeling_the_old_window() {
         let (core, host) = owned(2).await;
         host.spotify.lock().write_failures.extend([502, 502]);
-        assert!(core.run(&host, Action::Queue(vec![track("new0"), track("new1")], 0, String::new(), false)).await.is_err());
+        assert!(core.run(&host, Action::Queue(vec![track("new0"), track("new1")], 0, String::new(), false, false)).await.is_err());
         core.reconcile(&host).await;
         let state = core.snapshot().unwrap();
         assert_eq!(state.current_uri, "spotify:track:new0");
@@ -2264,10 +2284,10 @@ mod tests {
     async fn clearing_a_failed_replacement_stops_the_old_session_and_cancels_retry() {
         let (core, host) = owned(2).await;
         host.spotify.lock().write_failures.push_back(502);
-        assert!(core.run(&host, Action::Queue(vec![track("new")], 0, String::new(), false)).await.is_err());
+        assert!(core.run(&host, Action::Queue(vec![track("new")], 0, String::new(), false, false)).await.is_err());
         assert!(!core.snapshot().unwrap().playing);
         host.spotify.lock().log.clear();
-        core.run(&host, Action::Queue(Vec::new(), 0, String::new(), false)).await.unwrap();
+        core.run(&host, Action::Queue(Vec::new(), 0, String::new(), false, false)).await.unwrap();
         core.reconcile(&host).await;
         assert_eq!(host.spotify.lock().writes(), ["PUT me/player/pause?device_id=phone"]);
         assert!(core.snapshot().unwrap().queue.is_empty());
@@ -2436,7 +2456,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_empty_queue_clears_both_arrays_and_never_restores_old_rows() {
         let (core, host) = owned(2).await;
-        core.run(&host, Action::Queue(Vec::new(), 0, String::new(), false)).await.unwrap();
+        core.run(&host, Action::Queue(Vec::new(), 0, String::new(), false, false)).await.unwrap();
         let events = host.events.lock();
         let clear = events.iter().rev().find(|event| event.get("queue").is_some()).unwrap();
         assert_eq!(clear["queue"], json!([]));
@@ -2515,7 +2535,8 @@ mod tests {
         // Off: a selection is refused before any request, the window's
         // visibility wakes nothing, local playback reaches no device, and the
         // watcher is never woken.
-        assert!(core.select(&host, Some("phone".into())).await.is_err());
+        assert_eq!(core.select(&host, Some("phone".into())).await.unwrap_err(), DEVICES_OFF,
+            "the user is told devices are off, not that the device failed");
         core.set_visible(false, false);
         core.set_visible(true, true);
         core.run(&host, Action::Play).await.unwrap();
@@ -2533,7 +2554,7 @@ mod tests {
     async fn clear_pause_failure_retries_while_preserving_explicit_empty_queue() {
         let (core, host) = owned(2).await;
         host.spotify.lock().write_failures.push_back(502);
-        assert!(core.run(&host, Action::Queue(Vec::new(), 0, String::new(), false)).await.is_err());
+        assert!(core.run(&host, Action::Queue(Vec::new(), 0, String::new(), false, false)).await.is_err());
         assert!(core.snapshot().unwrap().queue.is_empty());
         assert!(remote(&core, |remote| remote.pause_dirty && remote.polling));
         core.reconcile(&host).await;
@@ -2547,10 +2568,28 @@ mod tests {
         let (core, host) = owned(2).await;
         let mut unavailable = track("blocked");
         unavailable.unavailable = true;
-        assert!(core.run(&host, Action::Queue(vec![unavailable], 0, String::new(), false)).await.is_err());
+        assert!(core.run(&host, Action::Queue(vec![unavailable], 0, String::new(), false, false)).await.is_err());
         assert_eq!(core.snapshot().unwrap().current_uri, "spotify:track:t0");
         assert_eq!(host.engine.lock().rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["t0", "t1"]);
         assert!(host.spotify.lock().writes().is_empty());
+    }
+
+    /// A start paused before it landed reaches the device as a staged queue:
+    /// the old window is stopped and nothing new sounds until Play.
+    #[tokio::test]
+    async fn a_paused_start_on_a_device_stages_the_queue_and_only_stops_the_old_one() {
+        let (core, host) = owned(2).await;
+        core.run(&host, Action::Queue(vec![track("a"), track("b")], 1, String::new(), false, true)).await.unwrap();
+        let state = core.snapshot().unwrap();
+        assert!(!state.playing);
+        assert_eq!(state.current_uri, "spotify:track:b");
+        assert_eq!(remote(&core, |remote| remote.kind()), Kind::Prepared);
+        assert_eq!(host.spotify.lock().writes(), ["PUT me/player/pause?device_id=phone"], "nothing new sounds on the device");
+        assert!(!host.engine.lock().playing);
+        host.spotify.lock().log.clear();
+        core.run(&host, Action::Play).await.unwrap();
+        let play = host.spotify.lock().last_play().unwrap();
+        assert_eq!(uris(&play)[0], "spotify:track:b", "Play starts the staged row");
     }
 
     #[tokio::test]
@@ -2566,7 +2605,14 @@ mod tests {
             assert_eq!(remote(&core, |remote| remote.kind()), Kind::Owned);
             assert!(!host.engine.lock().playing);
             assert!(host.spotify.lock().writes().is_empty());
-            assert!(!core.snapshot().unwrap().error.is_empty(), "suspension is visible to the user");
+            // The user is told which of the two happened: one needs another
+            // device, the other a reselection.
+            let error = core.snapshot().unwrap().error;
+            if restricted {
+                assert_eq!(error, "Spotify does not allow controlling this device");
+            } else {
+                assert_eq!(error, MOVED_AWAY);
+            }
         }
     }
 
@@ -2686,6 +2732,36 @@ mod tests {
         core.engine_recovered(&host, &ready).await;
         assert!(next_read(&core).is_none());
         assert!(host.spotify.lock().log.is_empty());
+    }
+
+    /// `run` holds the operation lock across whole engine commands. A ready
+    /// state that no device is waiting for must not queue behind one: in local
+    /// mode, and on a device that never lost its engine, the answer is known
+    /// without the lock.
+    #[tokio::test]
+    async fn a_ready_state_nothing_waits_for_never_waits_on_the_operation_lock() {
+        let (local, host) = fixture(2, true).await;
+        let (owned_core, owned_host) = owned(2).await;
+        for (core, host) in [(&local, &host), (&owned_core, &owned_host)] {
+            let held = core.operation.lock().await;
+            let ready = host.local_state();
+            let recovered = core.engine_recovered(host, &ready);
+            tokio::pin!(recovered);
+            let finished = std::future::poll_fn(|cx| std::task::Poll::Ready(recovered.as_mut().poll(cx).is_ready())).await;
+            assert!(finished, "a ready state waited on an operation that cannot concern it");
+            drop(held);
+        }
+        // A device that did lose its engine still recovers under the lock.
+        owned_core.engine_disconnected(&owned_host, "engine disconnected");
+        let held = owned_core.operation.lock().await;
+        let ready = owned_host.local_state();
+        let recovered = owned_core.engine_recovered(&owned_host, &ready);
+        tokio::pin!(recovered);
+        let finished = std::future::poll_fn(|cx| std::task::Poll::Ready(recovered.as_mut().poll(cx).is_ready())).await;
+        assert!(!finished, "recovery is serialized with the operation in flight");
+        drop(held);
+        recovered.await;
+        assert!(next_read(&owned_core).is_some(), "the waiting device resumes reading");
     }
 
     #[tokio::test]
@@ -2823,7 +2899,9 @@ mod tests {
         core.reconcile(&host).await;
         remote(&core, |remote| {
             assert!(!remote.polling);
-            assert!(!remote.state.error.is_empty(), "permanent authorization failure is visible");
+            assert_eq!(remote.state.error, personal_api::spotify_error(reqwest::StatusCode::UNAUTHORIZED),
+                "a permanent authorization failure tells the user to reconnect");
+            assert!(remote.state.error.contains("authorization expired"));
         });
     }
 
@@ -3084,7 +3162,7 @@ mod tests {
     async fn an_expired_start_waits_for_play_instead_of_starting_late() {
         let (core, host) = owned(2).await;
         host.spotify.lock().write_failures.push_back(502);
-        assert!(core.run(&host, Action::Queue(vec![track("new0"), track("new1")], 0, String::new(), false)).await.is_err());
+        assert!(core.run(&host, Action::Queue(vec![track("new0"), track("new1")], 0, String::new(), false, false)).await.is_err());
         remote(&core, |remote| remote.start_intent.as_mut().unwrap().since -= START_DEADLINE);
         // Spotify answers again, and the speaker still plays the old window.
         host.spotify.lock().log.clear();
@@ -3126,7 +3204,7 @@ mod tests {
         let (core, host) = owned(3).await;
         host.events.lock().clear();
         core.run(&host, Action::Index(2)).await.unwrap();
-        core.run(&host, Action::Queue(vec![track("a"), track("b")], 1, String::new(), false)).await.unwrap();
+        core.run(&host, Action::Queue(vec![track("a"), track("b")], 1, String::new(), false, false)).await.unwrap();
         let events = host.events.lock();
         assert_eq!(events.len(), 2, "one publish per start");
         assert!(events.iter().all(|event| event["playing"] == json!(true)), "the play button never flickers to paused");

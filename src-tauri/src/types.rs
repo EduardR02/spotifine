@@ -1478,6 +1478,7 @@ mod tests {
             cover_url: None,
             tracks: covers.iter().map(|url| track(url).into()).collect(),
             excluded_track_ids: Vec::new(),
+            tracks_key: None,
         }
     }
 

@@ -35,32 +35,69 @@ use crate::app::{
 use crate::log;
 use crate::types::{PlaybackState, Track};
 
-/// Replies for playback/session commands arrive promptly; browse and edit
-/// commands run network round-trips inside the engine.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-const BROWSE_TIMEOUT: Duration = Duration::from_secs(30);
-const WAVEFORM_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
-/// Engine respawn backoff bounds.
-const RESPAWN_BACKOFF_START: Duration = Duration::from_secs(2);
-const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-/// A child that stayed up this long was healthy, so its exit starts the
-/// backoff over. A spawn that succeeds proves nothing: a crash-looping engine
-/// spawns fine and dies again within seconds, and resetting on the spawn kept
-/// it respawning every two seconds for ever. Thirty seconds is past any
-/// startup crash (authentication, device open, restore) and equal to the
-/// longest wait, so a loop never respawns faster than its last delay.
-const RESPAWN_STABLE_UPTIME: Duration = Duration::from_secs(30);
-
-/// The wait before respawning a child that exited after `uptime`, given the
-/// `backoff` its predecessor's exit left behind.
-fn respawn_delay(backoff: Duration, uptime: Duration) -> Duration {
-    if uptime >= RESPAWN_STABLE_UPTIME { RESPAWN_BACKOFF_START } else { backoff }
+/// The client's clocks: how long a request waits for its answer, and how a
+/// lost engine is respawned. Carried by each client rather than read from
+/// constants so a test can prove the same deadlines and backoff at a fraction
+/// of production's seconds; production always runs [`Timing::PRODUCTION`].
+#[derive(Clone, Copy, Debug)]
+struct Timing {
+    /// Replies for playback/session commands arrive promptly.
+    command: Duration,
+    /// Browse and edit commands run network round-trips inside the engine.
+    browse: Duration,
+    waveform: Duration,
+    respawn: RespawnPolicy,
 }
 
-fn next_respawn_backoff(delay: Duration) -> Duration {
-    (delay * 2).min(RESPAWN_BACKOFF_MAX)
+impl Timing {
+    const PRODUCTION: Self = Self {
+        command: Duration::from_secs(10),
+        browse: Duration::from_secs(30),
+        waveform: Duration::from_secs(5 * 60),
+        respawn: RespawnPolicy {
+            start: Duration::from_secs(2),
+            max: Duration::from_secs(30),
+            // A child that stayed up this long was healthy, so its exit starts
+            // the backoff over. A spawn that succeeds proves nothing: a
+            // crash-looping engine spawns fine and dies again within seconds,
+            // and resetting on the spawn kept it respawning every two seconds
+            // for ever. Thirty seconds is past any startup crash
+            // (authentication, device open, restore) and equal to the longest
+            // wait, so a loop never respawns faster than its last delay.
+            stable_uptime: Duration::from_secs(30),
+        },
+    };
+
+    fn request_timeout(&self, kind: &str) -> Duration {
+        if kind == "get_track_waveform" {
+            self.waveform
+        } else if kind.starts_with("browse_") || kind.starts_with("edit_") {
+            self.browse
+        } else {
+            self.command
+        }
+    }
+}
+
+/// Engine respawn backoff: doubling from `start` to `max`, started over only
+/// by a child that stayed up for `stable_uptime`.
+#[derive(Clone, Copy, Debug)]
+struct RespawnPolicy {
+    start: Duration,
+    max: Duration,
+    stable_uptime: Duration,
+}
+
+impl RespawnPolicy {
+    /// The wait before respawning a child that exited after `uptime`, given
+    /// the `backoff` its predecessor's exit left behind.
+    fn delay(&self, backoff: Duration, uptime: Duration) -> Duration {
+        if uptime >= self.stable_uptime { self.start } else { backoff }
+    }
+
+    fn next(&self, delay: Duration) -> Duration {
+        (delay * 2).min(self.max)
+    }
 }
 
 /// Crash-restore retries use the same shape as the shell's library refresh:
@@ -108,11 +145,58 @@ const ENGINE_BINARY: &str = if cfg!(windows) {
 /// One engine reply (any non-`state`/`position` line). `data` carries the
 /// payload of `browse_*`/`edit_*` responses; plain `response` lines leave
 /// it `None`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub struct EngineReply {
     pub ok: bool,
     pub error: Option<String>,
-    pub data: Option<Value>,
+    pub data: Option<ReplyData>,
+    /// The download-mark fence as it stood when the reply was routed; the
+    /// typed parse applies it to the rows (see [`parse_data`]).
+    fence: MarkFence,
+}
+
+/// A reply payload exactly as the engine wrote it. Only checked to be JSON
+/// on the reader thread, then parsed once, straight into its typed shape, by
+/// whoever asked: a ten-thousand-row playlist is never built as a `Value`
+/// tree, walked, and parsed a second time.
+#[derive(Debug)]
+pub struct ReplyData(Box<serde_json::value::RawValue>);
+
+impl ReplyData {
+    fn json(&self) -> &str { self.0.get() }
+}
+
+impl PartialEq for ReplyData {
+    fn eq(&self, other: &Self) -> bool { self.json() == other.json() }
+}
+
+/// Download marks a reply may no longer claim. Captured on the reader thread
+/// at delivery, the same moment the marks were judged before, and applied to
+/// the typed rows.
+#[derive(Debug, Default)]
+struct MarkFence {
+    /// A cache reset landed while the request ran: every claim predates it.
+    stale: bool,
+    /// Marks the engine withdrew since; no row may claim one of these.
+    invalidated: HashSet<String>,
+}
+
+impl MarkFence {
+    fn apply(&self, payload: &mut impl CachedClaims) {
+        if !self.stale && self.invalidated.is_empty() { return; }
+        payload.claims(&mut |row| {
+            if self.stale || self.invalidated.contains(&row.id) { row.cached = false; }
+        });
+    }
+}
+
+/// The rows of a reply payload that carry a download mark: every
+/// [`TrackRef`](renderer_engine::protocol::TrackRef), wherever it sits, is
+/// handed to `visit`. Every type [`parse_data`] reads declares this, so a
+/// payload that gains rows has to say where they are; one without rows keeps
+/// the empty default.
+trait CachedClaims {
+    fn claims(&mut self, _visit: &mut dyn FnMut(&mut renderer_engine::protocol::TrackRef)) {}
 }
 
 struct PendingRequest {
@@ -726,28 +810,97 @@ fn unmark_rows(rows: &mut Arc<[Track]>, ids: &[String]) {
     }
 }
 
-fn discard_cached_claims(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            if let Some(cached) = object.get_mut("cached") { *cached = Value::Bool(false); }
-            for field in object.values_mut() { discard_cached_claims(field); }
-        }
-        Value::Array(values) => for value in values { discard_cached_claims(value); },
-        _ => {}
-    }
-}
+mod claims {
+    //! Where each reply payload keeps its rows. `TrackRef` is the only
+    //! protocol type with a download mark.
+    use super::CachedClaims;
+    use renderer_engine::protocol::*;
 
-fn discard_invalidated_claims(value: &mut Value, ids: &HashSet<String>) {
-    match value {
-        Value::Object(object) => {
-            if object.get("id").and_then(Value::as_str).is_some_and(|id| ids.contains(id)) {
-                if let Some(cached) = object.get_mut("cached") { *cached = Value::Bool(false); }
-            }
-            for field in object.values_mut() { discard_invalidated_claims(field, ids); }
-        }
-        Value::Array(values) => for value in values { discard_invalidated_claims(value, ids); },
-        _ => {}
+    type Visit<'a> = &'a mut dyn FnMut(&mut TrackRef);
+
+    impl CachedClaims for TrackRef {
+        fn claims(&mut self, visit: Visit) { visit(self) }
     }
+    impl<T: CachedClaims> CachedClaims for Vec<T> {
+        fn claims(&mut self, visit: Visit) { for item in self { item.claims(visit) } }
+    }
+    impl<T: CachedClaims> CachedClaims for Option<T> {
+        fn claims(&mut self, visit: Visit) { if let Some(item) = self { item.claims(visit) } }
+    }
+    impl CachedClaims for HistoryPage {
+        fn claims(&mut self, visit: Visit) { for item in &mut self.items { visit(&mut item.track) } }
+    }
+    impl CachedClaims for EpisodeRef {
+        fn claims(&mut self, visit: Visit) { visit(&mut self.track) }
+    }
+    impl CachedClaims for ShowBrowse {
+        fn claims(&mut self, visit: Visit) { self.episodes.claims(visit) }
+    }
+    impl CachedClaims for PlaylistBrowse {
+        fn claims(&mut self, visit: Visit) { self.tracks.claims(visit) }
+    }
+    impl CachedClaims for PlaylistRead {
+        fn claims(&mut self, visit: Visit) {
+            match self {
+                PlaylistRead::Changed(browse) => browse.claims(visit),
+                // The marks of an unchanged read are ids, not rows: the shell
+                // fences them against the rows it holds.
+                PlaylistRead::Unchanged(_) => {}
+            }
+        }
+    }
+    impl CachedClaims for RadioBrowse {
+        fn claims(&mut self, visit: Visit) { visit(&mut self.seed); self.tracks.claims(visit) }
+    }
+    impl CachedClaims for PlaylistRecommendations {
+        fn claims(&mut self, visit: Visit) { self.tracks.claims(visit) }
+    }
+    impl CachedClaims for AlbumBrowse {
+        fn claims(&mut self, visit: Visit) { self.tracks.claims(visit) }
+    }
+    impl CachedClaims for ArtistCataloguePage {
+        fn claims(&mut self, visit: Visit) { self.releases.claims(visit) }
+    }
+    impl CachedClaims for ArtistBrowse {
+        fn claims(&mut self, visit: Visit) {
+            self.top_tracks.claims(visit);
+            if let Some(ArtistPick { item: ArtistPickItem::Track(track), .. }) =
+                self.overview.as_mut().and_then(|overview| overview.artist_pick.as_mut())
+            {
+                visit(track);
+            }
+        }
+    }
+    impl CachedClaims for SongwriterPlaylist {
+        fn claims(&mut self, visit: Visit) { self.tracks.claims(visit) }
+    }
+    impl CachedClaims for LikedSongsPage {
+        fn claims(&mut self, visit: Visit) { self.tracks.claims(visit) }
+    }
+    impl CachedClaims for SearchBrowse {
+        fn claims(&mut self, visit: Visit) {
+            if let Some(SearchTopRef::Track(track)) = &mut self.top { visit(track); }
+            self.tracks.claims(visit);
+            self.episodes.claims(visit);
+        }
+    }
+
+    // Payloads without rows.
+    impl CachedClaims for TrackWaveform {}
+    impl CachedClaims for LibraryNode {}
+    impl CachedClaims for UserProfile {}
+    impl CachedClaims for PlaylistRef {}
+    impl CachedClaims for PlaylistMembership {}
+    impl CachedClaims for QueueMetadata {}
+    impl CachedClaims for LikedUrisPage {}
+    impl CachedClaims for TrackCredits {}
+    impl CachedClaims for Canvas {}
+    impl CachedClaims for TrackEditStatus {}
+    impl CachedClaims for TrackEditDefinition {}
+    impl CachedClaims for ArtistRef {}
+    impl CachedClaims for ShowRef {}
+    impl CachedClaims for bool {}
+    impl CachedClaims for String {}
 }
 
 pub struct EngineClient {
@@ -792,12 +945,18 @@ pub struct EngineClient {
     shutting_down: AtomicBool,
     /// Serializes child admission/publication, EOF cleanup and final shutdown.
     shutdown_lock: Mutex<()>,
+    timing: Timing,
 }
 
 impl EngineClient {
     /// Creates a client and spawns the engine subprocess. The supervisor task
     /// (see [`EngineClient::supervise`]) takes over respawns from there.
-    pub fn start() -> Arc<Self> {
+    ///
+    /// The receiver is subscribed before the child exists, so it hears the
+    /// state every engine announces at startup: the consumer it is handed to
+    /// needs no `status` request to learn the first state, and the engine
+    /// never re-serializes its queue for one.
+    pub fn start() -> (Arc<Self>, tokio::sync::broadcast::Receiver<StateLine>) {
         let (state_tx, _) = tokio::sync::broadcast::channel(64);
         let (exit_tx, _) = watch::channel(false);
         let (persist_tx, persist_rx) = mpsc::sync_channel(1);
@@ -833,12 +992,14 @@ impl EngineClient {
             process_generation: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             shutdown_lock: Mutex::new(()),
+            timing: Timing::PRODUCTION,
         });
         *client.persist_thread.lock() = Some(spawn_persistence_writer(&client, persist_rx));
+        let lines = client.subscribe_lines();
         if let Err(error) = client.spawn_engine() {
             log::error(&format!("engine spawn failed at startup: {error}"));
         }
-        client
+        (client, lines)
     }
 
     /// Subscribes to the engine's playback lines (full `state` plus the scalar
@@ -859,6 +1020,15 @@ impl EngineClient {
             if stale || base.invalidated_ids.contains(&row.id) { row.cached = false; }
             if base.cached_ids.contains(&row.id) { row.cached = true; }
         }
+    }
+
+    /// [`Self::reconcile_cached_rows`] for marks that arrive as ids rather
+    /// than rows (an unchanged playlist read): a reset since `generation`
+    /// withdraws them all, a later removal its own.
+    pub fn reconcile_cached_ids(&self, ids: &mut Vec<String>, generation: u64) {
+        let base = self.delta_base.lock();
+        if generation != self.cache_generation() { ids.clear(); }
+        ids.retain(|id| !base.invalidated_ids.contains(id));
     }
 
     /// A response barrier has proved the restore commands finished. Adopt the
@@ -999,7 +1169,7 @@ impl EngineClient {
     /// Respawn loop: waits for the reader thread to signal EOF, sleeps with
     /// exponential backoff, then starts a fresh engine and re-requests
     /// `status` so the engine re-emits its current state. The backoff starts
-    /// over only after a child stayed up for [`RESPAWN_STABLE_UPTIME`].
+    /// over only after a child stayed up for [`RespawnPolicy::stable_uptime`].
     pub async fn supervise(self: Arc<Self>) {
         self.supervise_with_spawn(Self::spawn_engine).await;
     }
@@ -1009,7 +1179,8 @@ impl EngineClient {
         self: Arc<Self>,
         mut spawn: impl FnMut(&Arc<Self>) -> Result<(), String>,
     ) {
-        let mut backoff = RESPAWN_BACKOFF_START;
+        let policy = self.timing.respawn;
+        let mut backoff = policy.start;
         // The startup child was spawned by `start` just before this runs.
         let mut spawned_at = tokio::time::Instant::now();
         // Even a startup child that closed stdout before this task first ran
@@ -1031,7 +1202,7 @@ impl EngineClient {
                             backoff.as_secs()
                         ));
                         if !self.wait_respawn(backoff).await { return; }
-                        backoff = next_respawn_backoff(backoff);
+                        backoff = policy.next(backoff);
                         continue;
                     }
                 }
@@ -1062,14 +1233,14 @@ impl EngineClient {
                 return;
             }
             let uptime = spawned_at.elapsed();
-            let delay = respawn_delay(backoff, uptime);
+            let delay = policy.delay(backoff, uptime);
             log::warn(&format!(
                 "engine exited after {}s; respawning in {}s",
                 uptime.as_secs(),
                 delay.as_secs()
             ));
             if !self.wait_respawn(delay).await { return; }
-            backoff = next_respawn_backoff(delay);
+            backoff = policy.next(delay);
             respawn = true;
         }
     }
@@ -1197,7 +1368,7 @@ impl EngineClient {
         args: impl Serialize,
         cancellation_track_id: Option<&str>,
     ) -> Result<EngineReply, String> {
-        let timeout = request_timeout(kind);
+        let timeout = self.timing.request_timeout(kind);
         let deadline = tokio::time::Instant::now() + timeout;
         let request_id = self.next_request_id();
         // Encoded and measured before any bookkeeping: an oversized line is
@@ -1380,6 +1551,7 @@ impl EngineClient {
         .map(|_| ())
     }
 
+    /// `start_paused` loads the chosen row paused instead of playing it.
     pub async fn play_queue(
         &self,
         queue: &[Track],
@@ -1387,6 +1559,7 @@ impl EngineClient {
         position_ms: u32,
         context: &str,
         automatic_start: bool,
+        start_paused: bool,
     ) -> Result<(), String> {
         let result = self
             .request(
@@ -1397,6 +1570,7 @@ impl EngineClient {
                     position_ms,
                     context,
                     automatic_start,
+                    start_paused,
                     ..QueueRequest::default()
                 },
             )
@@ -1719,11 +1893,14 @@ impl EngineClient {
         parse_data(reply, "browse_playlist_covers")
     }
 
+    /// `tracks_key` names rows the caller holds; while the playlist still
+    /// answers to it the engine resolves and sends no rows (`Unchanged`).
     pub async fn browse_playlist(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::PlaylistBrowse, String> {
-        let reply = self.request("browse_playlist", json!({"id": id})).await?;
+        tracks_key: Option<&str>,
+    ) -> Result<renderer_engine::protocol::PlaylistRead, String> {
+        let reply = self.request("browse_playlist", json!({"id": id, "tracks_key": tracks_key})).await?;
         parse_data(reply, "browse_playlist")
     }
 
@@ -2439,7 +2616,7 @@ impl EngineClient {
             let _ = request.sender.send(EngineReply {
                 ok: false,
                 error: Some("the playback engine exited".to_owned()),
-                data: None,
+                ..EngineReply::default()
             });
         }
     }
@@ -2451,7 +2628,7 @@ impl EngineClient {
                 let _ = request.sender.send(EngineReply {
                     ok: false,
                     error: Some("the engine account changed while the request was running".to_owned()),
-                    data: None,
+                    ..EngineReply::default()
                 });
                 return;
             }
@@ -2460,13 +2637,13 @@ impl EngineClient {
                 // after new positive lines, so it must never reset again.
                 self.clear_cache_marks();
             }
-            if request.cache_generation != self.cache_generation() {
-                if let Some(data) = &mut reply.data { discard_cached_claims(data); }
-            }
-            if let Some(data) = &mut reply.data {
+            // Judged now, applied by the typed parse: the claims are read
+            // there, once, instead of rewritten here in a parsed tree.
+            if reply.data.is_some() {
+                reply.fence.stale = request.cache_generation != self.cache_generation();
                 let base = self.delta_base.lock();
-                if !base.invalidated_ids.is_empty() {
-                    discard_invalidated_claims(data, &base.invalidated_ids);
+                if !reply.fence.stale && !base.invalidated_ids.is_empty() {
+                    reply.fence.invalidated.clone_from(&base.invalidated_ids);
                 }
             }
             let _ = request.sender.send(reply);
@@ -2638,7 +2815,7 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
                                 error,
                                 data,
                             }) => {
-                                client.deliver(&request_id, EngineReply { ok, error, data });
+                                client.deliver(&request_id, EngineReply { ok, error, data, ..EngineReply::default() });
                             }
                             None => {} // unparseable line: logged, dropped
                         }
@@ -2666,7 +2843,7 @@ enum Line {
         request_id: String,
         ok: bool,
         error: Option<String>,
-        data: Option<Value>,
+        data: Option<ReplyData>,
     },
 }
 
@@ -2680,19 +2857,20 @@ struct VolumeLine {
 /// A reply's routing fields, as tolerant as routing has always been: a
 /// request id or error that is not a string reads as none, and only a literal
 /// `true` is success. `data` is kept whenever the key is present, `null`
-/// included, because that is a payload some browses answer with.
+/// included, because that is a payload some browses answer with — kept as
+/// its text, which the requester parses once into its own type.
 #[derive(Default, serde::Deserialize)]
 #[serde(default)]
 struct ReplyFields {
     request_id: Value,
     ok: Value,
     error: Value,
-    #[serde(deserialize_with = "present_value")]
-    data: Option<Value>,
+    #[serde(deserialize_with = "present_data")]
+    data: Option<ReplyData>,
 }
 
-fn present_value<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
-    Value::deserialize(deserializer).map(Some)
+fn present_data<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<ReplyData>, D::Error> {
+    Box::<serde_json::value::RawValue>::deserialize(deserializer).map(|raw| Some(ReplyData(raw)))
 }
 
 /// Classifies and parses one protocol line in a single pass over its text.
@@ -2875,16 +3053,6 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for LineFields<'de, A> {
     }
 }
 
-fn request_timeout(kind: &str) -> Duration {
-    if kind == "get_track_waveform" {
-        WAVEFORM_TIMEOUT
-    } else if kind.starts_with("browse_") || kind.starts_with("edit_") {
-        BROWSE_TIMEOUT
-    } else {
-        COMMAND_TIMEOUT
-    }
-}
-
 /// One request line: the id and the command, then the command's own fields
 /// at the same level.
 #[derive(Serialize)]
@@ -2907,6 +3075,8 @@ struct QueueRequest<'a> {
     position_ms: u32,
     context: &'a str,
     automatic_start: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    start_paused: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     only_if_preview: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2949,11 +3119,16 @@ fn oversized_request_error(kind: &str, bytes: usize) -> String {
     )
 }
 
-fn parse_data<T: serde::de::DeserializeOwned>(reply: EngineReply, kind: &str) -> Result<T, String> {
+/// Reads a reply payload once, straight into its type, then withdraws the
+/// download marks the fence says it may no longer claim.
+fn parse_data<T: serde::de::DeserializeOwned + CachedClaims>(reply: EngineReply, kind: &str) -> Result<T, String> {
     let data = reply
         .data
         .ok_or_else(|| format!("{kind} reply carried no payload"))?;
-    serde_json::from_value(data).map_err(|error| format!("unexpected {kind} payload: {error}"))
+    let mut payload: T = serde_json::from_str(data.json())
+        .map_err(|error| format!("unexpected {kind} payload: {error}"))?;
+    reply.fence.apply(&mut payload);
+    Ok(payload)
 }
 
 /// Release builds use only the bundled resource (or Windows sibling).
@@ -3159,7 +3334,28 @@ mod tests {
             process_generation: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             shutdown_lock: Mutex::new(()),
+            timing: Timing::PRODUCTION,
         })
+    }
+
+    /// Production's deadlines and backoff in milliseconds. The command
+    /// deadline is the one these tests wait out; browse stays generous
+    /// because a fresh PowerShell child has to start up inside it.
+    const FAST: Timing = Timing {
+        command: Duration::from_millis(250),
+        browse: Duration::from_secs(10),
+        waveform: Duration::from_secs(10),
+        respawn: RespawnPolicy {
+            start: Duration::from_millis(100),
+            max: Duration::from_secs(10),
+            stable_uptime: Duration::from_secs(30),
+        },
+    };
+
+    fn fast_client(state: PlaybackState) -> Arc<EngineClient> {
+        let mut client = client_with_last_state(state);
+        Arc::get_mut(&mut client).expect("a fresh client is unshared").timing = FAST;
+        client
     }
 
     fn boundary_state() -> PlaybackState {
@@ -3249,9 +3445,77 @@ mod tests {
         assert!(!client.delta_base.lock().queue[0].cached);
         client.reconcile_cached_rows(&mut stale_rows, generation);
         assert!(!stale_rows[0].cached);
-        let mut payload = json!({"tracks": [{"cached": true}], "cached": true});
-        discard_cached_claims(&mut payload);
-        assert_eq!(payload["tracks"][0]["cached"], false);
+        // A reset between request and reply withdraws every claimed row; a
+        // later removal, only its own.
+        let reply = |fence| EngineReply { ok: true, data: Some(test_data(json!({"tracks": [
+            {"id": "a", "cached": true}, {"id": "b", "cached": true}]}))), fence, ..EngineReply::default() };
+        let stale = MarkFence { stale: true, ..MarkFence::default() };
+        assert!(rows(reply(stale)).iter().all(|row| !row.cached));
+        let removed = MarkFence { invalidated: HashSet::from(["a".to_owned()]), ..MarkFence::default() };
+        assert_eq!(rows(reply(removed)).iter().map(|row| row.cached).collect::<Vec<_>>(), [false, true]);
+        assert!(rows(reply(MarkFence::default())).iter().all(|row| row.cached));
+    }
+
+    /// A playlist read parses once, into the variant it is. A changed read's
+    /// rows are fenced by the reply; an unchanged read's marks are ids, fenced
+    /// by the shell against the same evidence when it adopts them.
+    #[test]
+    fn a_playlist_read_parses_into_its_variant_with_both_kinds_of_marks_fenced() {
+        use renderer_engine::protocol::PlaylistRead;
+        let changed = test_data(json!({"changed": {"id": "p", "uri": "spotify:playlist:p", "name": "P",
+            "owner_id": "o", "owner_name": "O", "tracks_key": "k",
+            "tracks": [{"id": "a", "cached": true}, {"id": "b", "cached": true}]}}));
+        let fence = MarkFence { invalidated: HashSet::from(["a".to_owned()]), ..MarkFence::default() };
+        let PlaylistRead::Changed(browse) = parse_data::<PlaylistRead>(
+            EngineReply { ok: true, data: Some(changed), fence, ..EngineReply::default() }, "browse_playlist",
+        ).unwrap() else { panic!("a changed read is a changed read") };
+        assert_eq!(browse.tracks.iter().map(|row| row.cached).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(browse.tracks_key.as_deref(), Some("k"));
+
+        let unchanged = test_data(json!({"unchanged": {"cached_ids": ["a", "b"], "excluded_track_ids": ["c"]}}));
+        let PlaylistRead::Unchanged(read) = parse_data::<PlaylistRead>(
+            EngineReply { ok: true, data: Some(unchanged), ..EngineReply::default() }, "browse_playlist",
+        ).unwrap() else { panic!("an unchanged read is an unchanged read") };
+        assert_eq!(read.excluded_track_ids, ["c"]);
+        let client = client_with_last_state(boundary_state());
+        let generation = client.cache_generation();
+        let mut removal = boundary_state();
+        removal.uncached_ids = Some(vec!["a".into()]);
+        client.on_state(&removal, PayloadRows::Sent);
+        let mut ids = read.cached_ids.clone();
+        client.reconcile_cached_ids(&mut ids, generation);
+        assert_eq!(ids, ["b"], "a removal since withdraws its own mark");
+        client.clear_cache_marks();
+        let mut ids = read.cached_ids;
+        client.reconcile_cached_ids(&mut ids, generation);
+        assert!(ids.is_empty(), "a reset since withdraws them all");
+    }
+
+    /// A test reply's payload, as the reader keeps it.
+    fn test_data(value: Value) -> ReplyData {
+        ReplyData(serde_json::value::RawValue::from_string(value.to_string()).unwrap())
+    }
+
+    fn reply_value(data: &ReplyData) -> Value {
+        serde_json::from_str(data.json()).unwrap()
+    }
+
+    /// A browse-shaped test payload: just its rows.
+    #[derive(serde::Deserialize)]
+    struct Rows {
+        tracks: Vec<renderer_engine::protocol::TrackRef>,
+    }
+
+    impl CachedClaims for Rows {
+        fn claims(&mut self, visit: &mut dyn FnMut(&mut renderer_engine::protocol::TrackRef)) {
+            for track in &mut self.tracks { visit(track) }
+        }
+    }
+
+    /// The rows of a reply, read the way `parse_data` reads every payload:
+    /// once, typed, with the reply's fence applied.
+    fn rows(reply: EngineReply) -> Vec<renderer_engine::protocol::TrackRef> {
+        parse_data::<Rows>(reply, "browse_playlist").unwrap().tracks
     }
 
     #[cfg(windows)]
@@ -3278,7 +3542,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         *client.stdin.lock() = child.stdin.take().map(|pipe| spawn_input_writer(pipe, 0));
         spawn_reader(child.stdout.take().unwrap(), &client);
         let reply = client.request("browse_playlist", json!({"id": "temporary"})).await.unwrap();
-        assert_eq!(reply.data.unwrap()["tracks"][0]["cached"], false);
+        assert!(!rows(reply)[0].cached);
         let first = lines.recv().await.unwrap();
         assert!(matches!(first, StateLine::State(state) if state.uncached_ids == Some(vec!["a".into()])
             && !state.queue[0].cached));
@@ -3300,11 +3564,25 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         client.spawn_child(&mut command).unwrap();
     }
 
+    /// A real owned child that exits at once. `cmd` starts in a fraction of
+    /// PowerShell's time, and a child that only has to end needs nothing more.
+    #[cfg(windows)]
+    fn start_exiting_child(client: &Arc<EngineClient>) {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("cmd.exe");
+        command.args(["/d", "/c", "exit 0"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+            .creation_flags(0x0800_0000);
+        client.exit_tx.send_replace(false);
+        client.spawn_child(&mut command).unwrap();
+    }
+
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervisor_backs_off_every_early_owned_child_eof_and_shutdown_cancels_sleep() {
-        let client = client_with_last_state(boundary_state());
-        start_fake_child(&client, "exit 0");
+        let client = fast_client(boundary_state());
+        let policy = client.timing.respawn;
+        start_exiting_child(&client);
         let mut startup_exit = client.exit_tx.subscribe();
         tokio::time::timeout(Duration::from_secs(10), startup_exit.wait_for(|value| *value)).await.unwrap().unwrap();
         let startup_eof = Instant::now();
@@ -3312,7 +3590,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         let supervised = {
             let client = client.clone();
             tokio::spawn(client.supervise_with_spawn(move |client| {
-                start_fake_child(client, "exit 0");
+                start_exiting_child(client);
                 // Own a real child, and make EOF deterministic before returning
                 // from admission: status cannot successfully observe this child.
                 let mut exited = client.exit_tx.subscribe();
@@ -3330,17 +3608,21 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         };
         let first = tokio::time::timeout(Duration::from_secs(15), admissions.recv()).await.unwrap().unwrap();
         let second = tokio::time::timeout(Duration::from_secs(15), admissions.recv()).await.unwrap().unwrap();
-        assert!(first.duration_since(startup_eof) >= RESPAWN_BACKOFF_START);
-        assert!(second.duration_since(first) >= next_respawn_backoff(RESPAWN_BACKOFF_START));
-        // The next sleep is eight seconds, but shutdown must end it now.
+        assert!(first.duration_since(startup_eof) >= policy.start);
+        assert!(second.duration_since(first) >= policy.next(policy.start));
+        // The next sleep is four times the first, but shutdown must end it now.
+        let pending = policy.next(policy.next(policy.start));
+        let shutdown = Instant::now();
         client.shutdown_engine();
         tokio::time::timeout(Duration::from_secs(2), supervised).await.unwrap().unwrap();
+        assert!(shutdown.elapsed() < pending, "shutdown waited out the backoff instead of ending it");
         assert!(admissions.recv().await.is_none(), "shutdown must not admit another child");
     }
 
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervisor_shutdown_wakes_live_child_exit_watch_and_spawn_failure_backoff() {
+        // Production deadlines: the status below waits on PowerShell starting.
         let client = client_with_last_state(boundary_state());
         start_fake_child(&client, r#"
 while ($line = [Console]::ReadLine()) {
@@ -3358,7 +3640,7 @@ while ($line = [Console]::ReadLine()) {
         client.shutdown_engine();
         tokio::time::timeout(Duration::from_secs(2), supervised).await.unwrap().unwrap();
 
-        let client = client_with_last_state(boundary_state());
+        let client = fast_client(boundary_state());
         let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
         let supervised = tokio::spawn(client.clone().supervise_with_spawn(move |_| {
             attempted.send(Instant::now()).unwrap();
@@ -3366,7 +3648,7 @@ while ($line = [Console]::ReadLine()) {
         }));
         let first = attempts.recv().await.unwrap();
         let second = tokio::time::timeout(Duration::from_secs(5), attempts.recv()).await.unwrap().unwrap();
-        assert!(second.duration_since(first) >= RESPAWN_BACKOFF_START);
+        assert!(second.duration_since(first) >= client.timing.respawn.start);
         client.shutdown_engine();
         tokio::time::timeout(Duration::from_secs(2), supervised).await.unwrap().unwrap();
         assert!(attempts.recv().await.is_none());
@@ -3482,7 +3764,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_written_audio_clear_waits_past_the_command_deadline_for_its_real_ack() {
-        let client = client_with_last_state(boundary_state());
+        let client = fast_client(boundary_state());
         let _child = IsolatedChild(client.clone());
         let mut lines = client.subscribe_lines();
         start_fake_child(&client, r#"
@@ -3503,7 +3785,8 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         }).await.unwrap();
         // The child has received the request but is still deleting. The
         // ordinary command deadline cannot release cache-operation ownership.
-        assert!(tokio::time::timeout(COMMAND_TIMEOUT + Duration::from_secs(1), &mut clear).await.is_err());
+        let past_deadline = client.timing.command + Duration::from_millis(250);
+        assert!(tokio::time::timeout(past_deadline, &mut clear).await.is_err());
         assert_eq!(client.pending.lock().len(), 1);
         assert!(client.current_state().unwrap().queue[0].cached, "no success has been acknowledged");
         assert!(client.process.lock().is_some(), "slow disk work is not a crashed child");
@@ -3607,12 +3890,12 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
 [Console]::ReadLine() | Out-Null
 "#);
         let reply = client.request("browse_playlist", json!({"id": "temporary"})).await.unwrap();
-        let mut tracks: Vec<Track> = serde_json::from_value(reply.data.unwrap()["tracks"].clone()).unwrap();
+        let mut tracks: Vec<Track> = rows(reply).into_iter().map(Track::from).collect();
         client.reconcile_cached_rows(&mut tracks, client.cache_generation());
         assert!(!tracks[0].cached);
         assert!(tracks[1].cached, "unrelated file is still cached");
         let reply = client.request("browse_playlist", json!({"id": "temporary"})).await.unwrap();
-        assert_eq!(reply.data.unwrap()["tracks"][0]["cached"], true, "new positive wins");
+        assert!(rows(reply)[0].cached, "new positive wins");
         let request = {
             let client = client.clone();
             tokio::spawn(async move { client.request("browse_playlist", json!({"id": "temporary"})).await })
@@ -3625,9 +3908,9 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         client.clear_cache_marks();
         let release = build_line(&client.next_request_id(), "status", Value::Null);
         client.write_line(release).unwrap().1.await.unwrap().unwrap();
-        let data = request.await.unwrap().unwrap().data.unwrap();
-        assert_eq!(data["tracks"][0]["cached"], false);
-        assert_eq!(data["tracks"][1]["cached"], false, "reset fences every row");
+        let data = rows(request.await.unwrap().unwrap());
+        assert!(!data[0].cached);
+        assert!(!data[1].cached, "reset fences every row");
         let generation = client.process_generation.load(Ordering::Acquire);
         client.retire_process(generation);
     }
@@ -3635,7 +3918,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stalled_child_input_times_out_without_blocking_runtime_and_replacement_answers() {
-        let client = client_with_last_state(boundary_state());
+        let client = fast_client(boundary_state());
         let mut exited = client.exit_tx.subscribe();
         start_fake_child(&client, "Start-Sleep -Seconds 60");
         let request = {
@@ -3661,7 +3944,9 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
 [Console]::WriteLine((@{request_id=$request.request_id; ok=$true} | ConvertTo-Json -Compress))
 [Console]::ReadLine() | Out-Null
 "#);
-        client.status().await.unwrap();
+        // A browse-lane request: its deadline outlasts PowerShell starting up,
+        // which the shortened command deadline here would not.
+        client.request("browse_replacement", Value::Null).await.unwrap();
         client.retire_process(client.process_generation.load(Ordering::Acquire));
     }
 
@@ -3675,16 +3960,17 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
 
     #[test]
     fn long_running_waveform_work_does_not_extend_cancellation_or_transport_deadlines() {
-        assert!(request_timeout("get_track_waveform") > request_timeout("browse_album"));
-        assert!(request_timeout("browse_album") > request_timeout("status"));
-        assert_eq!(request_timeout("cancel_track_waveform"), request_timeout("pause"));
+        let timing = Timing::PRODUCTION;
+        assert!(timing.request_timeout("get_track_waveform") > timing.request_timeout("browse_album"));
+        assert!(timing.request_timeout("browse_album") > timing.request_timeout("status"));
+        assert_eq!(timing.request_timeout("cancel_track_waveform"), timing.request_timeout("pause"));
     }
 
     #[test]
     fn missing_or_malformed_reply_payloads_fail_at_the_typed_client_boundary() {
         for data in [None, Some(Value::Null), Some(json!({"track_id": "a", "interval_ms": "bad"}))] {
             let result = parse_data::<renderer_engine::protocol::TrackWaveform>(
-                EngineReply { ok: true, error: None, data }, "get_track_waveform",
+                EngineReply { ok: true, data: data.map(test_data), ..EngineReply::default() }, "get_track_waveform",
             );
             assert!(result.is_err());
         }
@@ -4245,7 +4531,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
                 assert_eq!(request_id, "request-8");
                 assert!(!ok);
                 assert_eq!(error.as_deref(), Some("browse failed"));
-                assert_eq!(data.unwrap()["tracks"][0]["id"], "track-1");
+                assert_eq!(reply_value(&data.unwrap())["tracks"][0]["id"], "track-1");
             }
             _ => panic!("reply fields stay on the reply path"),
         }
@@ -4899,23 +5185,24 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
 
     #[test]
     fn a_crash_loop_backs_off_and_only_a_stable_child_starts_the_backoff_over() {
-        let mut backoff = RESPAWN_BACKOFF_START;
+        let policy = Timing::PRODUCTION.respawn;
+        let mut backoff = policy.start;
         let mut delays = Vec::new();
         // Each child spawns fine and dies a second later.
         for _ in 0..6 {
-            let delay = respawn_delay(backoff, Duration::from_secs(1));
+            let delay = policy.delay(backoff, Duration::from_secs(1));
             delays.push(delay.as_secs());
-            backoff = next_respawn_backoff(delay);
+            backoff = policy.next(delay);
         }
         assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
         assert!(delays[1] > delays[0], "early successful spawns cannot reset backoff");
-        assert!(delays.iter().all(|seconds| Duration::from_secs(*seconds) <= RESPAWN_BACKOFF_MAX));
+        assert!(delays.iter().all(|seconds| Duration::from_secs(*seconds) <= policy.max));
         assert_eq!(delays[4], delays[5], "crash retries remain capped");
         // A child that stayed up long enough was healthy: its exit starts over.
-        let delay = respawn_delay(backoff, RESPAWN_STABLE_UPTIME);
-        assert_eq!(delay, RESPAWN_BACKOFF_START);
-        assert!(next_respawn_backoff(delay) > delay);
-        assert_eq!(respawn_delay(Duration::from_secs(16), RESPAWN_STABLE_UPTIME - Duration::from_millis(1)),
+        let delay = policy.delay(backoff, policy.stable_uptime);
+        assert_eq!(delay, policy.start);
+        assert!(policy.next(delay) > delay);
+        assert_eq!(policy.delay(Duration::from_secs(16), policy.stable_uptime - Duration::from_millis(1)),
             Duration::from_secs(16));
     }
 
@@ -5027,7 +5314,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
                 assert_eq!(request_id, "r");
                 assert_eq!(ok, value["ok"].as_bool().unwrap());
                 assert_eq!(error.as_deref(), value.get("error").and_then(Value::as_str));
-                assert_eq!(data.as_ref(), value.get("data"));
+                assert_eq!(data.as_ref().map(reply_value), value.get("data").cloned());
             }
         }
         assert_eq!(parse_line(r#"{"type":"position","position_ms":5,"duration_ms":9}"#),
@@ -5047,10 +5334,14 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             QueueRequest { queue: &queue, index: 0, position_ms: 5, context: "album:x",
                 automatic_start: true, ..QueueRequest::default() })).unwrap();
         assert_eq!(request.request_id, "r");
-        let renderer_engine::protocol::Command::PlayQueue { queue: rows, position_ms, context, automatic_start, .. }
+        let renderer_engine::protocol::Command::PlayQueue { queue: rows, position_ms, context, automatic_start, start_paused, .. }
             = request.command else { panic!("queue request must be routable"); };
         assert_eq!(rows[0].uri, queue[0].uri);
-        assert_eq!((position_ms, context.as_str(), automatic_start), (5, "album:x", true));
+        assert_eq!((position_ms, context.as_str(), automatic_start, start_paused), (5, "album:x", true, false));
+        let request: renderer_engine::protocol::Request = serde_json::from_str(&build_line("r", "play_queue",
+            QueueRequest { queue: &queue, start_paused: true, ..QueueRequest::default() })).unwrap();
+        assert!(matches!(request.command,
+            renderer_engine::protocol::Command::PlayQueue { start_paused: true, .. }), "a paused start reaches the engine");
 
         let request: renderer_engine::protocol::Request = serde_json::from_str(&build_line("restore", "restore_queue",
             QueueRequest { queue: &queue, only_if_preview: true, preview_lease_id: Some(17),
@@ -5072,10 +5363,35 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         assert_eq!(line_for(largest).unwrap().len() + 1, MAX_REQUEST_BYTES);
         assert!(line_for(largest + 1).is_err());
 
+        // A running engine's input, so the refusal is the size check's alone:
+        // without one, any request fails as "not running" whatever its size.
         let client = client_with_last_state(PlaybackState::default());
+        let (sender, written) = mpsc::sync_channel::<InputLine>(4);
+        *client.stdin.lock() = Some(EngineInput { generation: 1, sender });
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let queue = vec![Track { name: "x".repeat(MAX_REQUEST_BYTES), ..Track::default() }];
-        assert!(runtime.block_on(client.play_queue(&queue, 0, 0, "", false)).is_err());
+        let error = runtime.block_on(client.play_queue(&queue, 0, 0, "", false, false)).unwrap_err();
+        assert!(error.starts_with("This queue is too large for the playback engine"), "{error}");
+        assert!(error.contains("16 MB limit"), "the message names the limit: {error}");
+        assert!(written.try_recv().is_err(), "an oversized line is never handed to the engine");
         assert!(client.pending.lock().is_empty(), "nothing waits for an answer that cannot come");
+
+        // The same input carries a request that fits.
+        let small = vec![Track { name: "x".into(), ..Track::default() }];
+        let request = runtime.block_on(async {
+            let sending = client.play_queue(&small, 0, 0, "", false, false);
+            tokio::pin!(sending);
+            assert!(futures_poll_once(sending.as_mut()).await.is_none(), "a fitting request waits for its reply");
+            written.try_recv().expect("a fitting request is written")
+        });
+        assert!(request.line.contains("\"type\":\"play_queue\""));
+    }
+
+    /// Polls `future` once, answering its output if it was already done.
+    async fn futures_poll_once<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(match future.as_mut().poll(cx) {
+            std::task::Poll::Ready(output) => Some(output),
+            std::task::Poll::Pending => None,
+        })).await
     }
 }

@@ -26,13 +26,16 @@ jobs:
           bun -e 'const v = require("./package.json").version; const tag = process.env.RELEASE_TAG.replace(/^v/, ""); if (v !== tag || require("./src-tauri/tauri.conf.json").version !== tag) throw Error(`Release tag ${tag} must match app version ${v}`)'
       - name: Test frontend, engine and shell
         # The shell compiles against the built frontend and bundles the
-        # release engine, so both must exist before its tests build.
+        # release engine, so both must exist before its tests build. Native
+        # tests run serially (AGENTS.md): the audio and cache epochs are
+        # process-global.
         run: |
           bun test
           bun run build
           bun run build:engine
-          cargo test -p renderer-engine
-          cargo test -p spotifine
+          cargo test -p renderer-engine --lib --bin PlaybackEngine -- --test-threads=1
+          cargo test -p librespot-audio -- --test-threads=1
+          cargo test -p spotifine -- --test-threads=1
       - name: Build and sign macOS app and updater archive
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -105,6 +108,18 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           bun -e 'const v = require("./package.json").version; const tag = process.env.RELEASE_TAG.replace(/^v/, ""); if (v !== tag || require("./src-tauri/tauri.conf.json").version !== tag) throw Error(`Release tag ${tag} must match app version ${v}`)'
+      - name: Test frontend, engine and shell
+        # Same prerequisites and commands as the macOS job. This is the only
+        # place the `#[cfg(windows)]` tests run: the engine client's
+        # supervisor, its PowerShell-child pipe tests and the SMTC session.
+        shell: bash
+        run: |
+          bun test
+          bun run build
+          bun run build:engine
+          cargo test -p renderer-engine --lib --bin PlaybackEngine -- --test-threads=1
+          cargo test -p librespot-audio -- --test-threads=1
+          cargo test -p spotifine -- --test-threads=1
       - name: Build signed NSIS updater
         shell: bash
         env:

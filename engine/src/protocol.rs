@@ -174,6 +174,10 @@ pub enum Command {
         /// after `index`, wrapping once. Direct row playback leaves it false.
         #[serde(default)]
         automatic_start: bool,
+        /// Load the chosen row paused rather than playing: a start the user
+        /// paused before it landed installs in one step, never sounding.
+        #[serde(default)]
+        start_paused: bool,
     },
     /// Installs a paused queue/playhead without asking librespot to load audio.
     /// Snapshot positions are in the compiled transport timeline and are
@@ -322,9 +326,15 @@ pub enum Command {
     ClearHistory,
     Shutdown,
     /// Playlist metadata and tracks via `/playlist/v2/playlist/{id}`.
-    /// Responded to with a `browse_playlist` message.
+    /// Responded to with a `browse_playlist` message carrying a
+    /// [`PlaylistRead`].
     BrowsePlaylist {
         id: String,
+        /// The [`PlaylistBrowse::tracks_key`] of the rows the caller already
+        /// holds. When the playlist still answers to it, the reply is
+        /// [`PlaylistRead::Unchanged`] and no row is resolved or sent.
+        #[serde(default)]
+        tracks_key: Option<String>,
     },
     /// Ordered song membership only, without resolving track metadata.
     BrowsePlaylistMembership { id: String },
@@ -901,6 +911,37 @@ pub struct PlaylistBrowse {
     /// Track ids skipped by automatic playback in this playlist. Direct row
     /// playback remains available for every row, including these ids.
     #[serde(default)]
+    pub excluded_track_ids: Vec<String>,
+    /// Names exactly these rows: the revision they were resolved for, under
+    /// the session's account and availability policy. A caller that keeps
+    /// the rows sends it back with its next [`Command::BrowsePlaylist`].
+    /// Absent when the rows cannot stand in for a later read of the revision:
+    /// a resolve that lost items, or a row whose verdict only the clock
+    /// overturns (not released yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks_key: Option<String>,
+}
+
+/// Answer to [`Command::BrowsePlaylist`]. Externally tagged, so the rows of a
+/// `changed` read stream straight into their type.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaylistRead {
+    /// The playlist as it stands, rows and all.
+    Changed(PlaylistBrowse),
+    /// The caller's rows still stand: the playlist answers to the
+    /// `tracks_key` it sent.
+    Unchanged(PlaylistUnchanged),
+}
+
+/// What can move under rows that still stand.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PlaylistUnchanged {
+    /// Rows whose audio is in the cache now, by track id.
+    pub cached_ids: Vec<String>,
+    /// As in [`PlaylistBrowse::excluded_track_ids`]: local, so no revision
+    /// covers it.
     pub excluded_track_ids: Vec<String>,
 }
 
@@ -1544,6 +1585,7 @@ mod tests {
             position_ms,
             context,
             automatic_start,
+            start_paused,
         } = without_flag.command
         else {
             panic!("play_queue must parse as its dedicated command");
@@ -1553,6 +1595,7 @@ mod tests {
         assert_eq!(position_ms, 0);
         assert_eq!(context, "playlist:playlist");
         assert!(!automatic_start, "omitted flag defaults to direct playback");
+        assert!(!start_paused, "omitted flag starts playing");
 
         let with_flag: Request = serde_json::from_value(json!({
             "request_id": "request-play-automatic",
@@ -1560,13 +1603,15 @@ mod tests {
             "queue": [],
             "index": 0,
             "position_ms": 0,
-            "automatic_start": true
+            "automatic_start": true,
+            "start_paused": true
         }))
         .unwrap();
         assert!(matches!(
             with_flag.command,
             Command::PlayQueue {
                 automatic_start: true,
+                start_paused: true,
                 ..
             }
         ));

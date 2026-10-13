@@ -238,8 +238,10 @@ pub fn run() {
             let personal = personal_api::PersonalApi::new().map_err(std::io::Error::other)?;
             app.manage(personal.clone());
 
-            // Spawn the playback engine and keep it alive across crashes.
-            let client = EngineClient::start();
+            // Spawn the playback engine and keep it alive across crashes. The
+            // state consumer's subscription predates the child, so it hears
+            // the engine's own startup state rather than asking for one.
+            let (client, lines) = EngineClient::start();
             app.manage(client.clone());
             let router = playback_router::PlaybackRouter::new(client.clone(), personal, startup_settings.devices_enabled);
             app.manage(router.clone());
@@ -269,7 +271,7 @@ pub fn run() {
 
             // Mirror engine state into AppState and the frontend.
             let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(commands::consume_states(app_handle));
+            tauri::async_runtime::spawn(commands::consume_states(app_handle, lines));
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol("cover", |_context, request, responder| {

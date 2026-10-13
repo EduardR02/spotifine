@@ -228,18 +228,18 @@ fn run_controls(
         }
     }
 
-    // Publish the sender before asking for status. Otherwise a fast response
-    // can arrive in the gap and be dropped, leaving SMTC stale until the next
-    // full engine state.
+    // Updates published before the sender existed were dropped. Publish it
+    // first, then read what they would have shown: the device's state when
+    // one is selected, otherwise the client's current one. Read after, so a
+    // state newer than the read is already queued and lands after it.
     if UPDATES.set(sender).is_err() {
         return;
     }
     log::info("media keys registered (SMTC)");
-
-    let refresh = client.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = refresh.request("status", serde_json::Value::Null).await;
-    });
+    let current = app.try_state::<Arc<PlaybackRouter>>()
+        .and_then(|router| router.snapshot())
+        .or_else(|| client.current_state())
+        .map(|state| update_for(&state));
 
     // Deduplicate the actual OS metadata tuple, not the URI: preview edits,
     // restores and refreshed titles/artwork can change it for the same song.
@@ -247,7 +247,7 @@ fn run_controls(
     let mut last_metadata = None;
     let mut last_transport: Option<Published> = None;
     let mut confirmed_rate = None;
-    for update in receiver {
+    for update in current.into_iter().chain(receiver) {
         let result = match update {
             Update::State {
                 transport: next,
@@ -434,21 +434,27 @@ pub fn update_state(state: &PlaybackState) {
     POSITION_MS.store(state.position_ms as u64, Ordering::Relaxed);
     let duration_ms = track.map_or(0, |track| track_duration(state.duration_ms, track.duration_ms));
     DURATION_MS.store(duration_ms as u64, Ordering::Relaxed);
-    let Some(sender) = UPDATES.get() else { return; };
-    let Some(track) = track else {
-        let _ = sender.send(Update::Stopped);
-        return;
+    if let Some(sender) = UPDATES.get() {
+        let _ = sender.send(update_for(state));
+    }
+}
+
+/// What the media session shows for one full state. Pure: the producer's
+/// intent and playhead atomics are [`update_state`]'s to keep.
+fn update_for(state: &PlaybackState) -> Update {
+    let Some(track) = state.current_index.and_then(|index| state.queue.get(index)) else {
+        return Update::Stopped;
     };
-    let _ = sender.send(Update::State {
+    Update::State {
         transport: Transport::from_state(state),
         metadata: Metadata {
-            duration_ms,
+            duration_ms: track_duration(state.duration_ms, track.duration_ms),
             title: track.name.clone(),
             artist: track.artist_names.join(", "),
             album: track.album_name.clone(),
             cover: track.cover_url.clone(),
         },
-    });
+    }
 }
 
 /// Notes a position heartbeat for relative seeks from the overlay. Nothing is

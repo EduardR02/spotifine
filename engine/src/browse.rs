@@ -66,7 +66,7 @@ use serde::Deserialize;
 
 use renderer_engine::protocol::{
     AlbumRef, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity,
-    Canvas, CreditArtist, CreditRole, EpisodeRef, LibraryNode, PlaylistRecommendations, PlaylistRef,
+    Canvas, CreditArtist, CreditRole, EpisodeRef, LibraryNode, PlaylistRead, PlaylistRecommendations, PlaylistRef, PlaylistUnchanged,
     RadioBrowse, ShowBrowse, ShowRef, SongwriterPlaylist, TrackCredits, TrackRef,
     UserProfile, sanitize_playlist_description,
 };
@@ -331,11 +331,20 @@ pub fn track_ref(track: &Track) -> TrackRef {
 /// Region-locked tracks carry no files of their own. Their alternative ids are
 /// retained in the session index, but ordinary browse never fetches substitute
 /// metadata merely to improve a cache badge.
-fn track_is_cached(track: &Track, cache: Option<&Cache>) -> bool {
+///
+/// A hit also tells the persistent cache index which track that file holds,
+/// so a file cached before the index existed stops being unaccounted for.
+fn track_is_cached(id: &str, track: &Track, cache: Option<&Cache>) -> bool {
     let Some(cache) = cache else {
         return false;
     };
-    any_file_on_disk(track.files.values().copied(), cache)
+    let Some(file_id) = track.files.values().copied().find(|file_id| {
+        cache.file_path(*file_id).is_some_and(|path| std::fs::exists(path).unwrap_or(false))
+    }) else {
+        return false;
+    };
+    crate::cache_index::record(id, file_id);
+    true
 }
 
 /// `std::fs::exists`, not `Path::exists`: the former is one `GetFileAttributesW`,
@@ -578,6 +587,16 @@ pub fn cached_track_ids(ids: &[String], cache: Option<&Cache>) -> Vec<String> {
     };
     ids.iter()
         .filter(|id| resolve_cached(id, &index, cache, true) == Some(true))
+        .cloned()
+        .collect()
+}
+
+/// Which of `ids` count `file_id` among their known files. Memory only: this
+/// is how a removed file finds the marks it could have carried.
+pub fn ids_holding_file<'a>(ids: impl IntoIterator<Item = &'a String>, file_id: FileId) -> Vec<String> {
+    let Ok(index) = FILE_IDS.read() else { return Vec::new(); };
+    ids.into_iter()
+        .filter(|id| index.get(id.as_str()).is_some_and(|entry| entry.files.contains(&file_id)))
         .cloned()
         .collect()
 }
@@ -1053,7 +1072,7 @@ fn parse_track_payload(
     // Here and nowhere else: this is the one point where a track's file ids
     // exist without a request having been made for them.
     remember_track_files(&reference.id, &track);
-    reference.cached = track_is_cached(&track, cache);
+    reference.cached = track_is_cached(&reference.id, &track, cache);
     Some(reference)
 }
 
@@ -2498,20 +2517,87 @@ fn playlist_items(playlist: &Playlist) -> Vec<(SpotifyUri, Option<i64>)> {
         .collect()
 }
 
+/// What a playlist's resolved rows are an answer for: its revision, for this
+/// account, under this availability policy — the same facts that key
+/// [`PLAYLIST_TRACKS_CACHE`], spelled out so they can cross the process
+/// boundary and come back with the caller's held rows. `None` for a playlist
+/// without a revision, which nothing can vouch for.
+fn playlist_rows_key(user: &str, revision: &str, policy: &AvailabilityPolicy) -> Option<String> {
+    (!revision.is_empty()).then(|| format!(
+        "{revision}:{user}:{}:{}:{}",
+        policy.country, policy.catalogue, policy.filter_explicit,
+    ))
+}
+
+/// Download marks for rows the caller already holds, without sending them.
+///
+/// The persistent cache index answers with no metadata at all whenever it
+/// accounts for every cached file. Otherwise the rows are resolved as an open
+/// always resolved them (the memo first) and only their marks are kept; that
+/// resolve also teaches the index the files it finds.
+async fn held_playlist_marks(
+    session: &Session,
+    id: &str,
+    playlist: &Playlist,
+    user: &str,
+    revision: &str,
+    policy: &AvailabilityPolicy,
+) -> Result<Vec<String>, String> {
+    let Some(cache) = session.cache().cloned() else { return Ok(Vec::new()) };
+    let ids: Vec<String> = playlist.contents.items.iter()
+        .filter(|item| matches!(item.id, SpotifyUri::Track { .. }))
+        .map(|item| id_of(&item.id))
+        .collect();
+    if let Some(cached) = crate::cache_index::cached_among(ids.iter().map(String::as_str), &cache) {
+        return Ok(cached);
+    }
+    let tracks = match fresh_playlist_tracks(policy, user, id, revision, Some(&cache)) {
+        Some(tracks) => tracks,
+        None => {
+            let items = playlist_items(playlist);
+            let tracks = fetch_playlist_tracks(session, &items, policy).await?;
+            remember_playlist_tracks(policy, user, id, revision, &items, &tracks);
+            tracks
+        }
+    };
+    let mut cached: Vec<String> = tracks.into_iter().filter(|track| track.cached).map(|track| track.id).collect();
+    cached.sort_unstable();
+    cached.dedup();
+    Ok(cached)
+}
+
 /// Playlist header and tracks via the spclient playlist4 endpoint.
 ///
-/// The header is fetched every time — it is where the revision comes from —
-/// but the track list behind it is served from [`PLAYLIST_TRACKS_CACHE`] when
-/// that revision has already been resolved for the session's current policy.
-/// A resolve that could not place every item is returned but never remembered,
-/// so the next open tries for the rows it is missing instead of inheriting
-/// them from here.
+/// The header is fetched every time — it is where the revision comes from.
+/// When `held_key` names the rows that revision resolves to (see
+/// [`playlist_rows_key`]), the caller already has them: the answer is
+/// [`PlaylistRead::Unchanged`], carrying only the marks that can move under
+/// unchanged rows. Otherwise the track list is served from
+/// [`PLAYLIST_TRACKS_CACHE`] when that revision has already been resolved for
+/// the session's current policy. A resolve that could not place every item is
+/// returned but never remembered, and carries no key, so the next open tries
+/// for the rows it is missing instead of inheriting them.
 pub async fn playlist_browse(
     session: &Session,
     id: &str,
-) -> Result<renderer_engine::protocol::PlaylistBrowse, String> {
+    held_key: Option<&str>,
+) -> Result<PlaylistRead, String> {
     let uri = playlist_uri(id)?;
     let playlist: Playlist = spclient_read(|| Playlist::get(session, &uri)).await.map_err(|error| format!("{} fetch failed: {error}", "playlist"))?;
+    let user = session.username();
+    let revision = hex(&playlist.revision);
+    // Read once: the verdicts in the resolved list, the key it is stored
+    // under and the key handed out must come from the same policy.
+    let policy = AvailabilityPolicy::for_session(session);
+    let key = playlist_rows_key(&user, &revision, &policy);
+    if key.is_some() && key.as_deref() == held_key {
+        let cached_ids = held_playlist_marks(session, id, &playlist, &user, &revision, &policy).await;
+        crate::cache_index::save_if_dirty();
+        return Ok(PlaylistRead::Unchanged(PlaylistUnchanged {
+            cached_ids: cached_ids?,
+            excluded_track_ids: Vec::new(),
+        }));
+    }
     let owner_id = match &playlist.id {
         SpotifyUri::Playlist { user, .. } => user.clone().unwrap_or_default(),
         _ => String::new(),
@@ -2527,21 +2613,20 @@ pub async fn playlist_browse(
             }
         }
     };
-    let user = session.username();
-    let revision = hex(&playlist.revision);
     let cache = session.cache().cloned();
-    // Read once: the verdicts in the resolved list and the key it is stored
-    // under must come from the same policy.
-    let policy = AvailabilityPolicy::for_session(session);
-    let tracks = match fresh_playlist_tracks(&policy, &user, id, &revision, cache.as_deref()) {
-        Some(tracks) => tracks,
+    // A memo hit was memoizable when it was stored; a resolve, when it placed
+    // every item with no row waiting on its release date.
+    let (tracks, standing) = match fresh_playlist_tracks(&policy, &user, id, &revision, cache.as_deref()) {
+        Some(tracks) => (tracks, true),
         None => {
             let items = playlist_items(&playlist);
             let tracks = fetch_playlist_tracks(session, &items, &policy).await?;
             remember_playlist_tracks(&policy, &user, id, &revision, &items, &tracks);
-            tracks
+            let standing = playlist_resolve_is_memoizable(&items, &tracks);
+            (tracks, standing)
         }
     };
+    crate::cache_index::save_if_dirty();
     remember_playlist_metadata(&user, PlaylistRef {
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
@@ -2554,7 +2639,7 @@ pub async fn playlist_browse(
         cover_urls: playlist_track_cover_urls(&tracks),
         track_count: u32::try_from(playlist.length).ok(),
     }, true);
-    Ok(renderer_engine::protocol::PlaylistBrowse {
+    Ok(PlaylistRead::Changed(renderer_engine::protocol::PlaylistBrowse {
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
         name: playlist.name().to_owned(),
@@ -2565,7 +2650,8 @@ pub async fn playlist_browse(
         cover_url: playlist_attributes_cover(&playlist.attributes),
         tracks,
         excluded_track_ids: Vec::new(),
-    })
+        tracks_key: key.filter(|_| standing),
+    }))
 }
 
 /// Playlist artwork: the attributes' raw picture file id (i.scdn.co) wins;
@@ -9734,6 +9820,56 @@ mod file_index_tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A metadata parse that finds a row's file on disk tells the cache index
+    /// which track the file holds, so a file cached before the index existed
+    /// stops keeping it from vouching for marks.
+    #[test]
+    fn a_parse_that_finds_a_cached_file_maps_it_for_the_cache_index() {
+        let root = scratch();
+        let audio = root.join("audio");
+        std::fs::create_dir_all(&audio).unwrap();
+        let cache = Cache::new(None::<&Path>, None::<&Path>, Some(audio.as_path()), None).unwrap();
+        let track_id = "1indexAAAAAAAAAAAAAAAA";
+        let file = FileId::from_raw(&[0x5c; 20]);
+        let mut metadata = tests::test_track(track_id, "Indexed", 1000,
+            tests::test_album("1indexBBBBBBBBBBBBBBBB", "Album", Vec::new(), Default::default()), Vec::new());
+        metadata.files.insert(librespot_metadata::audio::AudioFileFormat::OGG_VORBIS_96, file);
+        let path = cache.file_path(file).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"cached before the index").unwrap();
+
+        crate::cache_index::install(root.join("audio-index.json"), vec![file]);
+        assert_eq!(crate::cache_index::cached_among([track_id], &cache), None, "an unmapped file blocks vouching");
+        assert!(track_is_cached(track_id, &metadata, Some(&cache)));
+        assert_eq!(crate::cache_index::cached_among([track_id], &cache), Some(vec![track_id.to_owned()]));
+        crate::cache_index::uninstall();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The key a caller holds rows under names everything the rows depend on,
+    /// as the memo key does: the revision, the account and the policy. Any of
+    /// them moving makes the next read a full one; no revision, no key.
+    #[test]
+    fn a_rows_key_moves_with_the_revision_the_account_and_the_policy() {
+        let policy = AvailabilityPolicy {
+            country: "US".to_owned(),
+            catalogue: "premium".to_owned(),
+            filter_explicit: false,
+        };
+        let key = playlist_rows_key("me", "abc", &policy).expect("a revision keys its rows");
+        assert_eq!(playlist_rows_key("me", "abc", &policy.clone()), Some(key.clone()));
+        assert_ne!(playlist_rows_key("me", "abd", &policy), Some(key.clone()));
+        assert_ne!(playlist_rows_key("you", "abc", &policy), Some(key.clone()));
+        for moved in [
+            AvailabilityPolicy { country: "DE".to_owned(), ..policy.clone() },
+            AvailabilityPolicy { catalogue: "free".to_owned(), ..policy.clone() },
+            AvailabilityPolicy { filter_explicit: true, ..policy.clone() },
+        ] {
+            assert_ne!(playlist_rows_key("me", "abc", &moved), Some(key.clone()));
+        }
+        assert_eq!(playlist_rows_key("me", "", &policy), None);
     }
 
     /// A revision proves which items a playlist holds. It does not prove that

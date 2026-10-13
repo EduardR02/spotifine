@@ -32,15 +32,154 @@ pub type AudioFileResult = Result<(), librespot_core::Error>;
 #[derive(Debug)]
 pub enum AudioCacheEvent {
     Stored { track_uri: SpotifyUri, file_id: FileId, downloaded: bool, epoch: u64 },
-    Removed { track_uri: SpotifyUri, file_id: FileId, epoch: u64 },
-    /// A failed save may still have pruned other entries before reporting an error.
-    Revalidate { epoch: u64 },
+    /// The file is gone from the cache. `track_uri` names the song a decoder
+    /// rejected it for; a file the size limit pruned has no song in hand, so
+    /// it is `None` there and the listener maps the file itself.
+    Removed { track_uri: Option<SpotifyUri>, file_id: FileId, epoch: u64 },
 }
 
 static AUDIO_CACHE_EVENT_SENDER: OnceLock<mpsc::UnboundedSender<AudioCacheEvent>> = OnceLock::new();
 // A clear advances this epoch while holding the same lock as cache commits.
 // Pending loaders capture it before resolving metadata or opening audio.
 static CACHE_COMMIT_EPOCH: Mutex<u64> = Mutex::new(0);
+
+/// The audio cache's size bound. Renderer patch: it lives here instead of in
+/// librespot-core's `Cache`, whose limiter deletes the least recently used
+/// files inside `save_file` and tells nobody which. Kept here, every file it
+/// prunes is announced as [`AudioCacheEvent::Removed`], so a listener holding
+/// download marks knows exactly which went, without re-checking every mark
+/// against the disk after every download.
+///
+/// One bound per process, for the cache root it was installed on; a cache
+/// rooted elsewhere is unbounded here, exactly as an uninstalled one is.
+static AUDIO_LIMIT: Mutex<Option<AudioLimit>> = Mutex::new(None);
+
+struct AudioLimit {
+    root: std::path::PathBuf,
+    limit: u64,
+    in_use: u64,
+    /// Least recently used first; the counter orders equal timestamps.
+    order: std::collections::BTreeMap<(std::time::SystemTime, u64), FileId>,
+    files: std::collections::HashMap<FileId, (u64, (std::time::SystemTime, u64))>,
+    next: u64,
+}
+
+impl AudioLimit {
+    fn stamp(&mut self, at: std::time::SystemTime) -> (std::time::SystemTime, u64) {
+        self.next += 1;
+        (at, self.next)
+    }
+
+    fn insert(&mut self, file_id: FileId, size: u64, at: std::time::SystemTime) {
+        self.remove(file_id);
+        let key = self.stamp(at);
+        self.order.insert(key, file_id);
+        self.files.insert(file_id, (size, key));
+        self.in_use += size;
+    }
+
+    fn touch(&mut self, file_id: FileId) {
+        let Some(&(size, key)) = self.files.get(&file_id) else { return };
+        self.order.remove(&key);
+        let key = self.stamp(std::time::SystemTime::now());
+        self.order.insert(key, file_id);
+        self.files.insert(file_id, (size, key));
+    }
+
+    fn remove(&mut self, file_id: FileId) {
+        if let Some((size, key)) = self.files.remove(&file_id) {
+            self.order.remove(&key);
+            self.in_use -= size;
+        }
+    }
+
+    /// The next file to delete, least recently used first, while over the bound.
+    fn pop_over_limit(&mut self) -> Option<FileId> {
+        if self.in_use <= self.limit { return None; }
+        let (_, file_id) = self.order.pop_first()?;
+        if let Some((size, _)) = self.files.remove(&file_id) { self.in_use -= size; }
+        Some(file_id)
+    }
+}
+
+fn cache_root(cache: &Cache) -> Option<std::path::PathBuf> {
+    let sample = cache.file_path(FileId::from_raw(&[0; 20]))?;
+    Some(sample.parent()?.parent()?.to_path_buf())
+}
+
+/// Runs `apply` on the bound of `cache`'s root, if one is installed there.
+fn with_limit<R>(cache: &Cache, apply: impl FnOnce(&mut AudioLimit) -> R) -> Option<R> {
+    let root = cache_root(cache)?;
+    let mut limit = AUDIO_LIMIT.lock().expect("audio limit mutex poisoned");
+    limit.as_mut().filter(|limit| limit.root == root).map(apply)
+}
+
+/// Deletes over-limit files, least recently used first, announcing (and
+/// answering) each one that is actually gone. A file that cannot be deleted
+/// stays on disk, so no one is told it went.
+fn prune_over_limit(cache: &Cache, epoch: u64) -> Vec<FileId> {
+    let mut pruned = Vec::new();
+    while let Some(file_id) = with_limit(cache, AudioLimit::pop_over_limit).flatten() {
+        let Some(path) = cache.file_path(file_id) else { continue };
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(sender) = AUDIO_CACHE_EVENT_SENDER.get() {
+                    let _ = sender.send(AudioCacheEvent::Removed { track_uri: None, file_id, epoch });
+                }
+                pruned.push(file_id);
+            }
+            Err(error) => warn!("Could not prune cached audio {path:?}: {error}"),
+        }
+    }
+    pruned
+}
+
+/// Opens the audio cache for this process: lists what it holds and, with a
+/// `limit`, bounds it there from now on, pruning at once if it is already over
+/// (a lowered limit). Answers the files that remain. Install the event sender
+/// first so the startup prunes are announced too.
+pub fn install_audio_cache(cache: &Cache, limit: Option<u64>) -> Vec<FileId> {
+    let Some(root) = cache_root(cache) else { return Vec::new() };
+    let mut found = Vec::new();
+    if let Ok(shards) = fs::read_dir(&root) {
+        for shard in shards.flatten() {
+            if !shard.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }
+            let Ok(entries) = fs::read_dir(shard.path()) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(file_id) = cache_file_id(&root, &path) else { continue };
+                let metadata = if limit.is_some() { entry.metadata().ok() } else { None };
+                found.push((file_id, metadata));
+            }
+        }
+    }
+    let Some(limit) = limit else {
+        return found.into_iter().map(|(file_id, _)| file_id).collect();
+    };
+    let mut bound = AudioLimit {
+        root, limit, in_use: 0,
+        order: Default::default(), files: Default::default(), next: 0,
+    };
+    for (file_id, metadata) in &found {
+        let Some(metadata) = metadata else { continue };
+        let accessed = metadata.accessed().or_else(|_| metadata.modified())
+            .unwrap_or_else(|_| std::time::SystemTime::now());
+        bound.insert(*file_id, metadata.len(), accessed);
+    }
+    *AUDIO_LIMIT.lock().expect("audio limit mutex poisoned") = Some(bound);
+    let pruned = prune_over_limit(cache, cache_epoch());
+    found.into_iter()
+        .map(|(file_id, _)| file_id)
+        .filter(|file_id| !pruned.contains(file_id))
+        .collect()
+}
+
+/// Deletes one cached audio file and drops it from the size bound.
+pub fn remove_audio_file(cache: &Cache, file_id: FileId) -> Result<(), Error> {
+    cache.remove_file(file_id)?;
+    with_limit(cache, |limit| limit.remove(file_id));
+    Ok(())
+}
 
 pub fn cache_epoch() -> u64 {
     *CACHE_COMMIT_EPOCH.lock().expect("cache commit mutex poisoned")
@@ -80,7 +219,7 @@ fn clear_audio_directory(cache: &Cache, root: &std::path::Path, directory: &std:
             clear_audio_directory(cache, root, &path, fs::read_dir(&path)?)?;
             fs::remove_dir(&path)?;
         } else if let Some(file_id) = cache_file_id(root, &path) {
-            cache.remove_file(file_id)?;
+            remove_audio_file(cache, file_id)?;
         } else {
             fs::remove_file(&path)?;
         }
@@ -115,9 +254,9 @@ pub fn remove_cached_audio(session: &Session, track_uri: &SpotifyUri, file_id: F
         return Err(Error::aborted("audio cache was cleared"));
     }
     let cache = session.cache().ok_or_else(|| Error::failed_precondition("audio cache unavailable"))?;
-    cache.remove_file(file_id)?;
+    remove_audio_file(cache, file_id)?;
     if let Some(sender) = AUDIO_CACHE_EVENT_SENDER.get() {
-        let _ = sender.send(AudioCacheEvent::Removed { track_uri: track_uri.clone(), file_id, epoch });
+        let _ = sender.send(AudioCacheEvent::Removed { track_uri: Some(track_uri.clone()), file_id, epoch });
     }
     Ok(())
 }
@@ -516,14 +655,18 @@ async fn cache_completed_download(
     if *active != epoch { return; }
     if let Some(cache) = cache {
         if let Some(cache_id) = cache.file_path(file_id) {
+            // The bound is this crate's (see `AUDIO_LIMIT`): the core cache
+            // has none, so a failed save prunes nothing and needs no report.
+            let size = file.as_file().metadata().map(|metadata| metadata.len());
             if let Err(e) = cache.save_file(file_id, &mut file) {
                 error!("Error caching file {file_id} to {cache_id:?}: {e}");
-                if let Some(sender) = AUDIO_CACHE_EVENT_SENDER.get() {
-                    let _ = sender.send(AudioCacheEvent::Revalidate { epoch });
-                }
             } else {
                 debug!("File {file_id} cached to {cache_id:?}");
                 send_cache_event(&track_uri, file_id, true, epoch);
+                if let Ok(size) = size {
+                    with_limit(&cache, |limit| limit.insert(file_id, size, std::time::SystemTime::now()));
+                    prune_over_limit(&cache, epoch);
+                }
             }
         }
     }
@@ -543,8 +686,9 @@ impl AudioFile {
             if *active != epoch {
                 return Err(Error::aborted("audio cache was cleared"));
             }
-            if let Some(file) = cache.as_ref().and_then(|cache| cache.file(file_id)) {
+            if let Some((cache, file)) = cache.as_ref().and_then(|cache| Some((cache, cache.file(file_id)?))) {
                 debug!("File {file_id} already in cache");
+                with_limit(cache, |limit| limit.touch(file_id));
                 send_cache_event(track_uri, file_id, false, epoch);
                 return Ok(AudioFile::Cached(file));
             }
@@ -969,7 +1113,11 @@ mod cache_event_tests {
 
         let mut events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
-            if matches!(&event, AudioCacheEvent::Stored { track_uri, .. } | AudioCacheEvent::Removed { track_uri, .. } if track_uri == &song_uri || track_uri == &episode_uri) {
+            let uri = match &event {
+                AudioCacheEvent::Stored { track_uri, .. } => Some(track_uri),
+                AudioCacheEvent::Removed { track_uri, .. } => track_uri.as_ref(),
+            };
+            if uri.is_some_and(|uri| uri == &song_uri || uri == &episode_uri) {
                 events.push(event);
             }
         }
@@ -1013,17 +1161,59 @@ mod cache_event_tests {
         assert!(!cache.file_path(late_id).unwrap().exists());
         let mut removal = false;
         while let Ok(event) = receiver.try_recv() {
-            if matches!(event, AudioCacheEvent::Removed { file_id, epoch, .. } if file_id == late_id && epoch == new_epoch) {
+            if matches!(&event, AudioCacheEvent::Removed { track_uri: Some(uri), file_id, epoch }
+                if *file_id == late_id && *epoch == new_epoch && uri == &song_uri)
+            {
                 removal = true;
             }
         }
         assert!(removal, "successful decoder rejection publishes file removal");
 
+        // The size bound is this crate's, so every file it prunes is
+        // announced, at startup and after a download alike.
         let limited_root = directory.path().join("limited-audio");
-        let limited = Cache::new(None::<PathBuf>, None::<PathBuf>, Some(limited_root), Some(32)).unwrap();
-        limited.save_file(saved_id, &mut std::io::Cursor::new([1u8; 24])).unwrap();
-        clear_cached_audio(&limited).unwrap();
-        limited.save_file(late_id, &mut std::io::Cursor::new([2u8; 24])).unwrap();
-        assert!(limited.file_path(late_id).unwrap().exists(), "clear updates the existing cache limiter instead of leaving phantom entries");
+        let limited = Session::new(SessionConfig::default(), Some(
+            Cache::new(None::<PathBuf>, None::<PathBuf>, Some(limited_root), None).unwrap(),
+        ));
+        let limited_cache = limited.cache().unwrap();
+        let [first, second, third, fourth] = [210, 211, 212, 213].map(|byte| FileId::from_raw(&[byte; 20]));
+        let exists = |file_id: FileId| limited_cache.file_path(file_id).unwrap().exists();
+        let drain_removals = |receiver: &mut mpsc::UnboundedReceiver<AudioCacheEvent>| {
+            let mut removed = Vec::new();
+            while let Ok(event) = receiver.try_recv() {
+                if let AudioCacheEvent::Removed { track_uri: None, file_id, .. } = event { removed.push(file_id); }
+            }
+            removed
+        };
+        for file_id in [first, second] {
+            limited_cache.save_file(file_id, &mut std::io::Cursor::new([1u8; 24])).unwrap();
+        }
+        // A lowered bound prunes at startup: one of the two must go.
+        let remaining = install_audio_cache(limited_cache, Some(40));
+        assert_eq!(remaining.len(), 1);
+        let pruned = drain_removals(&mut receiver);
+        assert_eq!(pruned.len(), 1, "the startup prune is announced");
+        assert!(!exists(pruned[0]) && exists(remaining[0]));
+        assert_ne!(pruned[0], remaining[0]);
+        let kept = remaining[0];
+        // 24 + 19 bytes: within 48 once the bound is raised.
+        install_audio_cache(limited_cache, Some(48));
+        cache_completed_download(third, song_uri.clone(), audio_cache(&limited, &song_uri), completed_file(), cache_epoch()).await;
+        assert!(exists(kept) && exists(third));
+        assert!(drain_removals(&mut receiver).is_empty(), "nothing is pruned within the bound");
+        // Playing the older file makes the download the least recently used.
+        assert!(AudioFile::open(&limited, kept, 1, &song_uri, cache_epoch()).await.unwrap().is_cached());
+        cache_completed_download(fourth, song_uri.clone(), audio_cache(&limited, &song_uri), completed_file(), cache_epoch()).await;
+        assert_eq!(drain_removals(&mut receiver), vec![third], "exactly the least recently used file is pruned and named");
+        assert!(exists(kept) && exists(fourth) && !exists(third));
+        // A clear and a decoder removal leave no phantom size behind.
+        clear_cached_audio(limited_cache).unwrap();
+        for file_id in [first, second] {
+            cache_completed_download(file_id, song_uri.clone(), audio_cache(&limited, &song_uri), completed_file(), cache_epoch()).await;
+        }
+        remove_cached_audio(&limited, &song_uri, first, cache_epoch()).unwrap();
+        cache_completed_download(third, song_uri.clone(), audio_cache(&limited, &song_uri), completed_file(), cache_epoch()).await;
+        assert!(exists(second) && exists(third));
+        assert!(drain_removals(&mut receiver).is_empty(), "removed files no longer count against the bound");
     }
 }
