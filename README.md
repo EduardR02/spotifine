@@ -203,6 +203,11 @@ how weren't left to them, and plenty of it got thrown out and redone.
 It's an easy codebase to extend. If Spotify is missing something you want, point
 an agent at it.
 
+## Issues and suggestions
+
+Bug reports and suggestions are welcome. For now, rather than pull requests,
+I'd prefer [issues](../../issues) as prompt requests.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Covers the code here and nothing belonging to
