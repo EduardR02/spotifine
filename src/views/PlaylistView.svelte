@@ -274,7 +274,8 @@
 
   function activeReorder(session) {
     return reorderSession === session && route.name === "playlist" &&
-      route.id === session.id && detail.playlist?.id === session.id;
+      route.id === session.id && detail.playlist?.id === session.id &&
+      detail.playlist.rows_complete === true;
   }
 
   async function fetchReorderRefresh(session) {
@@ -318,7 +319,7 @@
       while (activeReorder(session) && session.pending.length) {
         const job = session.pending[0];
         try {
-          await api.reorderPlaylistTracks(session.id, job.from, job.to);
+          await api.reorderPlaylistTracks(session.id, job.from, job.to, session.tokens.length);
           if (!activeReorder(session)) return;
           session.pending.shift();
           session.successes++;
@@ -342,6 +343,13 @@
           if (!fresh || fresh.id !== session.id || !Array.isArray(fresh.tracks)) {
             ui.error = "Could not refresh playlist after reorder failed.";
             session.pending.length = 0;
+            return;
+          }
+          if (fresh.rows_complete !== true) {
+            session.pending.length = 0;
+            reorderSession = null;
+            detail.playlist = fresh;
+            reorderBlocked = false;
             return;
           }
           const list = fresh.tracks.slice();
@@ -383,7 +391,7 @@
   }
 
   function reorderTracks(from, to) {
-    if (reorderBlocked) return;
+    if (reorderBlocked || !editable || !ownOrderShown || pl?.rows_complete !== true) return;
     const list = detail.playlist?.tracks;
     const id = pl?.id;
     if (!id || route.name !== "playlist" || route.id !== id || !Array.isArray(list) ||
@@ -418,9 +426,17 @@
   // the first move must not erase the second drag's already visible position.
   $effect(() => {
     const list = pl?.tracks;
+    const rowsComplete = pl?.rows_complete === true;
     if (!list) return;
     untrack(() => {
       const session = reorderSession;
+      if (session && !rowsComplete) {
+        session.pending.length = 0;
+        session.cancelRefresh?.();
+        reorderSession = null;
+        reorderBlocked = false;
+        return;
+      }
       if (!session?.pending.length || !activeReorder(session) || session.rows === list) return;
       const incoming = occurrenceKeys(list);
       if (incoming.length !== session.tokens.length ||
@@ -1005,6 +1021,9 @@
                again takes it away. -->
           <p class="start-blocked" role="alert">{automaticStartBlocked}</p>
         {/if}
+        {#if editable && tracks.length && pl.rows_complete !== true}
+          <p class="start-blocked">Reordering is unavailable until every playlist item can be shown, including local files and songs that could not be loaded.</p>
+        {/if}
       </div>
     </header>
 
@@ -1022,7 +1041,7 @@
           onSort={toggleSort}
           excludedTrackIds={excludedTrackIds}
           onSetExcluded={setTrackExcluded}
-          onReorder={editable && ownOrderShown && !reorderBlocked ? reorderTracks : null}
+          onReorder={editable && ownOrderShown && pl.rows_complete === true && !reorderBlocked ? reorderTracks : null}
         />
       </div>
     {:else}

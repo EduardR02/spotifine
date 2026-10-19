@@ -523,7 +523,17 @@ async fn post_playlist_changes(
     if let Some(expected) = expected_snapshot_id {
         require_reviewed_revision(&revision, expected)?;
     }
-    let mut changes = list_changes(&revision, ops);
+    post_playlist_ops(session, id, &revision, ops).await
+}
+
+/// Posts edits against the same source snapshot that was checked.
+async fn post_playlist_ops(
+    session: &Session,
+    id: &str,
+    revision: &[u8],
+    ops: Vec<p4::Op>,
+) -> Result<(), String> {
+    let mut changes = list_changes(revision, ops);
     if let Some(delta) = changes.deltas.first_mut() {
         delta.info = protobuf::MessageField::some(change_info(session));
     }
@@ -829,11 +839,29 @@ pub async fn reorder_tracks(
     id: &str,
     from: usize,
     to: usize,
+    row_count: usize,
 ) -> Result<(), String> {
     if from == to {
         return Ok(());
     }
-    post_playlist_changes(session, id, vec![move_op(from, to)], None).await
+    let uri = playlist_uri(id)?;
+    let playlist = Playlist::get(session, &uri)
+        .await
+        .map_err(|error| format!("playlist fetch failed: {error}"))?;
+    require_complete_reorder(usize::try_from(playlist.length).ok(), row_count, from, to)?;
+    post_playlist_ops(session, id, &playlist.revision, vec![move_op(from, to)]).await
+}
+
+fn require_complete_reorder(
+    source_count: Option<usize>,
+    row_count: usize,
+    from: usize,
+    to: usize,
+) -> Result<(), String> {
+    if source_count != Some(row_count) || from >= row_count || to >= row_count {
+        return Err("Reordering is unavailable because not every playlist item is shown. Refresh the playlist and try again.".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -841,6 +869,16 @@ mod tests {
     use protobuf::Message;
 
     use super::*;
+
+    #[test]
+    fn positional_reorder_rejects_omitted_source_rows_before_building_a_move() {
+        assert!(require_complete_reorder(Some(4), 3, 1, 0).is_err());
+        assert!(require_complete_reorder(None, 3, 1, 0).is_err());
+        assert!(require_complete_reorder(Some(3), 3, 3, 0).is_err());
+        assert!(require_complete_reorder(Some(3), 3, 1, 3).is_err());
+        assert!(require_complete_reorder(Some(3), 3, 1, 0).is_ok());
+        assert!(require_complete_reorder(Some(3), 3, 0, 2).is_ok());
+    }
 
     #[test]
     fn reviewed_removal_rejects_changed_or_missing_revision() {

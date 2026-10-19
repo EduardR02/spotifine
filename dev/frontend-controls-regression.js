@@ -386,7 +386,7 @@ export async function playlistInteractionRegressions() {
   }));
   const playlist = (id, tracks = rows, excluded = []) => ({
     id, name: id, owner: session.username, owner_id: session.username,
-    snapshot_id: `snapshot-${id}`, tracks, excluded_track_ids: excluded,
+    snapshot_id: `snapshot-${id}`, tracks, rows_complete: true, excluded_track_ids: excluded,
   });
   const frames = async () => {
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -549,7 +549,7 @@ export async function playlistInteractionRegressions() {
       { ...rows[0], name: "Duplicate A2", album_name: "Duplicate album A2" },
       { ...rows[2], name: "Distinct B" },
     ];
-    api.reorderPlaylistTracks = (id, from, to) => new Promise((resolve) => localReorders.push({ id, from, to, resolve }));
+    api.reorderPlaylistTracks = (id, from, to, rowCount) => new Promise((resolve) => localReorders.push({ id, from, to, rowCount, resolve }));
     navigate("playlist", localSource);
     detail.playlist = playlist(localSource, localRows);
     component = mount(PlaylistView, { target: host });
@@ -562,6 +562,7 @@ export async function playlistInteractionRegressions() {
     release(localDrag, host.querySelector('.tl-row[data-i="1"]'));
     await settle();
     check(localReorders.length === 1 && localReorders[0].id === localSource && localReorders[0].from === 0 && localReorders[0].to === 1, "local duplicate reorder targets the captured storage occurrence");
+    check(localReorders[0].rowCount === localRows.length, "reorder carries displayed source count to the authoritative mutation guard");
     check(document.activeElement === locallyFocused && locallyFocused.textContent.trim() === localRows[0].album_name && locallyFocused.closest(".tl-row").dataset.i === "1", "known local duplicate move carries the same focused DOM and metadata to its new occurrence position");
     check(detail.playlist.tracks.map((track) => track.name).join(",") === [localRows[1], localRows[0], localRows[2]].map((track) => track.name).join(","), "optimistic duplicate reorder keeps actual row order rather than rebasing metadata onto old ordinal keys");
     localReorders[0].resolve();
@@ -573,6 +574,44 @@ export async function playlistInteractionRegressions() {
     await settle();
     check(document.activeElement !== locallyFocused, "an actual playlist refresh replacing opaque duplicate rows through a legitimate mutable field invalidates focus rather than guessing occurrence identity");
     await dropComponent();
+    for (const proof of [false, undefined]) {
+      detail.playlist = playlist(localSource, localRows);
+      component = mount(PlaylistView, { target: host });
+      await frames();
+      const incoming = playlist(localSource, localRows);
+      if (proof === undefined) delete incoming.rows_complete;
+      else incoming.rows_complete = proof;
+      window.__harness.emit("playlist", incoming);
+      await settle();
+      host.querySelector(".tl").scrollIntoView({ block: "start" });
+      await frames();
+      const blockedDrag = held(host.querySelector('.tl-row[data-i="1"]'));
+      release(blockedDrag, host.querySelector('.tl-row[data-i="0"]'));
+      await settle();
+      check(localReorders.length === 1 && detail.playlist.tracks[1] === localRows[1],
+        "incomplete or legacy unproven rows cannot dispatch a positional reorder");
+      check(host.textContent.includes("Reordering is unavailable"), "incomplete list explains the restriction calmly");
+      await dropComponent();
+    }
+
+    detail.playlist = playlist(localSource, localRows);
+    component = mount(PlaylistView, { target: host });
+    await frames();
+    host.querySelector(".tl").scrollIntoView({ block: "start" });
+    await frames();
+    release(held(host.querySelector('.tl-row[data-i="0"]')), host.querySelector('.tl-row[data-i="1"]'));
+    await settle();
+    release(held(host.querySelector('.tl-row[data-i="1"]')), host.querySelector('.tl-row[data-i="2"]'));
+    await settle();
+    check(localReorders.length === 2, "later drag waits behind the in-flight move");
+    detail.playlist = { ...playlist(localSource, localRows.slice(0, 2)), rows_complete: false };
+    await settle();
+    localReorders[1].resolve();
+    await settle();
+    check(localReorders.length === 2 && detail.playlist.tracks.length === 2,
+      "an incomplete authoritative payload cancels queued moves and cannot be overlaid with optimistic rows");
+    await dropComponent();
+    results.push("Incomplete and unproven playlist reorder refusal; queued moves canceled on incomplete refresh");
     navigate("library");
     await settle();
     results.push("Known local exact-duplicate reorder preserves focus; fresh ambiguous duplicates invalidate focus");

@@ -2565,6 +2565,12 @@ async fn held_playlist_marks(
     cached.dedup();
     Ok(cached)
 }
+/// Positional edits require a row for every source slot, not just every
+/// supported URI. A short source response is not proof either.
+fn playlist_rows_complete(source_count: i32, source_rows: usize, resolved_rows: usize) -> bool {
+    usize::try_from(source_count).ok() == Some(source_rows) && resolved_rows == source_rows
+}
+
 
 /// Playlist header and tracks via the spclient playlist4 endpoint.
 ///
@@ -2590,12 +2596,15 @@ pub async fn playlist_browse(
     // under and the key handed out must come from the same policy.
     let policy = AvailabilityPolicy::for_session(session);
     let key = playlist_rows_key(&user, &revision, &policy);
-    if key.is_some() && key.as_deref() == held_key {
+    let source_complete = playlist_rows_complete(
+        playlist.length, playlist.contents.items.len(), playlist.contents.items.len());
+    if source_complete && key.is_some() && key.as_deref() == held_key {
         let cached_ids = held_playlist_marks(session, id, &playlist, &user, &revision, &policy).await;
         crate::cache_index::save_if_dirty();
         return Ok(PlaylistRead::Unchanged(PlaylistUnchanged {
             cached_ids: cached_ids?,
             excluded_track_ids: Vec::new(),
+            rows_complete: true,
         }));
     }
     let owner_id = match &playlist.id {
@@ -2626,6 +2635,8 @@ pub async fn playlist_browse(
             (tracks, standing)
         }
     };
+    let rows_complete = playlist_rows_complete(
+        playlist.length, playlist.contents.items.len(), tracks.len());
     crate::cache_index::save_if_dirty();
     remember_playlist_metadata(&user, PlaylistRef {
         id: id_of(&playlist.id),
@@ -2649,8 +2660,9 @@ pub async fn playlist_browse(
         owner_name,
         cover_url: playlist_attributes_cover(&playlist.attributes),
         tracks,
+        rows_complete,
         excluded_track_ids: Vec::new(),
-        tracks_key: key.filter(|_| standing),
+        tracks_key: key.filter(|_| standing && rows_complete),
     }))
 }
 
@@ -7915,6 +7927,36 @@ mod tests {
             SpotifyUri::from_uri("spotify:user:spotify:playlist:not-an-id").is_err(),
             "malformed playlist ids never reach metadata verification"
         );
+    }
+
+    #[test]
+    fn playlist_reorder_completeness_counts_local_unresolved_and_duplicate_slots() {
+        let a = SpotifyUri::from_uri("spotify:track:0123456789ABCDEFGHIJKL").unwrap();
+        let b = SpotifyUri::from_uri("spotify:track:1123456789ABCDEFGHIJKL").unwrap();
+        let local = SpotifyUri::from_uri("spotify:local:artist:album:song:123").unwrap();
+        let resolved = vec![TrackRef { uri: uri_of(&a), ..TrackRef::default() },
+            TrackRef { uri: uri_of(&b), ..TrackRef::default() }];
+        let items = vec![(a.clone(), Some(1)), (local, None), (b.clone(), Some(3))];
+        let tracks = playlist_tracks_from_resolved(&items, resolved.clone());
+        assert_eq!(tracks.iter().map(|row| row.uri.as_str()).collect::<Vec<_>>(),
+            vec![uri_of(&a), uri_of(&b)]);
+        assert!(!playlist_rows_complete(3, items.len(), tracks.len()),
+            "an omitted local file shifts all later displayed indices");
+
+        let unresolved = vec![(a.clone(), None), (b.clone(), None)];
+        let tracks = playlist_tracks_from_resolved(&unresolved, resolved[..1].to_vec());
+        assert!(!playlist_rows_complete(2, unresolved.len(), tracks.len()),
+            "a supported URI omitted by metadata is equally unsafe");
+
+        let duplicates = vec![(a.clone(), Some(1)), (b, Some(2)), (a, Some(3))];
+        let tracks = playlist_tracks_from_resolved(&duplicates, resolved);
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(tracks[0].added_at, Some(1));
+        assert_eq!(tracks[2].added_at, Some(3));
+        assert!(playlist_rows_complete(3, duplicates.len(), tracks.len()));
+        assert!(!playlist_rows_complete(4, duplicates.len(), tracks.len()),
+            "a truncated source response cannot authorize positional edits");
+        assert!(!playlist_rows_complete(-1, 0, 0));
     }
 
     #[test]

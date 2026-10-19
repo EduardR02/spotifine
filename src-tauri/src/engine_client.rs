@@ -2227,11 +2227,12 @@ impl EngineClient {
         id: &str,
         from: usize,
         to: usize,
+        row_count: usize,
     ) -> Result<(), String> {
         let _ = self
             .request(
                 "edit_reorder_playlist_tracks",
-                json!({"id": id, "from": from, "to": to}),
+                json!({"id": id, "from": from, "to": to, "row_count": row_count}),
             )
             .await?;
         Ok(())

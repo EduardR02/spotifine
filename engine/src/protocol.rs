@@ -525,6 +525,9 @@ pub enum Command {
         id: String,
         from: usize,
         to: usize,
+        /// Number of displayed source rows. Required: the mutation refuses
+        /// positional edits when this differs from the authoritative length.
+        row_count: usize,
     },
     /// Clears the cached credentials and tears the session down; the engine
     /// immediately reports `needs_login` (with a fresh authorize URL).
@@ -908,6 +911,10 @@ pub struct PlaylistBrowse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
     pub tracks: Vec<TrackRef>,
+    /// Every source slot, including duplicates, has a displayed row.
+    /// Missing proof must never authorize positional edits.
+    #[serde(default)]
+    pub rows_complete: bool,
     /// Track ids skipped by automatic playback in this playlist. Direct row
     /// playback remains available for every row, including these ids.
     #[serde(default)]
@@ -943,6 +950,8 @@ pub struct PlaylistUnchanged {
     /// As in [`PlaylistBrowse::excluded_track_ids`]: local, so no revision
     /// covers it.
     pub excluded_track_ids: Vec<String>,
+    /// Completeness proof for the held rows, renewed by this read.
+    pub rows_complete: bool,
 }
 
 /// A playlist-like radio context. `tracks[0]` is always the first playable
@@ -1540,7 +1549,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AuthState, BrowseResponse, Command, PlaylistRef,
+        AuthState, BrowseResponse, Command, PlaylistRead, PlaylistRef,
         PositionEvent, RepeatMode, Request, Response, SearchBrowse, StateEvent,
         TrackRef, VolumeEvent,
         normalize_canonical_playlist_description, sanitize_playlist_description,
@@ -2019,6 +2028,18 @@ mod tests {
                 "track_count": 42
             }])
         );
+    }
+
+    #[test]
+    fn playlist_completeness_and_reorder_count_fail_closed_when_missing() {
+        let unchanged: PlaylistRead = serde_json::from_value(json!({
+            "unchanged": { "cached_ids": [], "excluded_track_ids": [] }
+        })).unwrap();
+        let PlaylistRead::Unchanged(held) = unchanged else { panic!("expected unchanged") };
+        assert!(!held.rows_complete);
+        assert!(serde_json::from_value::<Command>(json!({
+            "type": "edit_reorder_playlist_tracks", "id": "p", "from": 1, "to": 0
+        })).is_err());
     }
 
     #[test]

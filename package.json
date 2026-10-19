@@ -1,6 +1,6 @@
 {
   "name": "spotifine",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Spotifine, Spotify without the bloat (Tauri 2 + Svelte 5)",
   "type": "module",
   "scripts": {

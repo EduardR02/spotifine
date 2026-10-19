@@ -4141,7 +4141,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "renderer-engine"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "block2",
@@ -4933,7 +4933,7 @@ dependencies = [
 
 [[package]]
 name = "spotifine"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "auto-launch",
  "base64 0.22.1",

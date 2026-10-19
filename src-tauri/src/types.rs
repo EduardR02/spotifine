@@ -400,6 +400,8 @@ pub struct PlaylistDetail {
     #[serde(flatten)]
     pub playlist: Playlist,
     pub tracks: Vec<Track>,
+    /// True only when the engine accounted for every source position.
+    pub rows_complete: bool,
     /// Track ids excluded from automatic playback for this playlist.
     ///
     /// This is playlist-local state supplied by the engine rather than a
@@ -453,6 +455,7 @@ impl From<PlaylistBrowse> for PlaylistDetail {
                 last_activity: None,
             },
             tracks,
+            rows_complete: browse.rows_complete,
             excluded_track_ids,
         }
     }
@@ -1477,6 +1480,7 @@ mod tests {
             owner_name: String::new(),
             cover_url: None,
             tracks: covers.iter().map(|url| track(url).into()).collect(),
+            rows_complete: true,
             excluded_track_ids: Vec::new(),
             tracks_key: None,
         }

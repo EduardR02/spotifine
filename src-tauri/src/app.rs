@@ -606,6 +606,10 @@ pub struct PlaylistTracksEntry {
     /// Stored without their session-live fields; see [`StoredTrack`].
     #[serde(serialize_with = "store_tracks")]
     pub tracks: Vec<Track>,
+    /// Proof belongs to these exact rows, not the library's song count.
+    /// Legacy cache entries remain non-reorderable until refreshed.
+    #[serde(default)]
+    pub rows_complete: bool,
     /// Playlist-local tracks skipped by automatic playback.
     ///
     /// Older cache files do not carry this field; missing data means no
@@ -1055,6 +1059,7 @@ pub fn upsert_tracks_cache(
                 || !existing.tracks.iter().map(StoredTrack::from).eq(entry.tracks.iter().map(StoredTrack::from))
                 || existing.excluded_track_ids != entry.excluded_track_ids
                 || existing.tracks_key != entry.tracks_key
+                || existing.rows_complete != entry.rows_complete
         });
     entries.retain(|existing| existing.id != entry.id);
     entries.insert(0, entry);
@@ -1205,6 +1210,7 @@ pub fn playlist_detail_from_cache(state: &AppState, entry: PlaylistTracksEntry) 
     PlaylistDetail {
         playlist,
         tracks: entry.tracks,
+        rows_complete: entry.rows_complete,
         excluded_track_ids: entry.excluded_track_ids,
     }
 }
@@ -1551,7 +1557,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("renderer-history-import-{}", std::process::id()));
         legacy_history(&root, "account-a", 456);
         save_tracks_cache(&root, &[PlaylistTracksEntry { id: "shared".into(), fetched_at: None,
-            revision: "old".into(), tracks: vec![track("private")], excluded_track_ids: Vec::new(), tracks_key: None }]);
+            revision: "old".into(), tracks: vec![track("private")], rows_complete: false, excluded_track_ids: Vec::new(), tracks_key: None }]);
         save_membership(&root, &[membership(LIKED_MEMBERSHIP_ID, "", &["spotify:track:private"])]);
         let mut state = AppState::new(root.clone());
         assert!(state.playlists.is_empty());
@@ -1643,7 +1649,7 @@ mod tests {
             playlists: first.playlists.clone(), playlist_tree: first.playlist_tree.clone() };
         save_playlist_list(&a_dir, &cache);
         save_tracks_cache(&a_dir, &[PlaylistTracksEntry { id: "shared".into(), fetched_at: Some(100),
-            revision: "r".into(), tracks: vec![track("a")], excluded_track_ids: Vec::new(), tracks_key: None }]);
+            revision: "r".into(), tracks: vec![track("a")], rows_complete: false, excluded_track_ids: Vec::new(), tracks_key: None }]);
         save_membership(&a_dir, &[membership(LIKED_MEMBERSHIP_ID, "", &["spotify:track:a"])]);
 
         let mut restarted = AppState::new(root.clone());
@@ -1779,7 +1785,7 @@ mod tests {
         save_playlist_list(&dir, &PlaylistListCache { version: 1, fetched_at: Some(10), me_id: account.into(),
             playlists: vec![playlist(playlist_id)], playlist_tree: vec![LibraryNodeDetail::Playlist { id: playlist_id.into() }] });
         save_tracks_cache(&dir, &[PlaylistTracksEntry { id: playlist_id.into(), fetched_at: Some(10),
-            revision: "r".into(), tracks: vec![track(playlist_id)], excluded_track_ids: Vec::new(), tracks_key: None }]);
+            revision: "r".into(), tracks: vec![track(playlist_id)], rows_complete: false, excluded_track_ids: Vec::new(), tracks_key: None }]);
         save_membership(&dir, &[membership(LIKED_MEMBERSHIP_ID, "", &["spotify:track:liked"])]);
     }
 
@@ -2418,6 +2424,7 @@ mod tests {
                     fetched_at: Some(id as i64),
                     revision: String::new(),
                     tracks: vec![track("t")],
+                    rows_complete: false,
                     excluded_track_ids: Vec::new(), tracks_key: None,
                 },
             );
@@ -2434,6 +2441,7 @@ mod tests {
             fetched_at: Some(1),
             revision: "old".into(),
             tracks: vec![track("a")],
+            rows_complete: false,
             excluded_track_ids: Vec::new(), tracks_key: None,
         }];
         upsert_tracks_cache(
@@ -2443,6 +2451,7 @@ mod tests {
                 fetched_at: Some(2),
                 revision: "new".into(),
                 tracks: vec![track("b")],
+                rows_complete: false,
                 excluded_track_ids: vec!["b".into()], tracks_key: None,
             },
         );
@@ -2459,6 +2468,7 @@ mod tests {
             fetched_at: Some(1),
             revision: revision.into(),
             tracks: vec![track(track_id)],
+            rows_complete: false,
             excluded_track_ids: Vec::new(), tracks_key: None,
         };
 
@@ -2490,6 +2500,29 @@ mod tests {
     }
 
     #[test]
+    fn playlist_cache_completeness_is_explicit_and_replaced_with_the_rows() {
+        let state = AppState::new(PathBuf::from("unused"));
+        let legacy = serde_json::json!({
+            "id": "p1", "fetched_at": 1, "revision": "rev",
+            "tracks": [track("a"), track("a")], "tracks_key": "old-key"
+        });
+        let entry: PlaylistTracksEntry = serde_json::from_value(legacy).unwrap();
+        assert!(!entry.rows_complete, "neither row count nor an old key proves completeness");
+        assert!(!playlist_detail_from_cache(&state, entry.clone()).rows_complete);
+        let mut cache = vec![entry.clone()];
+        let mut complete = entry.clone();
+        complete.rows_complete = true;
+        assert!(upsert_tracks_cache(&mut cache, complete));
+        let stored = tracks_cache_bytes(&cache).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(json["playlists"][0]["rows_complete"], true);
+        assert!(playlist_detail_from_cache(&state, cache[0].clone()).rows_complete);
+        assert!(upsert_tracks_cache(&mut cache, entry));
+        assert!(!playlist_detail_from_cache(&state, cache[0].clone()).rows_complete,
+            "a later incomplete payload must revoke earlier proof even for matching rows");
+    }
+
+    #[test]
     fn detail_from_cache_falls_back_to_blank_metadata() {
         let state = AppState::new(PathBuf::from("unused"));
         let entry = PlaylistTracksEntry {
@@ -2497,6 +2530,7 @@ mod tests {
             fetched_at: Some(1),
             revision: "rev".into(),
             tracks: vec![track("t")],
+            rows_complete: false,
             excluded_track_ids: vec!["t".into()], tracks_key: None,
         };
         let detail = playlist_detail_from_cache(&state, entry);
@@ -2520,6 +2554,7 @@ mod tests {
                 track_with_cover("b", "cover-a"),
                 track_with_cover("c", "cover-b"),
             ],
+            rows_complete: false,
             excluded_track_ids: Vec::new(), tracks_key: None,
         };
         let detail = playlist_detail_from_cache(&state, entry);
@@ -2868,6 +2903,7 @@ mod tests {
             fetched_at: Some(42),
             revision: "rev".into(),
             tracks: vec![Track { cached, context: "playlist:p1".into(), ..track("t") }],
+            rows_complete: false,
             excluded_track_ids: Vec::new(), tracks_key: None,
         };
         let mut entries = vec![entry(true)];
@@ -2891,6 +2927,7 @@ mod tests {
             fetched_at: Some(42),
             revision: "rev".into(),
             tracks: vec![track("t")],
+            rows_complete: false,
             excluded_track_ids: vec!["t".into()], tracks_key: None,
         }];
         save_tracks_cache(&dir, &entries);

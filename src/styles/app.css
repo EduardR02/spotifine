@@ -642,10 +642,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   padding: 0 var(--s3) var(--s2);
   border-radius: var(--r-panel);
 }
-/* The rail's top inset, as a strip the window is moved by (Sidebar). On
-   macOS the traffic lights are drawn over the window's top-left corner, so
-   the strip is as tall as the title bar they sit in and the first row
-   starts below them. */
+/* The rail's top inset doubles as a window drag region. On macOS,
+   tauri.macos.conf.json positions the native traffic lights at a 20px inset,
+   inside this 30px strip below the app's 8px outer gutter and above Home.
+   Keep that native position aligned with this reserved space. */
 .sidebar-top { flex: none; height: var(--s3); margin: 0 calc(var(--s3) * -1); }
 :root[data-os="mac"] .sidebar-top { height: 30px; }
 .nav { display: flex; flex-direction: column; gap: 1px; }

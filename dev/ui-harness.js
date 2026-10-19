@@ -173,6 +173,7 @@ fixtures.playlistDetail = {
   owner_id: "eduard",
   snapshot_id: "snap-1",
   tracks: makeTracks(12),
+  rows_complete: true,
   excluded_track_ids: [],
 };
 fixtures.sharedTrack = {
@@ -537,6 +538,7 @@ function detailFor(id) {
     owner_id: "eduard",
     snapshot_id: `snap-${id}`,
     tracks,
+    rows_complete: true,
     excluded_track_ids: exclusionsFor(id) ?? [],
   };
 }
@@ -1201,6 +1203,9 @@ const mock = {
         const tracks = playlistTracks.get(id) || [];
         const from = Number(args.from ?? args.fromIndex);
         const to = Number(args.to ?? args.toIndex);
+        if (Number(args.rowCount ?? args.row_count) !== tracks.length) {
+          throw new Error("Reordering is unavailable because not every playlist item is shown.");
+        }
         if (Number.isInteger(from) && Number.isInteger(to) && tracks[from] && to >= 0 && to < tracks.length) {
           const [track] = tracks.splice(from, 1);
           tracks.splice(to, 0, track);

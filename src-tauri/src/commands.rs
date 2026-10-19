@@ -951,9 +951,10 @@ pub async fn reorder_playlist_tracks(
     id: String,
     from: usize,
     to: usize,
+    row_count: usize,
 ) -> Result<(), String> {
     let account_generation = library_account_generation(&app);
-    client.reorder_playlist_tracks(&id, from, to).await?;
+    client.reorder_playlist_tracks(&id, from, to, row_count).await?;
     record_playlist_edit(&app, &id, account_generation)?;
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
@@ -2491,6 +2492,7 @@ fn adopt_playlist_detail(
         fetched_at: Some(fetched_at),
         revision: detail.playlist.snapshot_id.clone(),
         tracks: detail.tracks.clone(),
+        rows_complete: detail.rows_complete,
         excluded_track_ids: detail.excluded_track_ids.clone(),
         tracks_key,
     });
@@ -2642,8 +2644,12 @@ fn adopt_unchanged_playlist(
         }
         let update = adopt_held_playlist(&mut guard, id, generation, playlist_generation,
             tracks_key, &cached_ids, read.excluded_track_ids)?;
-        let bytes = update.exclusions_changed.then(|| tracks_cache_bytes(&guard.tracks_cache)).flatten();
-        let detail = update.exclusions_changed.then(|| {
+        let entry = guard.tracks_cache.iter_mut().find(|entry| entry.id == id)
+            .expect("the adopted entry is held");
+        let detail_changed = update.exclusions_changed || entry.rows_complete != read.rows_complete;
+        entry.rows_complete = read.rows_complete;
+        let bytes = detail_changed.then(|| tracks_cache_bytes(&guard.tracks_cache)).flatten();
+        let detail = detail_changed.then(|| {
             let entry = guard.tracks_cache.iter().find(|entry| entry.id == id).cloned()
                 .expect("the adopted entry is held");
             playlist_detail_from_cache(&guard, entry)
@@ -3026,7 +3032,7 @@ mod tests {
         let mut state = AppState::new(std::path::PathBuf::new());
         state.playback.queue = vec![Track { id: "a".into(), cached: true, ..Default::default() }].into();
         state.tracks_cache.push(PlaylistTracksEntry { id: "p".into(), fetched_at: None, revision: String::new(),
-            tracks: vec![Track { id: "b".into(), cached: true, ..Default::default() }], excluded_track_ids: Vec::new(), tracks_key: None });
+            tracks: vec![Track { id: "b".into(), cached: true, ..Default::default() }], rows_complete: false, excluded_track_ids: Vec::new(), tracks_key: None });
         apply_uncached_ids(&mut state, &["b".into()]);
         assert!(!state.tracks_cache[0].tracks[0].cached);
         assert!(state.playback.queue[0].cached);

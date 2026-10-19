@@ -585,9 +585,9 @@ async fn run(
                                     edits::remove_tracks(&session, &id, &uris, expected_snapshot_id.as_deref()).await
                                 });
                             }
-                            Command::EditReorderPlaylistTracks { id, from, to } => {
+                            Command::EditReorderPlaylistTracks { id, from, to, row_count } => {
                                 spawn_edit(&engine, request_id, "edit_reorder_playlist_tracks", move |session| async move {
-                                    edits::reorder_tracks(&session, &id, from, to).await
+                                    edits::reorder_tracks(&session, &id, from, to, row_count).await
                                 });
                             }
                             command => {

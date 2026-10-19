@@ -3002,8 +3002,8 @@ export const api = {
   addPlaylistTracks: (id, uris) => sessionInvoke("add_playlist_tracks", { id, uris }),
   removePlaylistTracks: (id, uris, expectedSnapshotId = null) =>
     sessionInvoke("remove_playlist_tracks", { id, uris, expectedSnapshotId }),
-  reorderPlaylistTracks: (id, from, to) =>
-    sessionInvoke("reorder_playlist_tracks", { id, from, to }),
+  reorderPlaylistTracks: (id, from, to, rowCount) =>
+    sessionInvoke("reorder_playlist_tracks", { id, from, to, rowCount }),
   login: () => invoke("login"),
   logout: () => invoke("logout"),
   getState: () => cacheMarkedRead("get_state"),
@@ -3203,7 +3203,8 @@ function handlePlaylistRefresh(e) {
   }
   // `PlaylistDetail` is flattened by serde: metadata and `tracks` are
   // siblings, so the metadata comes across whole and the rows are merged.
-  detail.playlist = { ...open, ...fresh, tracks: refreshedRows(open.tracks ?? [], fresh.tracks ?? []) };
+  detail.playlist = { ...open, ...fresh, rows_complete: fresh.rows_complete === true,
+    tracks: refreshedRows(open.tracks ?? [], fresh.tracks ?? []) };
 }
 
 /** The fields a refresh can legitimately move on a row it keeps. */

@@ -907,6 +907,17 @@ impl Read for AudioFileStreaming {
                     Error::deadline_exceeded(AudioFileError::WaitTimeout),
                 ));
             }
+
+            // A failed streamer removes its unfinished range from requested
+            // and wakes us. In random-access mode nothing else schedules that
+            // data, so waiting again without requesting it would only time out.
+            if !download_status.downloaded.contains(offset)
+                && !download_status.requested.contains(offset)
+            {
+                self.stream_loader_command_tx
+                    .send(StreamLoaderCommand::Fetch(Range::new(offset, length_to_request)))
+                    .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err))?;
+            }
         }
         let available_length = download_status
             .downloaded
@@ -985,6 +996,103 @@ impl Seek for AudioFile {
             AudioFile::Cached(ref mut file) => file.seek(pos),
             AudioFile::Streaming(ref mut file) => file.seek(pos),
         }
+    }
+}
+
+#[cfg(test)]
+mod streaming_read_tests {
+    use std::io::Write;
+
+    use super::*;
+
+    const AUDIO: &[u8] = b"header and audio samples";
+
+    fn pending_read(
+        offset: usize,
+        streaming: bool,
+    ) -> (NamedTempFile, AudioFileStreaming, mpsc::UnboundedReceiver<StreamLoaderCommand>) {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(AUDIO).unwrap();
+        let shared = Arc::new(AudioFileShared {
+            cdn_url: String::new(),
+            file_size: AUDIO.len(),
+            bytes_per_second: 1,
+            cond: Condvar::new(),
+            download_status: Mutex::new(AudioFileDownloadStatus {
+                requested: RangeSet::new(),
+                downloaded: RangeSet::new(),
+            }),
+            download_streaming: AtomicBool::new(streaming),
+            download_slots: Semaphore::new(1),
+            ping_time_ms: AtomicUsize::new(0),
+            read_position: AtomicUsize::new(offset),
+            throughput: AtomicUsize::new(0),
+        });
+        let (stream_loader_command_tx, receiver) = mpsc::unbounded_channel();
+        let reader = AudioFileStreaming {
+            read_file: file.reopen().unwrap(),
+            position: offset as u64,
+            stream_loader_command_tx,
+            shared,
+        };
+        (file, reader, receiver)
+    }
+
+    #[tokio::test]
+    async fn failed_pending_range_is_requested_again_before_read_timeout() {
+        // Decoder startup uses random access; steady playback uses streaming.
+        // Both must recover when the range covering this read fails.
+        for (offset, streaming) in [(0, false), (7, false), (7, true)] {
+            let (_file, mut reader, mut commands) = pending_read(offset, streaming);
+            let shared = reader.shared.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                let mut output = [0; 4];
+                let length = reader.read(&mut output)?;
+                Ok::<_, io::Error>((length, output, reader.position))
+            });
+            let Some(StreamLoaderCommand::Fetch(range)) = commands.recv().await else {
+                panic!("read did not request missing audio");
+            };
+            {
+                // receive_data releases the failed remainder under this same
+                // mutex. Acquiring it after Fetch also ensures read is waiting.
+                let mut status = shared.download_status.lock().expect(DOWNLOAD_STATUS_POISON_MSG);
+                status.requested.add_range(&range);
+                status.requested.subtract_range(&range);
+                shared.cond.notify_all();
+            }
+            let retry = tokio::time::timeout(Duration::from_secs(1), commands.recv()).await;
+            {
+                // Complete even on regression so the reader never remains
+                // blocked merely to wait out the production download timeout.
+                let mut status = shared.download_status.lock().expect(DOWNLOAD_STATUS_POISON_MSG);
+                status.downloaded.add_range(&Range::new(offset, 4));
+                shared.cond.notify_all();
+            }
+            let (length, output, position) = read.await.unwrap().unwrap();
+            let Ok(Some(StreamLoaderCommand::Fetch(retry))) = retry else {
+                panic!("failed range was not re-requested before the timeout");
+            };
+            assert_eq!(retry.start, offset);
+            assert_eq!(retry.length, range.length);
+            assert_eq!(length, 4);
+            assert_eq!(&output, &AUDIO[offset..offset + 4]);
+            assert_eq!(position, (offset + 4) as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_range_reports_closed_downloader_instead_of_waiting_again() {
+        let (_file, mut reader, mut commands) = pending_read(0, false);
+        let shared = reader.shared.clone();
+        let read = tokio::task::spawn_blocking(move || reader.read(&mut [0; 4]));
+        assert!(matches!(commands.recv().await, Some(StreamLoaderCommand::Fetch(_))));
+        drop(commands);
+        {
+            let _status = shared.download_status.lock().expect(DOWNLOAD_STATUS_POISON_MSG);
+            shared.cond.notify_all();
+        }
+        assert_eq!(read.await.unwrap().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
     }
 }
 
