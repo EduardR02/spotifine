@@ -1041,3 +1041,111 @@ export async function seekSliderRegressions() {
     await settle();
   }
 }
+
+/** Exercise History through App's real route, scroll container and API wrapper:
+    empty/error body removal, explicit retry, and replies to an unmounted view. */
+export async function historyLoadRegressions() {
+  if (!document.body.dataset.harnessReady || new URLSearchParams(location.search).has("real")) {
+    throw new Error("These regressions require the synthetic UI harness.");
+  }
+  const savedRoute = { ...route };
+  const savedInvoke = window.__TAURI_INTERNALS__.invoke;
+  const requests = [];
+  const empty = () => ({ entries: [], total: 0, recorded: 0, offset: 0, next_offset: null });
+  const played = (id) => ({
+    entries: [{
+      track_id: id, started_at: 1_700_000_000_000, ms_played: 6_000,
+      completed: false, context: "history",
+      track: {
+        id, uri: `spotify:track:${id}`, name: id,
+        artist_names: ["History regression"], duration_ms: 180_000,
+      },
+    }],
+    total: 1, recorded: 1, offset: 0, next_offset: null,
+  });
+  const frames = async () => {
+    await settle();
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await settle();
+  };
+  const page = () => document.querySelector(".history-page");
+  async function leave() {
+    navigate("library");
+    await frames();
+    check(route.name === "library" && !page(), "History does not block navigation back to Library");
+  }
+  async function open() {
+    const before = requests.length;
+    navigate("history");
+    await frames();
+    check(!!page() && requests.length === before + 1, "mounting History starts exactly one first-page request");
+    const request = requests.at(-1);
+    check(request.args.offset === 0 && request.args.limit === 100 && request.args.query === "", "first page uses the bounded unfiltered API");
+    return request;
+  }
+  async function checkEmpty(count) {
+    await frames();
+    check(page()?.querySelector(".history-empty .h")?.textContent === "Nothing played yet", "an empty archive replaces the loading body");
+    check(!page().querySelector(".history-list") && !page().querySelector(".sk-row"), "empty History removes its virtual body and skeletons");
+    check(page().querySelector('[aria-label="Clear listening history"]').disabled, "empty History cannot clear a nonexistent archive");
+    page().closest(".scroll").dispatchEvent(new Event("scroll"));
+    window.dispatchEvent(new Event("resize"));
+    await frames();
+    check(requests.length === count, "empty History settles without observer or effect-driven refetches");
+  }
+  try {
+    await leave();
+    window.__TAURI_INTERNALS__.invoke = (command, args) => {
+      if (command !== "get_history") return savedInvoke(command, args);
+      return new Promise((resolve, reject) => requests.push({ args, resolve, reject }));
+    };
+
+    const fresh = await open();
+    fresh.resolve(empty());
+    await checkEmpty(1);
+    await leave();
+
+    const failed = await open();
+    failed.reject("listening history is read-only: could not read listening_history.jsonl");
+    await frames();
+    check(page()?.querySelector(".history-empty.failed .h")?.textContent === "History unavailable", "read failure renders a local History error");
+    check(page().querySelector(".why").textContent.includes("could not read"), "read failure preserves its useful reason");
+    check(!page().querySelector(".history-list") && requests.length === 2, "failed load removes its virtual body without retrying itself");
+    page().querySelector(".history-empty .actions button").click();
+    await frames();
+    check(requests.length === 3 && !!page().querySelector(".sk-row"), "Try again starts one request and restores the loading body");
+    requests[2].resolve(empty());
+    await checkEmpty(3);
+    await leave();
+
+    const stale = await open();
+    await leave();
+    const current = await open();
+    stale.resolve(played("Stale history play"));
+    await frames();
+    check(!!page().querySelector(".sk-row") && !page().textContent.includes("Stale history play"), "a previous mount's reply cannot finish the new mount's loading state");
+    current.resolve(played("First history play"));
+    await frames();
+    check(!!page().querySelector('[title="Play First history play"]'), "reopening after an empty archive renders its first play");
+    check(requests.length === 5 && !page().querySelector(".sk-row"), "the first real row settles without redundant paging");
+    await leave();
+
+    const abandoned = await open();
+    await leave();
+    abandoned.reject("engine did not answer get_history within 10s");
+    await frames();
+    check(route.name === "library" && !page() && requests.length === 6, "a late request failure cannot remount History or trap the active route");
+    return [
+      "History empty mount and explicit read-failure retry settle without refetch loops",
+      "Navigation during loading rejects stale success/failure and a later first play renders",
+    ];
+  } finally {
+    navigate("library");
+    await settle();
+    for (const request of requests) request.resolve(empty());
+    await settle();
+    window.__TAURI_INTERNALS__.invoke = savedInvoke;
+    navigate(savedRoute.name, savedRoute.id, savedRoute.param);
+    await settle();
+  }
+}

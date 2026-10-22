@@ -89,9 +89,9 @@ fn spawn_round_trip<T, Fut>(
 
 /// Audio fetch tuning at engine startup (before any playback).
 ///
-/// `read_ahead_during_playback` shrinks the streaming buffer from the
-/// 5-second default so play/pause/seek feel immediate, at the cost of
-/// jitter headroom. It is the operative knob for audible stalls: once a
+/// `read_ahead_during_playback` bounds compressed-data fetch-ahead, not the
+/// native device's output latency. Missing bytes can block the decoder and
+/// delay queued controls. It is the operative knob for audible stalls: once a
 /// CDN range fetch fails (observed: hyper `IncompleteMessage` / DataLoss
 /// mid-body connection drops, librespot-audio receive_data), the player's
 /// blocked read is woken and the range re-requested, but the playout

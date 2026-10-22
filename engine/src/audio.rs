@@ -353,13 +353,11 @@ impl From<cpal::SupportedStreamConfigsError> for OutputError {
 /// otherwise spin forever and wedge the player thread mid-track-change.
 const WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Decoded-audio write-ahead budget, in milliseconds. This is the engine's
-/// *output* latency: every seek, volume change, and track switch waits for this
-/// much already-decoded audio to play out first, and the reported position
-/// leads the sound by the same amount. librespot's stock budget is ~0.5 s,
-/// which made pause/seek/volume/next feel half a second behind. Network stalls
-/// are covered separately by the audio-fetch read-ahead window (3 s), not by
-/// this ring, so keeping it small does not weaken stall protection.
+/// Decoded-audio write-ahead budget, in milliseconds. This covers producer
+/// scheduling jitter, not a mandatory control delay: pause gates consumption,
+/// volume is applied in the callback, and seeks/loads invalidate queued audio.
+/// The audible clock accounts for queued samples. Network jitter is covered
+/// separately by the compressed audio-fetch read-ahead window (3 s).
 const WRITE_AHEAD_MS: usize = 150;
 
 /// [`WRITE_AHEAD_MS`] as interleaved samples at `rate`. The ring holds
@@ -1020,9 +1018,9 @@ impl OutputControl {
     }
 
     /// Reopening the device costs an audible gap, so a playing discontinuity
-    /// keeps the stream: what the device still holds is one period (~10 ms) of
-    /// the old position. During a user pause that period would play on resume,
-    /// however long after, so the next start opens a fresh stream instead.
+    /// keeps the stream. The device can still hold old-position audio; its
+    /// buffer size is platform/driver-defined. A discontinuity during a user
+    /// pause instead opens a fresh stream next start, avoiding that stale tail.
     fn discard_if_paused(&self, user_paused: bool) {
         let mut stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
         if user_paused && !self.status.running.load(Ordering::Acquire) {

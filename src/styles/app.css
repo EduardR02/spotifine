@@ -694,15 +694,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 .lib { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; margin-top: var(--s3); }
 .lib-head {
-  display: flex; align-items: center; justify-content: space-between;
-  height: 28px; padding: 0 var(--s2); margin-bottom: var(--s1);
+  display: flex; flex: none; flex-wrap: wrap; align-items: center;
+  gap: 0 var(--s1); min-height: 28px; padding: 0 var(--s2); margin-bottom: var(--s1);
 }
 .lib-head .label {
   font-family: var(--font-small);
   font-size: var(--t-caps); font-weight: var(--w-semi); letter-spacing: var(--track-caps);
   text-transform: uppercase; color: var(--label);
 }
-.lib-head-actions { display: flex; align-items: center; margin-right: calc(var(--s1) * -1); }
+.lib-head-actions { display: flex; flex: none; align-items: center; margin-left: auto; margin-right: calc(var(--s1) * -1); }
 .lib-filter-empty {
   padding: var(--s5) var(--s3); color: var(--fg-2); text-align: center;
   font-family: var(--font-small); font-size: var(--t-11);
@@ -777,15 +777,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    The other is the same type dimmed — no pill, no underline, no segmented
    track: two words at 11px are already a small enough object that a container
    around them would be the loudest thing in the rail. */
-.lib-modes { display: flex; align-items: center; gap: 6px; min-width: 0; }
-/* Sentence case, not the tracked caps every other section label wears, and
-   that is a measurement rather than a preference: tracked caps words plus
-   the head's two buttons overrun the rail. Three collections (Podcasts, with
-   the personal app) fit the 240px rail with 3px to spare; the 212px one lets
-   go of New playlist for them (Sidebar). The slot is
-   already sentence case half the time anyway — opening the filter replaces
-   this label with a "Filter library" placeholder at the same weight — so the
-   head keeps one voice either way. */
+/* Reserve the tabs' intrinsic width: shrinking this group lets its text paint
+   under Search with wider system fonts. Compact separators keep the usual
+   header on one line; the head can wrap the actions if the font needs more. */
+.lib-modes { display: flex; flex: none; align-items: center; gap: var(--s1); min-height: 24px; }
+/* Sentence case matches the filter placeholder and keeps three collections
+   readable in the rail without relying on Windows font metrics. */
 .lib-mode {
   font-family: var(--font-small);
   font-size: var(--t-11); font-weight: var(--w-semi);
@@ -802,7 +799,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* One dot between them, so the pair reads as one control rather than as a
    heading with a stray word after it. Drawn on the separator itself, which
    costs no element: `gap` already spaces the words. */
-.lib-mode + .lib-mode { position: relative; padding-left: var(--s2); }
+.lib-mode + .lib-mode { position: relative; padding-left: var(--s1); }
 .lib-mode + .lib-mode::before {
   content: ""; position: absolute; left: 0; top: 50%;
   width: 2px; height: 2px; margin-top: -1px; border-radius: var(--rf);

@@ -1362,19 +1362,19 @@ impl Future for PlayerInternal {
         loop {
             let mut all_futures_completed_or_not_ready = true;
 
-            // process commands that were sent to us
-            let cmd = match self.commands.poll_recv(cx) {
-                Poll::Ready(None) => return Poll::Ready(()), // client has disconnected - shut down.
-                Poll::Ready(Some(cmd)) => {
-                    all_futures_completed_or_not_ready = false;
-                    Some(cmd)
-                }
-                _ => None,
-            };
-
-            if let Some(cmd) = cmd {
-                if let Err(e) = self.handle_command(cmd) {
-                    error!("Error handling command: {e}");
+            // Drain ready controls before another potentially blocking decoder
+            // read or sink write. In particular, a queued Play followed by Pause
+            // must not resume output and then wait on a CDN read before pausing.
+            loop {
+                match self.commands.poll_recv(cx) {
+                    Poll::Ready(None) => return Poll::Ready(()),
+                    Poll::Ready(Some(cmd)) => {
+                        all_futures_completed_or_not_ready = false;
+                        if let Err(e) = self.handle_command(cmd) {
+                            error!("Error handling command: {e}");
+                        }
+                    }
+                    Poll::Pending => break,
                 }
             }
 
@@ -2747,5 +2747,164 @@ where
 
     fn byte_len(&self) -> Option<u64> {
         Some(self.length)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_backend::SinkResult;
+    use crate::decoder::{DecoderError, DecoderResult};
+    use crate::mixer::NoOpVolume;
+
+    struct ControlledDecoder {
+        reads: Arc<AtomicUsize>,
+        commands: mpsc::UnboundedSender<PlayerCommand>,
+    }
+
+    impl AudioDecoder for ControlledDecoder {
+        fn seek(&mut self, _: u32) -> Result<u32, DecoderError> {
+            panic!("ordinary resume must not seek the retained decoder");
+        }
+
+        fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+            let packet = self.reads.fetch_add(1, Ordering::SeqCst);
+            // Stop after one packet so polling is deterministic and needs no
+            // hardware, download or timing-dependent background thread.
+            self.commands.send(PlayerCommand::Pause).unwrap();
+            Ok(Some((AudioPacketPosition {
+                position_ms: 1_000 + packet as u32 * 10,
+                source_frame: 44_100 + packet as u64 * 441,
+                revision: 0,
+                skipped: false,
+            }, AudioPacket::Samples(vec![0.25; 882]))))
+        }
+    }
+
+    #[derive(Default)]
+    struct OutputProbe {
+        running: bool,
+        starts: usize,
+        stops: usize,
+        frames: Vec<u64>,
+    }
+
+    struct ProbeSink(Arc<Mutex<OutputProbe>>);
+
+    impl Sink for ProbeSink {
+        fn start(&mut self) -> SinkResult<()> {
+            let mut output = self.0.lock().unwrap();
+            output.running = true;
+            output.starts += 1;
+            Ok(())
+        }
+
+        fn stop(&mut self) -> SinkResult<()> {
+            let mut output = self.0.lock().unwrap();
+            output.running = false;
+            output.stops += 1;
+            Ok(())
+        }
+
+        fn write(&mut self, position: AudioPacketPosition, _: AudioPacket, _: &mut Converter) -> SinkResult<()> {
+            let mut output = self.0.lock().unwrap();
+            assert!(output.running);
+            output.frames.push(position.source_frame);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn queued_pause_stops_output_before_another_read_and_resume_retains_the_decoder() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime = runtime.enter();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(Mutex::new(OutputProbe::default()));
+        let track_id = SpotifyUri::from_uri("spotify:track:0000000000000000000001").unwrap();
+        let config = PlayerConfig::default();
+        let mut player = PlayerInternal {
+            session: Session::new(Default::default(), None),
+            converter: Converter::new(config.ditherer),
+            config,
+            commands: receiver,
+            load_handles: Arc::new(Mutex::new(HashMap::new())),
+            state: PlayerState::Paused {
+                track_id: track_id.clone(),
+                play_request_id: 1,
+                decoder: Box::new(ControlledDecoder { reads: Arc::clone(&reads), commands: commands.clone() }),
+                audio_item: AudioItem {
+                    duration_ms: 60_000,
+                    uri: track_id.to_uri().unwrap(),
+                    track_id,
+                    files: Default::default(),
+                    name: "Control test".to_owned(),
+                    covers: vec![],
+                    language: vec![],
+                    is_explicit: false,
+                    availability: Ok(()),
+                    alternatives: None,
+                    unique_fields: UniqueFields::Local {
+                        artists: None,
+                        album: None,
+                        album_artists: None,
+                        number: None,
+                        disc_number: None,
+                        path: Default::default(),
+                    },
+                },
+                normalisation_data: NormalisationData::default(),
+                normalisation_factor: 1.0,
+                stream_loader_controller: StreamLoaderController::from_local_file(1),
+                bytes_per_second: 1,
+                duration_ms: 60_000,
+                stream_position_ms: 1_000,
+                suggested_to_preload_next_track: false,
+                is_explicit: false,
+            },
+            preload: PlayerPreload::None,
+            sink: Box::new(ProbeSink(Arc::clone(&output))),
+            sink_status: SinkStatus::Closed,
+            decoder_revision: 1,
+            decoder_is_current: None,
+            sink_event_callback: None,
+            volume_getter: Box::new(NoOpVolume),
+            event_senders: vec![],
+            normalisation_integrators: [0.0; 2],
+            normalisation_peaks: [0.0; 2],
+            normalisation_channel: 0,
+            normalisation_knee_factor: 1.0,
+            auto_normalise_as_album: false,
+            player_id: 0,
+            cache_epoch: 0,
+            last_progress_update: Instant::now(),
+            local_file_lookup: Arc::new(create_local_file_lookup(&[])),
+        };
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+
+        for _ in 0..3 {
+            commands.send(PlayerCommand::Play(None)).unwrap();
+            commands.send(PlayerCommand::Pause).unwrap();
+        }
+        assert!(Pin::new(&mut player).poll(&mut context).is_pending());
+        assert_eq!(reads.load(Ordering::SeqCst), 0,
+            "queued pause must stop output without entering a read that could block on the CDN");
+        {
+            let output = output.lock().unwrap();
+            assert!(!output.running);
+            assert_eq!((output.starts, output.stops), (3, 3));
+            assert!(output.frames.is_empty(), "no extra PCM may slip between queued controls");
+        }
+        assert!(matches!(player.state, PlayerState::Paused { stream_position_ms: 1_000, .. }));
+
+        for _ in 0..2 {
+            commands.send(PlayerCommand::Play(None)).unwrap();
+            assert!(Pin::new(&mut player).poll(&mut context).is_pending());
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        let output = output.lock().unwrap();
+        assert!(!output.running);
+        assert_eq!(output.frames, [44_100, 44_541],
+            "later resume continues the same decoder without losing or replaying a packet");
     }
 }
