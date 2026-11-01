@@ -1133,3 +1133,45 @@ test("a first preview refusal lets its already-running catalogue read drain exac
     expect(pending.filter((request) => request.command === "add_queue_batch")).toHaveLength(1);
   });
 });
+
+test("a saved listening preference remains visible when live application is uncertain", async () => {
+  const initial = state.appSettings.spotify_listening_enabled;
+  try {
+    await withDeferredCommands(async (pending) => {
+      state.appSettings.spotify_listening_enabled = false;
+      const change = state.api.setSpotifyListeningEnabled(true).catch((error) => error);
+      pending[0].resolve({
+        settings: { spotify_listening_enabled: true },
+        apply_error: "Live application could not be confirmed",
+      });
+      expect(await change).toBeInstanceOf(Error);
+      expect(state.appSettings.spotify_listening_enabled).toBe(true);
+    });
+  } finally {
+    state.appSettings.spotify_listening_enabled = initial;
+  }
+});
+
+test("a late failed listening update cannot hide a newer saved opt-in", async () => {
+  const initial = state.appSettings.spotify_listening_enabled;
+  try {
+    await withDeferredCommands(async (pending) => {
+      state.appSettings.spotify_listening_enabled = false;
+      const obsolete = state.api.setSpotifyListeningEnabled(false).catch((error) => error);
+      const current = state.api.setSpotifyListeningEnabled(true);
+      pending[1].resolve({
+        settings: { spotify_listening_enabled: true },
+        apply_error: null,
+      });
+      await current;
+      pending[0].resolve({
+        settings: { spotify_listening_enabled: false },
+        apply_error: "The old live update could not be confirmed",
+      });
+      expect(await obsolete).toBeInstanceOf(Error);
+      expect(state.appSettings.spotify_listening_enabled).toBe(true);
+    });
+  } finally {
+    state.appSettings.spotify_listening_enabled = initial;
+  }
+});

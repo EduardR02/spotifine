@@ -1291,6 +1291,8 @@ impl EngineClient {
             .arg(audio_cache_limit_mb.to_string())
             .arg("--normalisation")
             .arg(settings.normalisation.to_string())
+            .arg("--spotify-listening-enabled")
+            .arg(settings.spotify_listening_enabled.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(
@@ -1790,6 +1792,12 @@ impl EngineClient {
             .map(|_| ())
     }
 
+    pub async fn set_spotify_listening_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.request("set_spotify_listening_enabled", json!({ "enabled": enabled }))
+            .await
+            .map(|_| ())
+    }
+
     pub async fn logout(&self) -> Result<(), String> {
         self.request("logout", Value::Null).await?;
         // EOF can race a successful logout. Keep this lock order identical to
@@ -2254,7 +2262,9 @@ impl EngineClient {
         }
         let child = self.process.lock().take();
         if let Some(mut child) = child {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            // The engine reserves three seconds for final listening delivery;
+            // leave another second for ordinary player/cache teardown.
+            let deadline = Instant::now() + Duration::from_secs(4);
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
@@ -3576,6 +3586,34 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             .creation_flags(0x0800_0000);
         client.exit_tx.send_replace(false);
         client.spawn_child(&mut command).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_allows_the_engine_to_finish_its_listening_drain() {
+        let marker = std::env::temp_dir().join(format!("spotifine-final-report-{}-{}.done",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let marker_path = marker.to_string_lossy().replace('\'', "''");
+        let client = client_with_last_state(boundary_state());
+        start_fake_child(&client, &format!(r#"
+while ($line = [Console]::ReadLine()) {{
+    $request = $line | ConvertFrom-Json
+    if ($request.type -eq 'shutdown') {{
+        Start-Sleep -Milliseconds 3000
+        [IO.File]::WriteAllText('{marker_path}', 'delivered')
+        break
+    }}
+    [Console]::WriteLine((@{{request_id=$request.request_id; ok=$true}} | ConvertTo-Json -Compress))
+}}
+"#));
+        // Establish the real pipe before spending the engine's full drain budget.
+        client.status().await.unwrap();
+        client.shutdown_engine();
+        let delivered = std::fs::read_to_string(&marker);
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(delivered.ok().as_deref(), Some("delivered"),
+            "the shell killed its child before the listening-report drain completed");
     }
 
     #[cfg(windows)]

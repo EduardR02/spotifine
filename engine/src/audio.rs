@@ -33,6 +33,21 @@ use tokio::sync::mpsc;
 
 use crate::resample::Resampler;
 use crate::time_stretch::{AudioPipeline, PipelineConfig};
+use crate::spotify_listening::Consumption;
+
+static LISTENING: Mutex<Option<(u64, Arc<Consumption>)>> = Mutex::new(None);
+
+/// Rebinding affects only newly queued PCM. Already buffered packets keep their
+/// original segment (which opt-out invalidates immediately).
+/// Ownership follows rendered output packets, not individual filter taps. The
+/// gapless resampler carries under 1 ms of lookahead at 44.1 kHz across a natural
+/// boundary; its blended boundary samples belong to the packet emitting them.
+/// Keep that bounded granularity rather than reset the filter and break gapless
+/// fidelity merely to split sub-millisecond report attribution.
+pub fn set_listening_counter(revision: u64, counter: Option<Arc<Consumption>>) {
+    *LISTENING.lock().unwrap_or_else(PoisonError::into_inner) =
+        counter.map(|counter| (revision, counter));
+}
 
 /// The audible output, queue and processing state are claimed together at
 /// first start, never when a replacement player is merely constructed.
@@ -399,6 +414,27 @@ struct RingPacket {
     /// it once played through; see [`RingState::marker`].
     boundary_id: u64,
     timing: Option<PacketTiming>,
+    listening: Option<ListeningPacket>,
+}
+
+struct ListeningPacket {
+    counter: Arc<Consumption>,
+    frames: usize,
+    rate: u32,
+    speed: f32,
+}
+
+impl ListeningPacket {
+    fn flush(&mut self) {
+        self.counter.record(std::mem::take(&mut self.frames), self.rate, self.speed);
+    }
+}
+
+impl Drop for ListeningPacket {
+    fn drop(&mut self) {
+        self.flush();
+        self.counter.pending_packets.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// A queued loop marker the engine has not been told about yet.
@@ -552,6 +588,13 @@ impl SampleRing {
         } else {
             0
         };
+        let listening = timing.and_then(|(revision, speed, rate)| {
+            if samples.is_empty() { return None; }
+            let binding = LISTENING.lock().unwrap_or_else(PoisonError::into_inner);
+            let (_, counter) = binding.as_ref().filter(|(bound, _)| *bound == revision)?;
+            counter.pending_packets.fetch_add(1, Ordering::Relaxed);
+            Some(ListeningPacket { counter: Arc::clone(counter), frames: 0, rate, speed })
+        });
         let timing = timing.filter(|_| !samples.is_empty()).map(|(revision, speed, rate)| {
             if state.timeline_revision != revision {
                 state.timeline_revision = revision;
@@ -573,6 +616,7 @@ impl SampleRing {
             samples,
             boundary_id,
             timing,
+            listening,
         });
         self.settle(state, deadline)
     }
@@ -864,6 +908,12 @@ impl LiveSource {
                 frame[2..].fill(T::EQUILIBRIUM);
             }
         }
+        if let Some(listening) = self.packet.listening.as_mut() {
+            listening.flush();
+        }
+        if self.pos == self.packet.samples.len() {
+            self.packet.listening = None;
+        }
     }
 }
 
@@ -890,6 +940,10 @@ impl Iterator for LiveSource {
         }
 
         while self.pos == self.packet.samples.len() {
+            // Release the consumed receipt before an empty pop can return
+            // early from render. Its Drop flushes frames without counting
+            // the underrun silence or retaining a finished packet until stop.
+            self.packet.listening = None;
             // The loop pass is now heard; the waiting producer reports it.
             self.ring.acknowledge_boundary(std::mem::take(&mut self.packet.boundary_id));
             match self.ring.pop() {
@@ -909,6 +963,11 @@ impl Iterator for LiveSource {
 
         let sample = self.packet.samples[self.pos];
         self.pos += 1;
+        if self.pos.is_multiple_of(NUM_CHANNELS as usize) {
+            if let Some(listening) = self.packet.listening.as_mut() {
+                listening.frames += 1;
+            }
+        }
         Some(sample)
     }
 
@@ -1693,6 +1752,108 @@ mod tests {
 
     fn packet(samples: usize) -> Vec<f32> {
         vec![1.0; samples]
+    }
+
+    fn listening_packet(ring: &SampleRing, counter: &Arc<Consumption>, frames: usize, speed: f32) {
+        ring.push(packet(frames * NUM_CHANNELS as usize), Duration::from_millis(50)).unwrap();
+        counter.pending_packets.fetch_add(1, Ordering::Relaxed);
+        ring.lock().packets.back_mut().unwrap().listening = Some(ListeningPacket {
+            counter: Arc::clone(counter), frames: 0, rate: OUT_RATE, speed,
+        });
+    }
+
+    #[test]
+    fn reports_only_consumed_device_frames_not_queued_pause_or_underrun_silence() {
+        let ring = test_ring();
+        let counter = Consumption::new();
+        listening_packet(&ring, &counter, 480, 2.0);
+        let mut source = LiveSource::new(Arc::clone(&ring));
+        let mut output = vec![0.0_f32; 240 * 2];
+        assert_eq!(counter.durations(), (Duration::ZERO, Duration::ZERO));
+        source.render(&mut output, 2, false, 1.0);
+        assert_eq!(counter.durations(), (Duration::ZERO, Duration::ZERO));
+        source.render(&mut output, 2, true, 1.0);
+        assert_eq!(counter.durations(), (Duration::from_millis(5), Duration::from_millis(10)));
+        source.render(&mut output, 2, false, 1.0);
+        source.render(&mut output, 2, true, 1.0);
+        assert_eq!(counter.pending_packets.load(Ordering::Acquire), 0);
+        source.render(&mut output, 2, true, 1.0);
+        assert_eq!(counter.durations(), (Duration::from_millis(10), Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn final_packet_exhausted_mid_callback_flushes_and_releases_before_underrun() {
+        let ring = test_ring();
+        let counter = Consumption::new();
+        listening_packet(&ring, &counter, 240, 2.0);
+        let mut source = LiveSource::new(Arc::clone(&ring));
+        let mut output = vec![-1.0_f32; 480 * 2];
+        source.render(&mut output, 2, true, 1.0);
+        assert!(output[..240 * 2].iter().all(|sample| *sample == 1.0));
+        assert!(output[240 * 2..].iter().all(|sample| *sample == 0.0));
+        assert_eq!(counter.durations(), (Duration::from_millis(5), Duration::from_millis(10)));
+        assert_eq!(counter.pending_packets.load(Ordering::Acquire), 0,
+            "a still-live idle stream must not hold the completed listening receipt");
+        source.render(&mut output, 2, true, 1.0);
+        assert_eq!(counter.durations(), (Duration::from_millis(5), Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn natural_tail_keeps_outgoing_identity_when_next_track_is_already_queued() {
+        let ring = test_ring();
+        let outgoing = Consumption::new();
+        let incoming = Consumption::new();
+        listening_packet(&ring, &outgoing, 240, 1.0);
+        listening_packet(&ring, &incoming, 480, 0.5);
+        let mut source = LiveSource::new(Arc::clone(&ring));
+        let mut output = vec![0.0_f32; 480 * 2];
+        source.render(&mut output, 2, true, 1.0);
+        assert_eq!(outgoing.durations().0, Duration::from_millis(5));
+        assert_eq!(outgoing.pending_packets.load(Ordering::Acquire), 0);
+        assert_eq!(incoming.durations(), (Duration::from_millis(5), Duration::from_micros(2500)));
+        assert_eq!(incoming.pending_packets.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn seek_discards_unheard_frames_and_opt_out_invalidates_callback_owned_pcm() {
+        let ring = test_ring();
+        let counter = Consumption::new();
+        listening_packet(&ring, &counter, 480, 1.0);
+        let mut source = LiveSource::new(Arc::clone(&ring));
+        let mut output = vec![0.0_f32; 240 * 2];
+        source.render(&mut output, 2, true, 1.0);
+        ring.clear();
+        source.render(&mut output, 2, true, 1.0);
+        assert_eq!(counter.durations().0, Duration::from_millis(5));
+        assert_eq!(counter.pending_packets.load(Ordering::Acquire), 0);
+        listening_packet(&ring, &counter, 480, 1.0);
+        source.render(&mut output, 2, true, 1.0);
+        counter.cancel();
+        source.render(&mut output, 2, true, 1.0);
+        assert_eq!(counter.durations().0, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn paused_seek_and_stream_drop_release_receipts_without_counting_discarded_pcm() {
+        let ring = test_ring();
+        let counter = Consumption::new();
+        listening_packet(&ring, &counter, 480, 2.0);
+        listening_packet(&ring, &counter, 480, 2.0);
+        let mut source = LiveSource::new(Arc::clone(&ring));
+        let mut output = vec![0.0_f32; 240 * 2];
+        source.render(&mut output, 2, true, 1.0);
+        ring.pause_at(Instant::now());
+        source.render(&mut output, 2, false, 1.0);
+        assert_eq!(counter.pending_packets.load(Ordering::Acquire), 2,
+            "pause retains both the partial native packet and queued PCM");
+        assert_eq!(counter.durations(), (Duration::from_millis(5), Duration::from_millis(10)));
+        ring.clear();
+        assert_eq!(counter.pending_packets.load(Ordering::Acquire), 1,
+            "the paused callback still owns its partial receipt until the stream closes");
+        drop(source);
+        assert_eq!(counter.pending_packets.load(Ordering::Acquire), 0);
+        assert_eq!(counter.durations(), (Duration::from_millis(5), Duration::from_millis(10)),
+            "neither a seek-discard nor closing a paused stream consumes the remaining frames");
     }
 
     fn configured(edit: Option<TrackEdit>, speed: f32, position_ms: u32, pass: u32) -> u64 {

@@ -39,6 +39,7 @@ const LOCAL_MOCK = new Set([
   "clear_queue",
   "set_animated_canvas",
   "set_devices_enabled",
+  "set_spotify_listening_enabled",
   "enable_account_canvas",
   "login",
   "logout",

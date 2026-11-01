@@ -182,6 +182,7 @@ pub fn run() {
             commands::login,
             commands::logout,
             commands::set_normalisation,
+            commands::set_spotify_listening_enabled,
             commands::personal_api_status,
             commands::personal_api_configure,
             commands::personal_api_authorize,

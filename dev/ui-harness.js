@@ -1089,6 +1089,9 @@ const mock = {
         settings.animated_canvas = Boolean(args.enabled ?? args.value);
         emit("settings", clone(settings));
         return null;
+      case "set_spotify_listening_enabled":
+        settings.spotify_listening_enabled = Boolean(args.enabled);
+        return { settings: clone(settings), apply_error: null };
       /* As the shell does: off brings playback on a device back here, paused. */
       case "set_devices_enabled":
         settings.devices_enabled = Boolean(args.enabled);
@@ -1379,7 +1382,7 @@ window.__TAURI_INTERNALS__ = {
   },
 };
 
-const settings = { animated_canvas: true, devices_enabled: true };
+const settings = { animated_canvas: true, devices_enabled: true, spotify_listening_enabled: true };
 /** Per-track Canvas loops, set by setCanvasFixtures; null for the demo loop. */
 let canvasFixtures = null;
 window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {

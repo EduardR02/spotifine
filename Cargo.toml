@@ -8,6 +8,8 @@ exclude = ["vendor/librespot-audio", "vendor/librespot-playback"]
 # FileId does not identify songs versus episodes. These pinned 0.8.0 patches
 # carry the audio item's URI into each load (including preload), so only songs
 # can read/write persistent audio cache. No session-wide cache toggles.
+# Playback also exposes the selected playable file identity to rendered-audio
+# listening reports; cached/relinked loads cannot be guessed from a queue row.
 [patch.crates-io]
 librespot-audio = { path = "vendor/librespot-audio" }
 librespot-playback = { path = "vendor/librespot-playback" }

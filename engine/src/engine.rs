@@ -19,6 +19,7 @@ use crate::auth::{
 };
 use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
+use crate::spotify_listening::LoadId;
 use crate::io::ProtocolWriter;
 use renderer_engine::protocol::{
     AuthState, Command, LoopRange, PositionEvent,
@@ -317,6 +318,7 @@ pub struct Engine {
     /// in `listening_history`.
     history: Vec<usize>,
     listening_history: ListeningHistory,
+    spotify_listening: crate::spotify_listening::SpotifyListening,
     random_state: u64,
     generation: u64,
     /// The generation the installed player's events travel under. A
@@ -324,6 +326,9 @@ pub struct Engine {
     /// player and commanding it, so its events, its end of track above all,
     /// must still be heard. `None` once it is detached.
     player_generation: Option<u64>,
+    /// Forwarders finish after their player drops; shutdown awaits them before
+    /// collecting reports so selected-file identities cannot be left in transit.
+    player_event_tasks: VecDeque<tokio::task::JoinHandle<()>>,
     /// The customization revision expected by loop-boundary signals. Markers
     /// can remain queued in the audio callback after a track/config change, so
     /// delivery must be tied to the pipeline that produced them.
@@ -624,9 +629,11 @@ impl Engine {
             shuffle_pool: Vec::new(),
             history: Vec::new(),
             listening_history: ListeningHistory::new(history_root),
+            spotify_listening: crate::spotify_listening::SpotifyListening::new(),
             random_state,
             generation: 0,
             player_generation: None,
+            player_event_tasks: VecDeque::new(),
             // No marker produced before this engine was constructed belongs
             // to its first queue, even when the process-wide audio revision
             // was already advanced by an earlier player instance.
@@ -648,6 +655,44 @@ impl Engine {
         }
     }
 
+    /// Privacy changes invalidate active/queued audio identities and abort any
+    /// waiting/in-flight report; re-enabling starts a new segment, never backfill.
+    pub fn set_spotify_listening_enabled(&mut self, enabled: bool) -> bool {
+        let changed = self.spotify_listening.set_enabled(enabled);
+        if changed { self.bind_spotify_audio(); }
+        changed
+    }
+
+    fn bind_spotify_audio(&mut self) {
+        if !self.preview_mode {
+            if let Some(track) = self.state.current_index.and_then(|index| self.state.queue.get(index)) {
+                self.spotify_listening.begin(&track.uri, &track.context, self.state.shuffle,
+                    self.state.repeat == RepeatMode::Track, self.state.repeat == RepeatMode::Context);
+            }
+        }
+        audio::set_listening_counter(self.audio_revision,
+            if self.preview_mode { None } else { self.spotify_listening.counter() });
+    }
+
+    pub async fn drain_spotify_listening(&mut self, events: &mut mpsc::UnboundedReceiver<PlayerSignal>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        // Stop native consumption first, without invalidating the authenticated
+        // session that the bounded delivery drain still needs.
+        audio::pause_output();
+        self.detach_player();
+        while let Some(mut task) = self.player_event_tasks.pop_front() {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+            }
+        }
+        // Only exact-owned SelectedAudio events survive detach's generation
+        // gate. Transport events must not start another load during shutdown.
+        while tokio::time::Instant::now() < deadline {
+            let Ok(event) = events.try_recv() else { break; };
+            self.on_player_signal(event);
+        }
+        self.spotify_listening.drain(deadline).await;
+    }
     /// Records that the OS will report default-output changes, so a machine
     /// with no output device is not asked again on a clock.
     pub fn set_device_notifications(&mut self, available: bool) {
@@ -895,6 +940,7 @@ impl Engine {
     /// notification wakes the loop, and a reconnect answers on its own
     /// deadline. A preserved player still sounding through one keeps its lane.
     pub fn next_work_deadline(&mut self) -> Option<Instant> {
+        self.spotify_listening.collect();
         let reconnecting = self.auth_running || self.awaiting_transport_retry;
         let active = self.state.playing && self.session.is_some() && self.player.is_some()
             && (!reconnecting || self.current_load_produced_audio && !self.loading_failed);
@@ -943,6 +989,9 @@ impl Engine {
             return;
         }
         self.drain_stop_at = None;
+        // Natural queue EOF has no active-playback tick. Collect the consumed
+        // tail on this existing one-shot wake before the engine goes idle.
+        self.spotify_listening.collect();
         if let Some(player) = &self.player {
             player.stop();
         }
@@ -1486,7 +1535,8 @@ impl Engine {
     fn begin_cached_authentication(&mut self, preserve_active_playback: bool) -> u64 {
         self.cancel_cache_evictions();
         if !preserve_active_playback {
-            self.shutdown_playback();
+            self.finalize_listening(false);
+            self.stop_playback_handles();
         }
         self.auth_running = true;
         self.generation = self.generation.wrapping_add(1);
@@ -1671,11 +1721,12 @@ impl Engine {
                         // while every transport command reached its
                         // replacement: audible playback that pause, seek and
                         // next no longer touch, until the app is restarted.
-                        if resume {
-                            self.stop_playback_handles();
-                        } else {
-                            self.shutdown_playback();
+                        if !resume {
+                            self.finalize_listening(false);
                         }
+                        // The replacement's authenticated username decides
+                        // whether measured listening may survive this handover.
+                        self.stop_playback_handles();
                         self.state.ready = true;
                         self.state.auth_state = AuthState::Ready;
                         self.state.auth_url = None;
@@ -1685,6 +1736,7 @@ impl Engine {
                         // search and edit playlists, and the player is the only
                         // thing it cannot have yet.
                         self.session = Some(connected.session);
+                        self.spotify_listening.set_session(self.session.as_ref().expect("installed session").clone());
                         self.next_reconnect = None;
                         self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
                         self.awaiting_transport_retry = false;
@@ -1888,7 +1940,11 @@ impl Engine {
         player_sender: mpsc::UnboundedSender<PlayerSignal>,
     ) {
         self.player_generation = Some(generation);
-        tokio::spawn(async move {
+        self.player_event_tasks.retain(|task| !task.is_finished());
+        if self.player_event_tasks.len() == 32 {
+            if let Some(task) = self.player_event_tasks.pop_front() { task.abort(); }
+        }
+        self.player_event_tasks.push_back(tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 if player_sender
                     .send(PlayerSignal::Event { generation, event })
@@ -1898,7 +1954,7 @@ impl Engine {
                 }
             }
             let _ = player_sender.send(PlayerSignal::Closed { generation });
-        });
+        }));
     }
 
     /// Removes timestamps older than a burst window without treating a clock
@@ -2017,6 +2073,9 @@ impl Engine {
         command: Command,
         auth_sender: &mpsc::UnboundedSender<AuthSignal>,
     ) -> Result<bool, String> {
+        if let Command::SetSpotifyListeningEnabled { enabled } = &command {
+            return Ok(self.set_spotify_listening_enabled(*enabled));
+        }
         if matches!(&command, Command::ClearAudioCache) {
             return self.clear_audio_cache().await;
         }
@@ -2087,6 +2146,7 @@ impl Engine {
             | Command::Login
             | Command::Logout
             | Command::SetNormalisation { .. }
+            | Command::SetSpotifyListeningEnabled { .. }
             | Command::BrowsePlaylist { .. }
             | Command::BrowsePlaylistMembership { .. }
             | Command::QueueMetadata { .. }
@@ -2173,8 +2233,14 @@ impl Engine {
             Command::SetQueueCursor { index, position_ms } => self.set_queue_cursor(index, position_ms),
             Command::Play => self.play(),
             Command::Pause => self.pause(),
-            Command::Next => self.advance_with_current_skip(false, false, true),
-            Command::Previous => self.previous(),
+            Command::Next => {
+                self.spotify_listening.navigation(false);
+                self.advance_with_current_skip(false, false, true)
+            }
+            Command::Previous => {
+                self.spotify_listening.navigation(true);
+                self.previous()
+            }
             Command::Seek { position_ms } => self.seek_transport(position_ms),
             Command::SetVolume { percent } => self.set_volume(percent),
             Command::SetShuffle { enabled } => self.set_shuffle(enabled),
@@ -2478,6 +2544,19 @@ impl Engine {
 
     pub fn on_player_signal(&mut self, signal: PlayerSignal) -> bool {
         match signal {
+            PlayerSignal::Event {
+                generation,
+                event: PlayerEvent::SelectedAudio { play_request_id, track_id, resolved_track_id, file_id, format },
+            } => {
+                // Retired loads still own heard PCM even when transport has
+                // moved on. The tracker accepts only a matching generation,
+                // request and requested URI, not whichever row is current.
+                if let Ok(requested) = track_id.to_uri() {
+                    self.spotify_listening.selected(LoadId { generation, request: play_request_id },
+                        &requested, resolved_track_id, file_id, format);
+                }
+                false
+            }
             PlayerSignal::Event { generation, event } if self.player_generation == Some(generation) => {
                 self.on_player_event(event)
             }
@@ -2501,6 +2580,7 @@ impl Engine {
                     self.mixer = None;
                     self.invalidate_audio_signals();
                     if let Some(session) = self.session.take() {
+                        audio::set_listening_counter(self.audio_revision, None);
                         session.shutdown();
                     }
                     true
@@ -2718,6 +2798,7 @@ impl Engine {
             position_ms,
             loop_pass,
         );
+        self.bind_spotify_audio();
     }
 
     fn configure_current_audio_after_natural_boundary(&mut self, position_ms: u32) {
@@ -2733,6 +2814,7 @@ impl Engine {
             self.state.playback_speed(),
             position_ms,
         );
+        self.bind_spotify_audio();
     }
     fn current_loop(&self) -> Option<LoopRange> {
         self.state
@@ -2813,6 +2895,7 @@ impl Engine {
     }
 
     fn finalize_listening(&mut self, completed: bool) {
+        self.spotify_listening.finish(completed);
         if self.preview_mode {
             return;
         }
@@ -3450,6 +3533,7 @@ impl Engine {
         } else {
             // No earlier track (first track, or already restarting): seek the
             // current track back to its beginning instead of erroring.
+            self.spotify_listening.finish(false);
             self.seek_transport(0)
         }
     }
@@ -3541,6 +3625,7 @@ impl Engine {
                 }
             }
             None => {
+                self.spotify_listening.queue_ended();
                 // At natural EOF librespot is already in EndOfTrack. Calling
                 // stop here would clear correctly queued audio before the
                 // device drains it, so the stop waits for the tail; explicit
@@ -3853,6 +3938,7 @@ impl Engine {
         let uri = playable_track_uri(track)?;
         let incoming = track.uri.starts_with("spotify:track:").then(|| track.id.clone());
         let position_ms = self.state.position_ms;
+        self.spotify_listening.prepare_load();
         if natural_boundary {
             self.configure_current_audio_after_natural_boundary(position_ms);
         } else {
@@ -3908,8 +3994,12 @@ impl Engine {
             .filter(|outgoing| self.loaded_track_id.as_ref() != Some(outgoing));
         if let Some(player) = player {
             self.prepare_cache_reload(&uri);
-            self.play_request_id = Some(player.load(uri, start_playing, position_ms,
-                crate::audio::decoder_transition(self.audio_revision)));
+            let request = player.load(uri, start_playing, position_ms,
+                crate::audio::decoder_transition(self.audio_revision));
+            self.play_request_id = Some(request);
+            self.spotify_listening.loaded(LoadId {
+                generation: self.player_generation.unwrap_or(self.generation), request,
+            });
         }
         self.mark_cached_tracks(outgoing);
         Ok(())
@@ -4634,6 +4724,8 @@ impl Engine {
     fn shutdown_playback(&mut self) {
         self.cancel_cache_evictions();
         self.finalize_listening(false);
+        self.spotify_listening.logout();
+        audio::set_listening_counter(self.audio_revision, None);
         self.stop_playback_handles();
     }
 
@@ -4890,6 +4982,8 @@ mod tests {
     use crate::auth::{PlaybackError, create_playback, percent_to_volume};
     use crate::customization::TrackEditStore;
     use crate::io::ProtocolWriter;
+    use crate::spotify_listening::LoadId;
+    use tokio::sync::mpsc;
     use librespot_core::SpotifyUri;
     use librespot_playback::audio_backend::{Sink, SinkResult};
     use librespot_playback::config::PlayerConfig;
@@ -4965,6 +5059,118 @@ mod tests {
         engine.awaiting_transport_retry = false;
         engine.next_reconnect = None;
         engine.player = None;
+        assert_eq!(engine.next_work_deadline(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_selected_audio_resolves_only_its_retired_load_across_player_generations() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        let session = librespot_core::Session::new(Default::default(), None);
+        session.set_username("listener");
+        engine.spotify_listening.set_session(session);
+        let mut reports = engine.spotify_listening.observe_reports();
+        let requested = engine.state.current_uri().unwrap().to_owned();
+        let uri = SpotifyUri::from_uri(&requested).unwrap();
+        let old_load = LoadId { generation: 1, request: 7 };
+        let new_load = LoadId { generation: 2, request: 7 };
+        engine.spotify_listening.begin(&requested, "", false, false, false);
+        engine.spotify_listening.loaded(old_load);
+        engine.spotify_listening.counter().unwrap().record(480, 48_000, 1.0);
+        engine.spotify_listening.prepare_load();
+        engine.spotify_listening.begin(&requested, "", false, false, false);
+        engine.spotify_listening.loaded(new_load);
+        engine.spotify_listening.counter().unwrap().record(960, 48_000, 1.0);
+        engine.player_generation = Some(2);
+        engine.play_request_id = Some(7);
+        engine.spotify_listening.collect();
+        assert!(reports.try_recv().is_err(), "heard but unresolved PCM must wait for its identity");
+        for (generation, play_request_id, file) in [(1, 7, 1), (1, 7, 3), (2, 8, 4), (2, 7, 2), (2, 7, 5)] {
+            assert!(!engine.on_player_signal(PlayerSignal::Event {
+                generation,
+                event: PlayerEvent::SelectedAudio {
+                    play_request_id, track_id: uri.clone(), resolved_track_id: uri.clone(),
+                    file_id: librespot_core::FileId([file; 20]),
+                    format: librespot_metadata::audio::AudioFileFormat::OGG_VORBIS_320,
+                },
+            }));
+            engine.spotify_listening.collect();
+        }
+        let (_sender, mut events) = mpsc::unbounded_channel();
+        engine.drain_spotify_listening(&mut events).await;
+        let old = reports.try_recv().expect("stale transport metadata still owns the retired PCM");
+        let new = reports.try_recv().expect("the duplicate URI has its own selected file");
+        assert_eq!((old.file_id, old.played), (librespot_core::FileId([1; 20]), Duration::from_millis(10)));
+        assert_eq!((new.file_id, new.played), (librespot_core::FileId([2; 20]), Duration::from_millis(20)));
+        assert!(reports.try_recv().is_err(), "duplicate events cannot rewrite or duplicate a report");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_waits_for_selected_file_events_already_queued_by_the_player() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        let session = librespot_core::Session::new(Default::default(), None);
+        session.set_username("listener");
+        engine.spotify_listening.set_session(session);
+        let mut reports = engine.spotify_listening.observe_reports();
+        let requested = engine.state.current_uri().unwrap().to_owned();
+        let uri = SpotifyUri::from_uri(&requested).unwrap();
+        engine.spotify_listening.begin(&requested, "", false, false, false);
+        engine.spotify_listening.loaded(LoadId { generation: 1, request: 7 });
+        engine.spotify_listening.counter().unwrap().record(480, 48_000, 1.0);
+        let (selected, selected_events) = mpsc::unbounded_channel();
+        let (sender, mut events) = mpsc::unbounded_channel();
+        selected.send(PlayerEvent::SelectedAudio {
+            play_request_id: 7, track_id: uri.clone(), resolved_track_id: uri,
+            file_id: librespot_core::FileId([1; 20]),
+            format: librespot_metadata::audio::AudioFileFormat::OGG_VORBIS_320,
+        }).unwrap();
+        drop(selected);
+        engine.forward_player_events(selected_events, 1, sender);
+        // No yield: the forwarding task has not yet delivered SelectedAudio.
+        engine.drain_spotify_listening(&mut events).await;
+        let report = reports.try_recv().expect("shutdown resolves metadata before collecting PCM");
+        assert_eq!(report.file_id, librespot_core::FileId([1; 20]));
+        assert_eq!(report.played, Duration::from_millis(10));
+        assert!(reports.try_recv().is_err());
+        assert!(engine.player_event_tasks.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_stuck_event_forwarders_within_the_delivery_deadline() {
+        let (mut engine, _) = test_engine();
+        let task = tokio::spawn(std::future::pending());
+        let observer = task.abort_handle();
+        engine.player_event_tasks.push_back(task);
+        let (_sender, mut events) = mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+        engine.drain_spotify_listening(&mut events).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        tokio::task::yield_now().await;
+        assert!(observer.is_finished(), "a retained event channel must not hang process shutdown");
+        assert!(engine.player_event_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn paused_retired_pcm_has_no_reporting_timer_but_eof_keeps_its_one_shot_drain() {
+        let (mut engine, _probe) = engine_with_player();
+        let session = librespot_core::Session::new(librespot_core::SessionConfig::default(), None);
+        session.set_username("listener");
+        engine.spotify_listening.set_session(session);
+        engine.spotify_listening.begin("spotify:track:0123456789ABCDEFGHIJKL", "", false, false, false);
+        let counter = engine.spotify_listening.counter().unwrap();
+        counter.pending_packets.store(1, Ordering::Release);
+        counter.record(240, 48_000, 1.0);
+        engine.spotify_listening.finish(true);
+        assert_eq!(engine.next_work_deadline(), None,
+            "retired PCM retained by pause must wait for existing events, not a reporting poll");
+        let drain = Instant::now() + Duration::from_secs(1);
+        engine.drain_stop_at = Some(drain);
+        assert_eq!(engine.next_work_deadline(), Some(drain),
+            "natural EOF still wakes once to collect its audible tail before idle");
+        counter.pending_packets.store(0, Ordering::Release);
+        engine.drain_stop_at = Some(Instant::now());
+        engine.tick_output_drain();
         assert_eq!(engine.next_work_deadline(), None);
     }
 
@@ -9161,6 +9367,13 @@ mod tests {
 
         let old_sink = SinkProbe::new();
         let (old_player, old_session) = probe_player(&old_sink);
+        old_session.set_username("listener");
+        engine.spotify_listening.set_session(old_session.clone());
+        let uri = engine.state.current_uri().unwrap().to_owned();
+        engine.spotify_listening.begin(&uri, "", false, false, false);
+        let heard = engine.spotify_listening.counter().unwrap();
+        heard.pending_packets.store(1, Ordering::Release);
+        heard.record(24_000, 48_000, 1.0);
         let old_player_handle = Arc::downgrade(&old_player);
         engine.player = Some(old_player);
         engine.session = Some(old_session.clone());
@@ -9175,6 +9388,7 @@ mod tests {
 
         let new_sink = SinkProbe::new();
         let (new_player, new_session) = probe_player(&new_sink);
+        new_session.set_username("listener");
         let new_player_handle = Arc::downgrade(&new_player);
         let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
         assert!(engine.on_auth_signal(
@@ -9184,6 +9398,9 @@ mod tests {
             },
             player_sender,
         ));
+        // PCM already owned by the old output still belongs to this account.
+        heard.record(24_000, 48_000, 1.0);
+        assert_eq!(heard.durations(), (Duration::from_secs(1), Duration::from_secs(1)));
 
         assert!(
             old_player_handle.upgrade().is_none(),
@@ -9205,6 +9422,7 @@ mod tests {
         );
         assert!(engine.state.playing, "the resume intent survived");
         assert!(new_sink.is_alive());
+        engine.shutdown();
     }
 
     /// The same teardown has to run when the attempt began preserved but the

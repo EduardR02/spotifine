@@ -543,6 +543,10 @@ pub enum Command {
     SetNormalisation {
         enabled: bool,
     },
+    /// Controls Spotify listening-history events independently of local history.
+    SetSpotifyListeningEnabled {
+        enabled: bool,
+    },
 }
 
 /// One logical local listening-history row.

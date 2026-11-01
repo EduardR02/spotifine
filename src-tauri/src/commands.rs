@@ -983,6 +983,25 @@ pub async fn set_normalisation(
     Ok(settings)
 }
 
+#[derive(serde::Serialize)]
+pub struct ListeningPreferenceUpdate {
+    settings: AppSettings,
+    apply_error: Option<String>,
+}
+
+/// Saves the listening preference and applies it without rebuilding playback.
+#[tauri::command]
+pub async fn set_spotify_listening_enabled(
+    client: State<'_, Arc<EngineClient>>,
+    enabled: bool,
+) -> Result<ListeningPreferenceUpdate, String> {
+    let settings = update_app_settings(|settings| settings.spotify_listening_enabled = enabled)?;
+    let apply_error = client.set_spotify_listening_enabled(enabled).await.err().map(|error| {
+        format!("Preference saved, but the running player's state could not be confirmed. Restart Spotifine before relying on this change: {error}")
+    });
+    Ok(ListeningPreferenceUpdate { settings, apply_error })
+}
+
 #[tauri::command]
 pub async fn logout(
     app: AppHandle,

@@ -221,7 +221,11 @@ export function setNowPlayingOpen(open) {
 }
 
 /** The single settings snapshot, hydrated by bootstrap and mutation replies. */
-export const appSettings = $state({ animated_canvas: true, devices_enabled: true });
+export const appSettings = $state({
+  animated_canvas: true,
+  devices_enabled: true,
+  spotify_listening_enabled: true,
+});
 export const settingsState = $state({ loaded: false });
 
 /**
@@ -2954,6 +2958,15 @@ export const api = {
   setAudioCacheLimit: (mb) => mutateAppSettings("set_audio_cache_limit", { mb }),
   setNormalisation: (enabled) =>
     mutateAppSettings("set_normalisation", { enabled: !!enabled }),
+  setSpotifyListeningEnabled: async (enabled) => {
+    const revision = ++appSettingsRevision;
+    const result = await invoke("set_spotify_listening_enabled", { enabled: !!enabled });
+    if (revision === appSettingsRevision) applyAppSettings(result.settings);
+    // Saving and live application can succeed independently. Keep the durable
+    // preference visible, but never silently claim the running player applied it.
+    if (result.apply_error) throw new Error(result.apply_error);
+    return result.settings;
+  },
   setLaunchAtLogin: (enabled) => mutateAppSettings("set_launch_at_login", { enabled: !!enabled }),
   setStartMinimized: (enabled) => mutateAppSettings("set_start_minimized", { enabled: !!enabled }),
   setAnimatedCanvas: (enabled) =>

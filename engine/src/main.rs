@@ -12,6 +12,7 @@ mod io;
 #[cfg(any(windows, target_os = "macos"))]
 mod output_device;
 mod resample;
+mod spotify_listening;
 mod time_stretch;
 mod waveform;
 
@@ -134,7 +135,7 @@ fn configure_audio_fetch() {
 }
 
 fn main() -> ExitCode {
-    let (state_directory, log_file, audio_cache_limit_bytes, normalisation) =
+    let (state_directory, log_file, audio_cache_limit_bytes, normalisation, spotify_listening_enabled) =
         match parse_arguments(std::env::args_os().skip(1).collect()) {
             Ok(arguments) => arguments,
             Err(error) => {
@@ -187,6 +188,7 @@ fn main() -> ExitCode {
         state_directory,
         normalisation,
         audio_cache_limit_bytes,
+        spotify_listening_enabled,
     ));
     runtime.shutdown_timeout(Duration::from_secs(1));
     match result {
@@ -216,6 +218,7 @@ async fn run(
     state_directory: PathBuf,
     normalisation: bool,
     audio_cache_limit_bytes: Option<u64>,
+    spotify_listening_enabled: bool,
 ) -> Result<(), String> {
     let (input_sender, mut input_receiver) = mpsc::unbounded_channel();
     let (auth_sender, mut auth_receiver) = mpsc::unbounded_channel::<AuthSignal>();
@@ -246,6 +249,7 @@ async fn run(
         audio::default_sink_opener(),
         audio::default_device_presence(),
     );
+    engine.set_spotify_listening_enabled(spotify_listening_enabled);
     engine.set_cache_sender(cache_sender);
     #[cfg(any(windows, target_os = "macos"))]
     let _output_watcher = match output_device::watch(output_sender) {
@@ -290,6 +294,7 @@ async fn run(
                                 }
                                 let success = Ok(true);
                                 engine.send_response(&request_id, &success)?;
+                                engine.drain_spotify_listening(&mut player_receiver).await;
                                 engine.shutdown();
                                 break;
                             }
@@ -609,6 +614,7 @@ async fn run(
                     }
                     Input::Eof => {
                         waveform_service.shutdown();
+                        engine.drain_spotify_listening(&mut player_receiver).await;
                         engine.shutdown();
                         break;
                     }
@@ -715,17 +721,19 @@ async fn wait_for_work(deadline: Option<std::time::Instant>) {
 /// Parses `--state-dir <path>` (required), `--log-file <path>` (optional,
 /// the diagnostic log the parent redirects stderr to; the panic hook appends
 /// there too), `--audio-cache-limit-mb <n>` (optional) and
-/// `--normalisation <true|false>` (optional, default off). Accepts the
+/// `--normalisation <true|false>` (optional, default off), and
+/// `--spotify-listening-enabled <true|false>` (optional, default on). Accepts the
 /// arguments in any order and tolerates extra pairs, so older launchers that
 /// only pass `--state-dir` keep working.
 fn parse_arguments(
     arguments: Vec<OsString>,
-) -> Result<(PathBuf, Option<PathBuf>, Option<u64>, bool), String> {
+) -> Result<(PathBuf, Option<PathBuf>, Option<u64>, bool, bool), String> {
     let mut state_directory: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut audio_cache_limit_bytes = Some(AUDIO_CACHE_LIMIT_BYTES);
     let mut audio_cache_limit_seen = false;
     let mut normalisation = false;
+    let mut spotify_listening_enabled = true;
     let mut index = 0usize;
     while index < arguments.len() {
         let name = arguments[index].to_string_lossy().into_owned();
@@ -774,6 +782,15 @@ fn parse_arguments(
                     }
                 };
             }
+            "--spotify-listening-enabled" => {
+                spotify_listening_enabled = match value.to_string_lossy().as_ref() {
+                    "true" => true,
+                    "false" => false,
+                    other => return Err(format!(
+                        "--spotify-listening-enabled must be \"true\" or \"false\", got {other}"
+                    )),
+                };
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
         index += 2;
@@ -785,6 +802,7 @@ fn parse_arguments(
         log_file,
         audio_cache_limit_bytes,
         normalisation,
+        spotify_listening_enabled,
     ))
 }
 
@@ -1035,13 +1053,14 @@ mod tests {
     fn parse_arguments_requires_state_dir_and_accepts_an_optional_log_file() {
         let state_dir = test_path("engine");
         let log_file = test_path("logs/playback_engine.log");
-        let (state, log, _, normalisation) =
+        let (state, log, _, normalisation, spotify_listening_enabled) =
             parse_arguments(os(&["--state-dir", &state_dir])).expect("state dir alone");
         assert_eq!(state, PathBuf::from(&state_dir));
         assert!(log.is_none(), "log file is optional");
         assert!(!normalisation, "normalisation defaults to off");
+        assert!(spotify_listening_enabled, "Spotify listening defaults to on");
 
-        let (state, log, cache_limit, _) = parse_arguments(os(&[
+        let (state, log, cache_limit, _, _) = parse_arguments(os(&[
             "--state-dir",
             &state_dir,
             "--log-file",
@@ -1055,7 +1074,7 @@ mod tests {
         assert_eq!(cache_limit, Some(4096 * 1024 * 1024));
 
         // Flag order must not matter.
-        let (state, log, cache_limit, _) = parse_arguments(os(&[
+        let (state, log, cache_limit, _, _) = parse_arguments(os(&[
             "--audio-cache-limit-mb",
             "0",
             "--log-file",
@@ -1072,7 +1091,7 @@ mod tests {
     #[test]
     fn parse_arguments_reads_the_normalisation_flag() {
         let state_dir = test_path("engine");
-        let (_, _, _, normalisation) = parse_arguments(os(&[
+        let (_, _, _, normalisation, _) = parse_arguments(os(&[
             "--state-dir",
             &state_dir,
             "--normalisation",
@@ -1081,7 +1100,7 @@ mod tests {
         .expect("normalisation on");
         assert!(normalisation);
 
-        let (_, _, _, normalisation) = parse_arguments(os(&[
+        let (_, _, _, normalisation, _) = parse_arguments(os(&[
             "--state-dir",
             &state_dir,
             "--normalisation",
@@ -1100,6 +1119,20 @@ mod tests {
             .is_err(),
             "a non-boolean value is rejected rather than silently ignored"
         );
+    }
+
+    #[test]
+    fn parse_arguments_reads_spotify_listening_privacy_setting() {
+        let state_dir = test_path("engine");
+        for (value, expected) in [("false", false), ("true", true)] {
+            let (_, _, _, _, enabled) = parse_arguments(os(&[
+                "--state-dir", &state_dir, "--spotify-listening-enabled", value,
+            ])).expect("boolean setting");
+            assert_eq!(enabled, expected);
+        }
+        assert!(parse_arguments(os(&[
+            "--state-dir", &state_dir, "--spotify-listening-enabled", "maybe",
+        ])).is_err());
     }
 
     #[test]

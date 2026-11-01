@@ -81,8 +81,27 @@ Some extra things I added because we control playback here:
 - Cut a section out of a song, or loop an exact range. Set per playlist, edited
   in a waveform view.
 - Playback speed from 0.5× to 4×.
-- Listening history, kept locally.
+- Listening history, kept locally. It starts empty on each computer; Spotify's
+  listening history is not imported.
 - A mark on songs that are already in the local audio cache.
+
+Spotify listening history and personalization are on by default, like in
+Spotify's own client. **Listening history & personalization** in Settings can
+turn them off. Only audio rendered to the output counts, not paused time,
+seek jumps, preload, or editor previews. The local history above is separate
+and is never uploaded retroactively.
+
+Turning this off cancels pending listening reports; turning it back on starts
+fresh. This isn't Spotify's account-wide Private Session or anonymous streaming:
+Spotify still receives the requests needed to play music. Delivery uses
+Spotify's undocumented event receiver and a bounded memory queue, so a crash
+or interrupted connection can lose unsent events. History updates can be delayed.
+Spotify controls how these events affect recommendations; Wrapped and royalty
+accounting aren't guaranteed.
+
+If the preference is saved but the running player cannot confirm the change,
+Settings keeps the saved value and shows a restart warning. Restart Spotifine
+before relying on that change.
 
 Canvas, the short looping video some songs have, is an account setting on
 Spotify's side. Spotifine shows it whenever it's on for your account.
@@ -118,6 +137,24 @@ other device, and that device's own controls work with it. Editing the queue
 while it plays elsewhere can make it rebuffer for a moment. Other devices play
 Spotify's original audio, so playback speed and song edits only apply on this
 computer.
+
+### Playback timing
+
+Ordinary local pause/resume retains the decoder, queued audio and processing
+state. It does not deliberately reload the song or wait for a fresh download
+window. The same three-second compressed-data read-ahead policy is used on
+Windows and macOS; it is not three seconds of output latency. Ready player
+commands are handled before the next potentially blocking decode or output write.
+An already-running read can still wait for missing network or disk data.
+
+The native output buffer is chosen by the platform and driver. CoreAudio's
+start/stop calls are synchronous; Windows queues those calls to an audio worker.
+If controls feel delayed on a Mac, compare the same cached song through built-in
+output with EQ/virtual output disabled, then enabled, then through Bluetooth.
+Record the approximate time and keep
+`~/Library/Application Support/Spotifine/logs/playback_engine.log`: its
+`transport:` lines distinguish an ordinary resume from a new load or recovery.
+Do not delete the cache or history to diagnose a delay.
 
 ## Limitations
 

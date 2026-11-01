@@ -41,6 +41,9 @@ pub struct AppSettings {
     /// engine over the protocol on change, so only the *initial* value comes
     /// from here.
     pub normalisation: bool,
+    /// Spotify listening-history and personalization reports. Local history is
+    /// independent; disabling this does not make Spotify requests anonymous.
+    pub spotify_listening_enabled: bool,
     /// User-owned Spotify developer app ID, never an app secret.
     pub personal_client_id: String,
     /// Spotify Connect devices from the player bar. Off is local only: the
@@ -57,6 +60,7 @@ impl Default for AppSettings {
             start_minimized: false,
             animated_canvas: true,
             normalisation: false,
+            spotify_listening_enabled: true,
             personal_client_id: String::new(),
             devices_enabled: true,
         }

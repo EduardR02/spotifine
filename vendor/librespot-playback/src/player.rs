@@ -88,6 +88,7 @@ struct PlayerInternal {
     sink_status: SinkStatus,
     decoder_revision: u64,
     decoder_is_current: Option<Box<dyn Fn() -> bool + Send>>,
+    selected_audio: Option<(SpotifyUri, crate::core::FileId, AudioFileFormat)>,
     sink_event_callback: Option<SinkEventCallback>,
     volume_getter: Box<dyn VolumeGetter + Send>,
     event_senders: Vec<mpsc::UnboundedSender<PlayerEvent>>,
@@ -241,6 +242,15 @@ pub enum PlayerEvent {
         audio_item: Box<AudioItem>,
         play_request_id: u64,
     },
+    /// The remote file actually selected after availability/relink resolution.
+    /// Emitted only when that loaded file becomes the current playback.
+    SelectedAudio {
+        play_request_id: u64,
+        track_id: SpotifyUri,
+        resolved_track_id: SpotifyUri,
+        file_id: crate::core::FileId,
+        format: AudioFileFormat,
+    },
     SessionConnected {
         connection_id: String,
         user_name: String,
@@ -299,6 +309,9 @@ impl PlayerEvent {
                 play_request_id, ..
             }
             | TrackChanged {
+                play_request_id, ..
+            }
+            | SelectedAudio {
                 play_request_id, ..
             }
             | Seeked {
@@ -518,6 +531,7 @@ impl Player {
                 sink_status: SinkStatus::Closed,
                 decoder_revision: 0,
                 decoder_is_current: None,
+                selected_audio: None,
                 sink_event_callback: None,
                 volume_getter,
                 event_senders: vec![],
@@ -706,6 +720,7 @@ struct PlayerLoadedTrackData {
     duration_ms: u32,
     stream_position_ms: u32,
     is_explicit: bool,
+    selected_audio: Option<(crate::core::FileId, AudioFileFormat)>,
 }
 
 enum PlayerPreload {
@@ -838,6 +853,7 @@ impl PlayerState {
                         duration_ms,
                         stream_position_ms,
                         is_explicit,
+                        selected_audio: None,
                     },
                 };
             }
@@ -1244,6 +1260,7 @@ impl PlayerTrackLoader {
                 duration_ms,
                 stream_position_ms,
                 is_explicit,
+                selected_audio: Some((file_id, format)),
             });
         }
     }
@@ -1323,6 +1340,7 @@ impl PlayerTrackLoader {
             duration_ms: duration.as_millis() as u32,
             stream_position_ms,
             is_explicit: false,
+            selected_audio: None,
             audio_item: AudioItem {
                 duration_ms: duration.as_millis() as u32,
                 uri: track_uri.to_uri().unwrap_or_default(),
@@ -1910,6 +1928,20 @@ impl PlayerInternal {
         let audio_item = Box::new(loaded_track.audio_item.clone());
 
         self.send_event(PlayerEvent::TrackChanged { audio_item, play_request_id });
+        if let Some((file_id, format)) = loaded_track.selected_audio {
+            self.selected_audio = Some((loaded_track.audio_item.track_id.clone(), file_id, format));
+        }
+        if let Some((_, file_id, format)) = self.selected_audio.as_ref()
+            .filter(|(uri, _, _)| *uri == loaded_track.audio_item.track_id).cloned()
+        {
+            self.send_event(PlayerEvent::SelectedAudio {
+                play_request_id,
+                track_id: track_id.clone(),
+                resolved_track_id: loaded_track.audio_item.track_id.clone(),
+                file_id,
+                format,
+            });
+        }
 
         let position_ms = loaded_track.stream_position_ms;
 
@@ -2089,6 +2121,7 @@ impl PlayerInternal {
                         duration_ms,
                         stream_position_ms,
                         is_explicit,
+                        selected_audio: None,
                     };
 
                     self.preload = PlayerPreload::None;
@@ -2867,6 +2900,7 @@ mod tests {
             sink_status: SinkStatus::Closed,
             decoder_revision: 1,
             decoder_is_current: None,
+            selected_audio: None,
             sink_event_callback: None,
             volume_getter: Box::new(NoOpVolume),
             event_senders: vec![],

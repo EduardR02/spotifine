@@ -6,6 +6,7 @@
 //! serde shapes without duplicating them.
 
 pub mod protocol;
+pub mod spotify_reporting;
 
 /// Atomic single-file replacement shared by engine and shell writers.
 /// Standard rename replaces existing files on Windows too. Only durable

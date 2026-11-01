@@ -72,6 +72,7 @@
   const settingErrors = $state({
     audioCacheLimit: "",
     normalisation: "",
+    spotifyListening: "",
     launchAtLogin: "",
     startMinimized: "",
     animatedCanvas: "",
@@ -220,6 +221,15 @@
     );
   }
 
+  function updateSpotifyListening(enabled) {
+    return updateSetting(
+      "spotifyListening",
+      enabled,
+      () => api.setSpotifyListeningEnabled(enabled),
+      "Could not update Spotify listening history.",
+    );
+  }
+
 
   // The command is cached server-side for a minute and this effect runs once
   // per Settings mount, so reopening the page stays fresh without a disk walk
@@ -284,6 +294,29 @@
           <div class="set-ctl"><span class="dot warn"></span></div>
         </div>
       {/if}
+      <div class="set-row">
+        <div>
+          <div class="k">Listening history &amp; personalization</div>
+          <div class="d" id="spotify-listening-description">
+            Let Spotify record what you listen to, as its own app normally does, for your
+            listening history and personalized recommendations. Off stops additional listening
+            reports from this app; your local history stays. Spotify still receives the requests
+            needed to stream music.
+          </div>
+          {#if settingErrors.spotifyListening}<div class="inline-error" role="alert">{settingErrors.spotifyListening}</div>{/if}
+        </div>
+        <div class="set-ctl">
+          <input
+            class="set-check"
+            type="checkbox"
+            aria-label="Listening history & personalization"
+            aria-describedby="spotify-listening-description"
+            checked={requestedSettings.spotifyListening ?? appSettings?.spotify_listening_enabled ?? true}
+            disabled={!settingsState.loaded || !!settingBusy}
+            onchange={(event) => updateSpotifyListening(event.currentTarget.checked)}
+          />
+        </div>
+      </div>
     </div>
 
     <!-- What the personal app is FOR, in its name. One sentence and the
