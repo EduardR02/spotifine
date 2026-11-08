@@ -21,10 +21,10 @@ use crate::engine_client::{unmark_cached_rows, EngineClient, PositionHeartbeat, 
 use crate::log;
 use crate::media_keys;
 use crate::personal_api::{
-    Authorization as PersonalAuthorization, Device as PersonalDevice, PersonalApi,
+    Authorization as PersonalAuthorization, PersonalApi,
     Status as PersonalStatus,
 };
-use crate::playback_router::{Action as PlaybackAction, PlaybackRouter};
+use crate::playback_router::{Action as PlaybackAction, DeviceDiscovery, PlaybackRouter};
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail, CacheStats, EpisodeDetail, HistoryPageDetail, LibraryNodeDetail, LikedSongsDetail, PlaybackEvent, PlaybackState, Playlist, PlaylistDetail, PlaylistRecommendationsDetail, ProfileDetail, RadioDetail, SearchResult, Show, ShowDetail, SongwriterPlaylist, Track, TrackCreditsDetail, TrackPlaylistRef, TrackWaveform
 };
@@ -1086,11 +1086,9 @@ pub async fn personal_api_set_saved(
 #[tauri::command]
 pub async fn personal_api_devices(
     app: AppHandle,
-    personal: State<'_, Arc<PersonalApi>>,
     router: State<'_, Arc<PlaybackRouter>>,
-) -> Result<Vec<PersonalDevice>, String> {
-    if !router.devices_enabled() { return Err("Spotify devices are turned off in Settings".to_owned()); }
-    personal.devices(&app).await
+) -> Result<DeviceDiscovery, String> {
+    router.devices(&app).await
 }
 
 #[tauri::command]

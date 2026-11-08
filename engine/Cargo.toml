@@ -1,6 +1,6 @@
 [package]
 name = "renderer-engine"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -10,13 +10,16 @@ name = "PlaybackEngine"
 path = "src/main.rs"
 
 [dependencies]
+aes = "0.8"
 base64 = "0.22"
 cpal = "0.16"
+ctr = "0.9"
 flate2 = "1"
 futures-util = { version = "0.3", default-features = false }
 http = "1"
 http-body-util = "0.1"
 hex = "0.4"
+hmac = "0.12"
 parking_lot = "0.12"
 protobuf = "3.7"
 protobuf-json-mapping = "3.7"
@@ -26,6 +29,9 @@ librespot-core = { version = "=0.8.0", default-features = false, features = ["na
 librespot-metadata = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
 librespot-playback = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
 librespot-protocol = { version = "=0.8.0", default-features = false }
+mdns-sd = { version = "0.21.7", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+rand = { version = "0.9", default-features = false, features = ["thread_rng"] }
 # The OAuth authorize URL must be known before the flow runs (the UI presents
 # it), so the engine drives the authorization-code + PKCE flow directly
 # instead of going through librespot-oauth (which hides the URL inside

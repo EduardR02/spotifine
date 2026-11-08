@@ -71,7 +71,8 @@ impl Timing {
     fn request_timeout(&self, kind: &str) -> Duration {
         if kind == "get_track_waveform" {
             self.waveform
-        } else if kind.starts_with("browse_") || kind.starts_with("edit_") {
+        } else if kind.starts_with("browse_") || kind.starts_with("edit_")
+            || matches!(kind, "discover_connect_devices" | "activate_connect_device") {
             self.browse
         } else {
             self.command
@@ -886,6 +887,7 @@ mod claims {
     }
 
     // Payloads without rows.
+    impl CachedClaims for renderer_engine::protocol::ConnectDevice {}
     impl CachedClaims for TrackWaveform {}
     impl CachedClaims for LibraryNode {}
     impl CachedClaims for UserProfile {}
@@ -1781,6 +1783,16 @@ impl EngineClient {
 
     pub async fn login(&self) -> Result<(), String> {
         self.request("login", Value::Null).await.map(|_| ())
+    }
+
+    /// On-demand LAN discovery; native endpoints remain inside the engine.
+    pub async fn discover_connect_devices(&self) -> Result<Vec<renderer_engine::protocol::ConnectDevice>, String> {
+        let reply = self.request("discover_connect_devices", Value::Null).await?;
+        parse_data(reply, "discover_connect_devices")
+    }
+
+    pub async fn activate_connect_device(&self, device_id: &str) -> Result<(), String> {
+        self.request("activate_connect_device", json!({ "device_id": device_id })).await.map(drop)
     }
 
     /// Applies the volume-normalisation preference to the live engine. The

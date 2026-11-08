@@ -4,8 +4,8 @@
  * harness (dev/ui-harness-real.js), which uses it to decide what to ask for.
  *
  * Each entry was checked against src-tauri/src/commands.rs and the engine: none
- * of them touches playback, the queue, the Spotify account, or a setting. The
- * worst any of them does is refresh a local cache, noted per entry.
+ * of them touches playback, the queue, the Spotify account, or a setting.
+ * Reads may refresh a local cache or explicitly discover LAN devices.
  *
  *   status                 makes the engine re-broadcast state to the real window.
  *   cancel_track_waveform  cancels engine work.
@@ -52,7 +52,8 @@ export const READ_COMMANDS = new Set([
   "browse_profile",
   // Native-bound personal reads only, never prewarmed. Contains answers only
   // whether a profile's user is followed, once when the profile opens; the
-  // UI asks for devices only when the device menu is opened.
+  // UI asks for devices only when the device menu is opened. This also browses
+  // LAN receivers on demand, but never activates them.
   "personal_api_status",
   "personal_api_contains",
   "personal_api_devices",

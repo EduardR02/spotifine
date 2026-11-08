@@ -263,13 +263,15 @@ pub(crate) fn is_transient(error: &str) -> bool {
     matches!(error, RATE_LIMITED | UNAVAILABLE | UNREACHABLE)
 }
 
-/// A player answer: `None` for an empty body (204 means nothing is playing).
-pub(crate) async fn read_player_response(response: reqwest::Response) -> Result<Option<serde_json::Value>, String> {
+/// Reads carry JSON; successful Player writes carry no data contract and may
+/// return an opaque acknowledgement instead of JSON (shuffle and repeat).
+pub(crate) async fn read_player_response(response: reqwest::Response, method: &Method) -> Result<Option<serde_json::Value>, String> {
     if response.status() == StatusCode::NO_CONTENT {
         return Ok(None);
     }
     let bytes = response.bytes().await.map_err(|_| UNREACHABLE.to_owned())?;
-    if bytes.is_empty() {
+    // Consume acknowledgements too so the connection remains reusable.
+    if method != Method::GET || bytes.is_empty() {
         return Ok(None);
     }
     serde_json::from_slice(&bytes).map(Some).map_err(|_| "Spotify returned an invalid player response".to_owned())
@@ -583,8 +585,8 @@ impl PersonalApi {
     /// [`player_path`]), never Spotify's account-wide active session.
     pub async fn player(&self, app: &AppHandle, method: Method, path: &str, body: Option<serde_json::Value>) -> Result<Option<serde_json::Value>, String> {
         let _operation = self.operation.lock().await;
-        let response = self.request(app, true, method, path, None, body).await?;
-        read_player_response(response).await
+        let response = self.request(app, true, method.clone(), path, None, body).await?;
+        read_player_response(response, &method).await
     }
 
     pub async fn account_changed(&self, app: &AppHandle, username: &str) {
@@ -725,6 +727,36 @@ mod tests {
                     assert_eq!(token.expires_in, 3600);
                 }
             }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn player_write_acknowledgements_are_not_json_but_reads_remain_strict() {
+        let http = Client::builder().no_proxy().build().unwrap();
+        for (method, status, body, expected) in [
+            (Method::PUT, 200, "opaque-player-acknowledgment", Ok(None)),
+            (Method::POST, 200, "opaque-player-acknowledgment", Ok(None)),
+            (Method::GET, 200, "opaque-player-acknowledgment", Err("Spotify returned an invalid player response")),
+            (Method::GET, 200, "{\"is_playing\":true}", Ok(Some(serde_json::json!({"is_playing": true})))),
+            (Method::GET, 204, "", Ok(None)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = Url::parse(&format!("http://{}/v1/me/player", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.windows(4).any(|part| part == b"\r\n\r\n") { break; }
+                }
+                stream.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let response = api_request(&http, "fixture", method.clone(), url, None).send().await.unwrap();
+            assert_eq!(read_player_response(response, &method).await, expected.map_err(str::to_owned));
             server.await.unwrap();
         }
     }

@@ -144,6 +144,16 @@ impl Default for TrackRef {
     }
 }
 
+/// A discovered Spotify Connect receiver. Network endpoints and credentials
+/// remain inside the engine; activation accepts only this opaque device id.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectDevice {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
 /// Longest request line the engine reads, its newline included. A longer one
 /// is answered with an error that carries no request id, so the sender must
 /// refuse it before writing: nothing would ever answer its pending request.
@@ -160,6 +170,10 @@ pub struct Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     Status,
+    /// Bounded, explicitly requested LAN discovery; answered with device data.
+    DiscoverConnectDevices,
+    /// Pairs a previously discovered receiver with the authenticated account.
+    ActivateConnectDevice { device_id: String },
     /// Retires audio/cache producers before the shell removes cached files.
     ClearAudioCache,
     PlayQueue {

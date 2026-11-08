@@ -97,15 +97,21 @@ export async function frontendControlRegressions() {
     check(discoveries === 1, "device discovery begins");
     personal.status = { ...oldPersonal, connected: false };
     await settle();
-    answerDevices([]);
+    answerDevices({ devices: [], discovery_error: null });
     await settle();
     personal.status = oldPersonal;
     await settle();
     document.querySelector(".device-btn").click();
     await settle();
     check(discoveries === 2, "reactivation can start discovery again");
-    answerDevices([]);
+    answerDevices({
+      devices: [{ id: "receiver", name: "Living room", type: "AVR", is_restricted: false }],
+      discovery_error: "Local network access denied",
+    });
     await settle();
+    check(document.querySelector(".device-error")?.textContent.includes("Local network access denied"), "discovery failure is visible alongside usable devices");
+    const receiver = [...document.querySelectorAll(".device-row")].find((row) => row.textContent.includes("Living room"));
+    check(receiver && !receiver.disabled, "usable cloud device remains selectable after local discovery failure");
     results.push("Device discovery invalidation and reactivation");
 
     let answerTransfer;
@@ -125,7 +131,7 @@ export async function frontendControlRegressions() {
     await settle();
     document.querySelector(".device-btn").click();
     await settle();
-    answerDevices([]);
+    answerDevices({ devices: [], discovery_error: null });
     await settle();
     const local = document.querySelector(".device-row");
     check(!local.disabled, "reactivation clears stale transfer busy state");

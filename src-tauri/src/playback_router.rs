@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use reqwest::Method;
+use renderer_engine::protocol::ConnectDevice;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
@@ -36,6 +37,9 @@ const GRACE: Duration = Duration::from_secs(8);
 /// While the window is visible the device is read this often, playing or paused.
 const VISIBLE_POLL: Duration = Duration::from_secs(4);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Activation is complete only once Spotify exposes the receiver to Player.
+const CONNECT_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_VISIBILITY_POLL: Duration = Duration::from_millis(500);
 /// A start Spotify has not accepted by then is dropped: the selection waits
 /// for Play instead of starting long after it was made.
 const START_DEADLINE: Duration = Duration::from_secs(90);
@@ -85,6 +89,9 @@ pub(crate) struct EngineView {
 pub(crate) trait Host: Sync {
     /// One Spotify Web API request; `None` is an empty answer.
     fn spotify(&self, method: Method, path: String, body: Option<Value>) -> impl Future<Output = Result<Option<Value>, String>> + Send;
+    fn cloud_devices(&self) -> impl Future<Output = Result<Vec<Device>, String>> + Send;
+    fn discover_connect_devices(&self) -> impl Future<Output = Result<Vec<ConnectDevice>, String>> + Send;
+    fn activate_connect_device(&self, device_id: &str) -> impl Future<Output = Result<(), String>> + Send;
     /// Applies `op` to the engine queue, then reads the engine back.
     fn engine(&self, op: Option<EngineOp<'_>>) -> impl Future<Output = Result<EngineView, String>> + Send;
     fn exclusions(&self, context: &str) -> impl Future<Output = Result<Vec<String>, String>> + Send;
@@ -386,6 +393,29 @@ impl Pending {
     }
 }
 
+#[derive(Serialize)]
+pub struct DeviceDiscovery {
+    devices: Vec<Device>,
+    discovery_error: Option<String>,
+}
+
+fn merge_devices(mut devices: Vec<Device>, local: Result<Vec<ConnectDevice>, String>) -> DeviceDiscovery {
+    let mut seen = HashSet::new();
+    devices.retain(|device| device.id.as_ref().is_none_or(|id| seen.insert(id.clone())));
+    match local {
+        Ok(local) => {
+            for device in local {
+                if !seen.insert(device.id.clone()) { continue; }
+                devices.push(Device { id: Some(device.id), name: device.name, kind: device.kind,
+                    is_active: false, is_private_session: false, is_restricted: false,
+                    volume_percent: None, supports_volume: false });
+            }
+            DeviceDiscovery { devices, discovery_error: None }
+        }
+        Err(error) => DeviceDiscovery { devices, discovery_error: Some(error) },
+    }
+}
+
 pub struct PlaybackRouter {
     client: Arc<EngineClient>,
     personal: Arc<PersonalApi>,
@@ -404,10 +434,6 @@ impl PlaybackRouter {
     }
 
     pub fn is_remote(&self) -> bool { self.core.remote.lock().is_some() }
-
-    /// Whether Spotify devices are on (Settings). Off, the router serves only
-    /// This computer and nothing in it wakes.
-    pub fn devices_enabled(&self) -> bool { self.core.enabled.load(Ordering::Relaxed) }
 
     /// Turning devices off first brings playback on a device back here,
     /// paused, through the one hand-back path; the grant is left alone.
@@ -433,6 +459,10 @@ impl PlaybackRouter {
 
     pub async fn select(&self, app: &AppHandle, device_id: Option<String>) -> Result<(), String> {
         self.core.select(&self.host(app), device_id).await
+    }
+
+    pub async fn devices(&self, app: &AppHandle) -> Result<DeviceDiscovery, String> {
+        self.core.devices(&self.host(app)).await
     }
 
     /// Disconnect never resumes local audio or leaves a dormant remote timer.
@@ -671,6 +701,30 @@ impl Core {
         result
     }
 
+    async fn devices<H: Host>(&self, host: &H) -> Result<DeviceDiscovery, String> {
+        let _operation = self.operation.lock().await;
+        if !self.enabled.load(Ordering::Relaxed) { return Err(DEVICES_OFF.into()); }
+        // The account-bound device grant must succeed before any LAN work.
+        let devices = host.cloud_devices().await?;
+        Ok(merge_devices(devices, host.discover_connect_devices().await))
+    }
+
+    async fn connect_device<H: Host>(&self, host: &H, device_id: &str) -> Result<Device, String> {
+        if let Some(device) = host.cloud_devices().await?.into_iter().find(|device| device.id.as_deref() == Some(device_id)) {
+            return Ok(device);
+        }
+        host.activate_connect_device(device_id).await
+            .map_err(|error| format!("Could not activate the selected Spotify receiver: {error}"))?;
+        tokio::time::timeout(CONNECT_VISIBILITY_TIMEOUT, async {
+            loop {
+                if let Some(device) = host.cloud_devices().await?.into_iter().find(|device| device.id.as_deref() == Some(device_id)) {
+                    return Ok(device);
+                }
+                tokio::time::sleep(CONNECT_VISIBILITY_POLL).await;
+            }
+        }).await.map_err(|_| "The receiver was activated but did not become available on Spotify; check its network connection and refresh devices".to_owned())?
+    }
+
     async fn select_locked<H: Host>(&self, host: &H, device_id: Option<String>) -> Result<(), String> {
         let Some(device_id) = device_id.filter(|id| !id.is_empty()) else {
             return self.return_local(host).await;
@@ -688,11 +742,7 @@ impl Core {
             // Reselecting a staged queue must not adopt an unrelated session there.
             return if kind == Kind::Prepared { Ok(()) } else { self.sync(host).await };
         }
-        let devices = host.spotify(Method::GET, "me/player/devices".into(), None).await?.unwrap_or_default();
-        let devices: Vec<Device> = serde_json::from_value(devices["devices"].clone())
-            .map_err(|_| "Spotify returned an invalid devices response".to_owned())?;
-        let device = devices.into_iter().find(|device| device.id.as_deref() == Some(&device_id))
-            .ok_or("Spotify device is unavailable; open Spotify there and refresh devices")?;
+        let device = self.connect_device(host, &device_id).await?;
         if device.is_restricted { return Err("Spotify does not allow controlling this device".into()); }
         if let Some((_, kind, playing)) = selected {
             // Spotify moves its whole session — window, position and all.
@@ -1858,6 +1908,10 @@ impl Host for AppHost<'_> {
         self.personal.player(self.app, method, &path, body).await
     }
 
+    async fn cloud_devices(&self) -> Result<Vec<Device>, String> { self.personal.devices(self.app).await }
+    async fn discover_connect_devices(&self) -> Result<Vec<ConnectDevice>, String> { self.client.discover_connect_devices().await }
+    async fn activate_connect_device(&self, device_id: &str) -> Result<(), String> { self.client.activate_connect_device(device_id).await }
+
     async fn engine(&self, op: Option<EngineOp<'_>>) -> Result<EngineView, String> {
         // Subscribed before the command: the engine answers a command first
         // and publishes the state it produced right after.
@@ -1957,8 +2011,10 @@ mod tests {
         player: Option<Value>,
         queue: Vec<Value>,
         devices: Option<Vec<Value>>,
+        device_responses: VecDeque<Result<Vec<Value>, u16>>,
         failures: std::collections::VecDeque<u16>,
         write_failures: std::collections::VecDeque<u16>,
+        write_acknowledgement: Option<String>,
         queue_failures: std::collections::VecDeque<u16>,
         log: Vec<(String, String, Option<Value>)>,
     }
@@ -2014,16 +2070,22 @@ mod tests {
                                 Some(status) => (status, None),
                                 None => spotify.player.clone().map_or((204, None), |player| (200, Some(player))),
                             },
-                            ("GET", "me/player/devices") => (200, Some(json!({"devices": spotify.devices.clone().unwrap_or_else(|| vec![device()])}))),
+                            ("GET", "me/player/devices") => match spotify.device_responses.pop_front() {
+                                Some(Ok(devices)) => (200, Some(json!({"devices": devices}))),
+                                Some(Err(status)) => (status, None),
+                                None => (200, Some(json!({"devices": spotify.devices.clone().unwrap_or_else(|| vec![device()])}))),
+                            },
                             ("GET", "me/player/queue") => match spotify.queue_failures.pop_front() {
                                 Some(status) => (status, None),
                                 None => (200, Some(json!({"queue": spotify.queue}))),
                             },
-                            _ => (spotify.write_failures.pop_front().unwrap_or(204), None),
+                            _ => (spotify.write_failures.pop_front().unwrap_or(if spotify.write_acknowledgement.is_some() { 200 } else { 204 }), None),
                         }
                     };
-                    let body = answer.map(|answer| answer.to_string()).unwrap_or_default();
-                    stream.write_all(format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    let body = answer.map(|answer| answer.to_string()).unwrap_or_else(|| {
+                        if method == "GET" { String::new() } else { spotify.lock().write_acknowledgement.clone().unwrap_or_default() }
+                    });
+                    stream.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                 });
             }
         });
@@ -2102,15 +2164,34 @@ mod tests {
         engine: Mutex<FakeEngine>,
         local_shown: Mutex<u32>,
         events: Mutex<Vec<Value>>,
+        discovery: Mutex<Result<Vec<ConnectDevice>, String>>,
+        discoveries: Mutex<usize>,
+        activation: Mutex<Result<(), String>>,
+        activations: Mutex<Vec<String>>,
+        device_read_state: Mutex<Vec<(bool, usize)>>,
     }
 
     impl Host for TestHost {
         async fn spotify(&self, method: Method, path: String, body: Option<Value>) -> Result<Option<Value>, String> {
             let url = url::Url::parse(&format!("{}/v1/{path}", self.base)).unwrap();
-            let response = personal_api::api_request(&self.http, "fixture", method, url, body).send().await
+            let response = personal_api::api_request(&self.http, "fixture", method.clone(), url, body).send().await
                 .map_err(|_| personal_api::UNREACHABLE.to_owned())?;
             if !response.status().is_success() { return Err(personal_api::spotify_error(response.status())); }
-            personal_api::read_player_response(response).await
+            personal_api::read_player_response(response, &method).await
+        }
+        async fn cloud_devices(&self) -> Result<Vec<Device>, String> {
+            self.device_read_state.lock().push((self.engine.lock().playing, self.spotify.lock().writes().len()));
+            let response = self.spotify(Method::GET, "me/player/devices".into(), None).await?.unwrap_or_default();
+            serde_json::from_value(response["devices"].clone()).map_err(|_| "Spotify returned an invalid devices response".into())
+        }
+        async fn discover_connect_devices(&self) -> Result<Vec<ConnectDevice>, String> {
+            *self.discoveries.lock() += 1;
+            // Move rather than requiring the protocol DTO to implement Clone.
+            std::mem::replace(&mut *self.discovery.lock(), Ok(Vec::new()))
+        }
+        async fn activate_connect_device(&self, device_id: &str) -> Result<(), String> {
+            self.activations.lock().push(device_id.into());
+            self.activation.lock().clone()
         }
         async fn engine(&self, op: Option<EngineOp<'_>>) -> Result<EngineView, String> { Ok(self.engine.lock().apply(op)) }
         async fn exclusions(&self, _context: &str) -> Result<Vec<String>, String> { Ok(self.engine.lock().excluded.iter().cloned().collect()) }
@@ -2130,8 +2211,174 @@ mod tests {
         let engine = FakeEngine { rows: (0..rows).map(|row| track(&format!("t{row}"))).collect(), current: Some(0), repeat: "off".into(),
             revision: 1, playing, position_ms: 0, volume: 50, ops: Vec::new(), excluded: HashSet::new() };
         let host = TestHost { base, http: reqwest::Client::builder().no_proxy().build().unwrap(), spotify, engine: Mutex::new(engine),
-            local_shown: Mutex::new(0), events: Mutex::new(Vec::new()) };
+            local_shown: Mutex::new(0), events: Mutex::new(Vec::new()), discovery: Mutex::new(Ok(Vec::new())),
+            discoveries: Mutex::new(0), activation: Mutex::new(Err("Receiver was not discovered; refresh devices".into())),
+            activations: Mutex::new(Vec::new()), device_read_state: Mutex::new(Vec::new()) };
         (Core::default(), host)
+    }
+
+    fn receiver() -> ConnectDevice {
+        ConnectDevice { id: "receiver".into(), name: "Living room".into(), kind: "AVR".into() }
+    }
+
+    fn cloud_receiver() -> Value {
+        let mut receiver = device();
+        receiver["id"] = json!("receiver");
+        receiver["name"] = json!("Living room");
+        receiver["type"] = json!("AVR");
+        receiver
+    }
+
+    #[test]
+    fn local_discovery_merges_by_id_without_overriding_cloud_capabilities() {
+        let mut cloud = cloud_receiver();
+        cloud["is_restricted"] = json!(true);
+        cloud["volume_percent"] = json!(71);
+        cloud["name"] = json!("Cloud name");
+        let devices = vec![serde_json::from_value(cloud.clone()).unwrap(), serde_json::from_value(cloud.clone()).unwrap()];
+        let result = merge_devices(devices, Ok(vec![receiver(), receiver(),
+            ConnectDevice { id: "other".into(), name: "Kitchen".into(), kind: "Speaker".into() }]));
+        assert_eq!(result.devices.len(), 2);
+        assert_eq!(serde_json::to_value(&result.devices[0]).unwrap(), cloud);
+        assert_eq!(result.devices[1].id.as_deref(), Some("other"));
+        assert_eq!(result.devices[1].volume_percent, None);
+        assert!(!result.devices[1].supports_volume);
+        assert!(result.discovery_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_keeps_cloud_devices_and_exposes_lan_errors() {
+        let (core, host) = fixture(2, true).await;
+        *host.discovery.lock() = Err("Local network access denied".into());
+        let result = core.devices(&host).await.unwrap();
+        assert_eq!(result.devices.len(), 1);
+        assert_eq!(result.devices[0].id.as_deref(), Some("phone"));
+        assert_eq!(result.discovery_error.as_deref(), Some("Local network access denied"));
+        assert_eq!(*host.discoveries.lock(), 1);
+        assert!(host.engine.lock().playing);
+        assert!(host.spotify.lock().writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_or_unauthorized_devices_never_discover_or_activate() {
+        for disabled in [false, true] {
+            let (core, host) = fixture(2, true).await;
+            if disabled { core.enabled.store(false, Ordering::Relaxed); }
+            host.spotify.lock().device_responses.extend([Err(403), Err(403)]);
+            assert!(core.devices(&host).await.is_err());
+            assert!(core.select(&host, Some("receiver".into())).await.is_err());
+            assert_eq!(*host.discoveries.lock(), 0);
+            assert!(host.activations.lock().is_empty());
+            assert!(host.engine.lock().playing);
+            assert!(host.spotify.lock().writes().is_empty());
+            if disabled { assert!(host.spotify.lock().log.is_empty()); }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_only_receiver_activates_then_waits_for_cloud_before_queue_transfer() {
+        let (core, host) = fixture(3, true).await;
+        *host.activation.lock() = Ok(());
+        host.spotify.lock().device_responses.extend([Ok(vec![]), Ok(vec![]), Ok(vec![cloud_receiver()])]);
+        core.select(&host, Some("receiver".into())).await.unwrap();
+        assert_eq!(&*host.activations.lock(), &["receiver"]);
+        assert_eq!(&*host.device_read_state.lock(), &[(true, 0), (true, 0), (true, 0)],
+            "local playback and all transfers must wait for cloud visibility");
+        assert!(!host.engine.lock().playing);
+        assert_eq!(core.snapshot().unwrap().output_device_id, "receiver");
+        assert_eq!(core.snapshot().unwrap().volume, 35);
+        let spotify = host.spotify.lock();
+        assert_eq!(spotify.reads_of("me/player/devices"), 3);
+        let play = spotify.last_play().unwrap();
+        assert_eq!(uris(&play), ["spotify:track:t0", "spotify:track:t1", "spotify:track:t2"]);
+        assert_eq!(spotify.writes()[0], "PUT me/player");
+    }
+
+    #[tokio::test]
+    async fn activation_failure_preserves_local_playback_without_transfer() {
+        let (core, host) = fixture(2, true).await;
+        *host.activation.lock() = Err("Receiver refused activation".into());
+        let error = core.select(&host, Some("receiver".into())).await.unwrap_err();
+        assert!(error.contains("Receiver refused activation"));
+        assert_eq!(&*host.activations.lock(), &["receiver"]);
+        assert!(host.engine.lock().playing);
+        assert!(host.spotify.lock().writes().is_empty());
+        assert!(core.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn activation_visibility_authorization_failure_does_not_pause_or_transfer() {
+        let (core, host) = fixture(2, true).await;
+        *host.activation.lock() = Ok(());
+        host.spotify.lock().device_responses.extend([Ok(vec![]), Err(403)]);
+        let error = core.select(&host, Some("receiver".into())).await.unwrap_err();
+        assert_eq!(error, personal_api::spotify_error(reqwest::StatusCode::FORBIDDEN));
+        assert!(host.engine.lock().playing);
+        assert!(host.spotify.lock().writes().is_empty());
+        assert!(core.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn activation_visibility_deadline_preserves_local_playback() {
+        let (core, host) = fixture(2, true).await;
+        *host.activation.lock() = Ok(());
+        let error = core.select(&host, Some("receiver".into())).await.unwrap_err();
+        assert!(error.contains("did not become available"));
+        assert_eq!(&*host.activations.lock(), &["receiver"]);
+        assert!(host.engine.lock().playing);
+        assert!(host.spotify.lock().writes().is_empty());
+        assert!(core.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn cloud_devices_skip_activation_and_keep_restrictions() {
+        for restricted in [false, true] {
+            let (core, host) = fixture(2, true).await;
+            let mut target = cloud_receiver();
+            target["is_restricted"] = json!(restricted);
+            host.spotify.lock().devices = Some(vec![target]);
+            let result = core.select(&host, Some("receiver".into())).await;
+            assert_eq!(result.is_err(), restricted);
+            assert!(host.activations.lock().is_empty());
+            assert_eq!(*host.discoveries.lock(), 0);
+            if restricted {
+                assert!(host.engine.lock().playing);
+                assert!(host.spotify.lock().writes().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_receiver_activation_preserves_selected_output_and_queue() {
+        let (core, host) = owned(3).await;
+        host.spotify.lock().log.clear();
+        let before = core.snapshot().unwrap();
+        assert!(core.select(&host, Some("receiver".into())).await.is_err());
+        let after = core.snapshot().unwrap();
+        assert_eq!(after.output_device_id, before.output_device_id);
+        assert_eq!(after.current_index, before.current_index);
+        assert_eq!(after.playing, before.playing);
+        assert!(host.spotify.lock().writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn taking_over_phone_playback_accepts_opaque_success_acknowledgements_and_starts_our_queue() {
+        let (core, host) = fixture(3, true).await;
+        {
+            let mut spotify = host.spotify.lock();
+            spotify.player = Some(reading("spotify:track:phone-started", true, 9000));
+            spotify.write_acknowledgement = Some("opaque-player-acknowledgment".into());
+        }
+        core.select(&host, Some("phone".into())).await.unwrap();
+        let state = core.snapshot().unwrap();
+        assert!(state.error.is_empty());
+        assert!(state.playing);
+        assert!(!host.engine.lock().playing);
+        let play = host.spotify.lock().last_play().unwrap();
+        assert_eq!(uris(&play), ["spotify:track:t0", "spotify:track:t1", "spotify:track:t2"]);
+        core.run(&host, Action::Pause).await.unwrap();
+        core.run(&host, Action::Play).await.unwrap();
+        assert!(core.snapshot().unwrap().playing);
     }
 
     #[tokio::test]
@@ -2686,6 +2933,9 @@ mod tests {
             async fn spotify(&self, method: Method, path: String, body: Option<Value>) -> Result<Option<Value>, String> {
                 self.base.spotify(method, path, body).await
             }
+            async fn cloud_devices(&self) -> Result<Vec<Device>, String> { self.base.cloud_devices().await }
+            async fn discover_connect_devices(&self) -> Result<Vec<ConnectDevice>, String> { self.base.discover_connect_devices().await }
+            async fn activate_connect_device(&self, device_id: &str) -> Result<(), String> { self.base.activate_connect_device(device_id).await }
             async fn engine(&self, op: Option<EngineOp<'_>>) -> Result<EngineView, String> {
                 let mut view = self.base.engine(op).await?;
                 let mut state = view.state.take().unwrap_or_else(|| self.base.local_state());

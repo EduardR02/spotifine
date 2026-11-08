@@ -970,7 +970,7 @@ const mock = {
       }
       case "personal_api_devices":
         if (!settings.devices_enabled) throw new Error("Spotify devices are turned off in Settings");
-        return clone(outputDevices);
+        return { devices: clone(outputDevices), discovery_error: null };
       case "select_output": {
         if (args.deviceId && !settings.devices_enabled) throw new Error("Spotify devices are turned off in Settings");
         const device = args.deviceId ? outputDevices.find((device) => device.id === args.deviceId) : null;

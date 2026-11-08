@@ -3,6 +3,7 @@ mod auth;
 mod browse;
 mod cache_index;
 mod collection;
+mod connect;
 mod customization;
 mod edits;
 mod engine;
@@ -151,6 +152,9 @@ fn main() -> ExitCode {
         }
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        // Upstream token providers print complete credentials at trace level.
+        // Even an explicit RUST_LOG must not put account tokens on stderr.
+        .parse_filters("librespot_core::login5=warn,librespot_core::token=warn,librespot_core::spclient=warn")
         .target(env_logger::Target::Stderr)
         .init();
     // Installed after the logger: every panic (any thread, including
@@ -238,6 +242,7 @@ async fn run(
     cache_index::install(state_directory.join("audio-index.json"), cached_files);
     let (mut waveform_service, mut waveform_receiver) =
         WaveformService::new(cache.clone(), &state_directory)?;
+    let connect_service = connect::ConnectService::default();
 
     let mut engine = Engine::new(
         writer,
@@ -282,6 +287,18 @@ async fn run(
                         }
                         let request_id = request.request_id;
                         match request.command {
+                            Command::DiscoverConnectDevices => {
+                                let service = connect_service.clone();
+                                spawn_browse(&engine, request_id, "discover_connect_devices", move |session| async move {
+                                    service.discover(&session).await
+                                });
+                            }
+                            Command::ActivateConnectDevice { device_id } => {
+                                let service = connect_service.clone();
+                                spawn_edit(&engine, request_id, "activate_connect_device", move |session| async move {
+                                    service.activate(&session, &device_id).await
+                                });
+                            }
                             Command::Shutdown => {
                                 let cancelled: Result<TrackWaveform, String> =
                                     Err("waveform service is shutting down".to_owned());

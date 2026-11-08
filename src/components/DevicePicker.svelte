@@ -12,6 +12,7 @@
   let devices = $state([]);
   let loading = $state(false);
   let error = $state("");
+  let discoveryError = $state("");
   let transferring = $state("");
   let generation = 0;
 
@@ -30,10 +31,12 @@
     const current = generation;
     loading = true;
     error = "";
+    discoveryError = "";
     try {
-      const list = await personalApi.devices();
+      const result = await personalApi.devices();
       if (current !== generation) return;
-      devices = Array.isArray(list) ? list : [];
+      devices = result.devices;
+      discoveryError = result.discovery_error ?? "";
     } catch (reason) {
       if (current === generation) error = String(reason);
     } finally {
@@ -153,6 +156,9 @@
         {/each}
         {#if !devices.length && !error}
           <p class="device-note">{loading ? "Looking for devices…" : "No other devices found"}</p>
+        {/if}
+        {#if discoveryError}
+          <p class="device-error" role="alert" title={discoveryError}>Local discovery: {discoveryError}</p>
         {/if}
         {#if error || (remote && playback.error)}
           <p class="device-error" role="alert" title={error || playback.error}>{error || playback.error}</p>

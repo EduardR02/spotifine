@@ -2139,6 +2139,8 @@ impl Engine {
         }
         match command {
             Command::Status
+            | Command::DiscoverConnectDevices
+            | Command::ActivateConnectDevice { .. }
             | Command::ClearAudioCache
             | Command::GetHistory { .. }
             | Command::ClearHistory
