@@ -78,40 +78,18 @@ impl ConnectService {
         let endpoints = tokio::task::spawn_blocking(browse_endpoints).await
             .map_err(|_| "Local Spotify discovery worker failed")??;
         require_session(session)?;
-        let mut probes = stream::iter(endpoints.into_iter().map(|endpoint| async move {
-            let client = endpoint.client()?;
-            let info = get_info(&client, &endpoint).await?;
-            Ok::<_, String>((endpoint, info))
-        })).buffer_unordered(8);
-        let deadline = tokio::time::Instant::now() + PROBE_TIME;
         let mut devices = Vec::new();
-        let mut last_error = None;
-        loop {
-            match tokio::time::timeout_at(deadline, probes.next()).await {
-                Ok(Some(Ok((endpoint, info)))) => {
-                    if !registry.endpoints.contains_key(&info.device_id) {
-                        devices.push(ConnectDevice {
-                            id: info.device_id.clone(), name: info.remote_name, kind: info.device_type,
-                        });
-                        registry.endpoints.insert(info.device_id, endpoint);
-                    }
-                }
-                Ok(Some(Err(error))) => last_error = Some(error),
-                Ok(None) => break,
-                Err(_) => {
-                    last_error = Some("Local Spotify receiver inspection timed out".into());
-                    break;
-                }
+        for (endpoint, info) in inspect_receivers(endpoints).await {
+            if !registry.endpoints.contains_key(&info.device_id) {
+                devices.push(ConnectDevice {
+                    id: info.device_id.clone(), name: info.remote_name, kind: info.device_type,
+                });
+                registry.endpoints.insert(info.device_id, endpoint);
             }
         }
         if let Err(error) = require_session(session) {
             *registry = Registry::default();
             return Err(error);
-        }
-        // One broken advertisement (including the desktop launcher) must not
-        // erase healthy receivers. If none can be inspected, explain why.
-        if devices.is_empty() {
-            if let Some(error) = last_error { return Err(error); }
         }
         registry.owner = Some(session.clone());
         registry.discovered_at = Some(Instant::now());
@@ -134,6 +112,23 @@ fn require_session(session: &Session) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Advertisements are hints: sleeping receivers and desktop launchers may not
+/// answer getInfo. Only responsive Spotify receivers belong in search results;
+/// the discovery deadline is normal completion, not an activation failure.
+async fn inspect_receivers(endpoints: Vec<Endpoint>) -> Vec<(Endpoint, Info)> {
+    let mut probes = stream::iter(endpoints.into_iter().map(|endpoint| async move {
+        let client = endpoint.client()?;
+        let info = get_info(&client, &endpoint).await?;
+        Ok::<_, String>((endpoint, info))
+    })).buffer_unordered(8);
+    let deadline = tokio::time::Instant::now() + PROBE_TIME;
+    let mut receivers = Vec::new();
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, probes.next()).await {
+        if let Ok(receiver) = result { receivers.push(receiver); }
+    }
+    receivers
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -213,9 +208,8 @@ fn browse_endpoints() -> Result<Vec<Endpoint>, String> {
             match event {
                 ServiceEvent::ServiceResolved(info) => {
                     if services.len() < MAX_ENDPOINTS || services.contains_key(info.get_fullname()) {
-                        match service_endpoints(&info) {
-                            Ok(endpoints) => { services.insert(info.get_fullname().to_owned(), endpoints); }
-                            Err(error) => discovery_error = Some(error),
+                        if let Ok(endpoints) = service_endpoints(&info) {
+                            services.insert(info.get_fullname().to_owned(), endpoints);
                         }
                     }
                 }
@@ -638,6 +632,53 @@ mod tests {
         assert!(registry.endpoint(&other, "receiver").is_err());
         session.shutdown();
         assert!(registry.endpoint(&session, "receiver").is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_discovery_timeout_is_an_empty_result() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint { address: listener.local_addr().unwrap(), path: "/zc".into() };
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let receivers = inspect_receivers(vec![endpoint]).await;
+        server.abort();
+        assert!(receivers.is_empty());
+    }
+
+    async fn discovery_receiver(body: &str) -> (Endpoint, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint { address: listener.local_addr().unwrap(), path: "/zc".into() };
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn connect_discovery_skips_invalid_advertisements_and_keeps_receivers() {
+        let (invalid, invalid_server) = discovery_receiver("not a Spotify receiver").await;
+        assert!(inspect_receivers(vec![invalid]).await.is_empty());
+        invalid_server.await.unwrap();
+
+        let (invalid, invalid_server) = discovery_receiver("not a Spotify receiver").await;
+        let (receiver, receiver_server) = discovery_receiver(r#"{
+            "status":101,"spotifyError":0,"deviceID":"receiver",
+            "remoteName":"Living room","deviceType":"AVR"
+        }"#).await;
+        let receivers = inspect_receivers(vec![invalid, receiver.clone()]).await;
+        invalid_server.await.unwrap();
+        receiver_server.await.unwrap();
+        assert_eq!(receivers.len(), 1);
+        assert!(receivers[0].0 == receiver);
+        assert_eq!(receivers[0].1.device_id, "receiver");
+        assert_eq!(receivers[0].1.remote_name, "Living room");
     }
 
     async fn serve_response(response: String) -> Result<Status, String> {
