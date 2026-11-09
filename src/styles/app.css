@@ -2262,13 +2262,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .p-body.no-mark { --now-mark-gone: var(--now-mark); }
 .p-body.compact-now { grid-template-columns: max-content minmax(0, 1fr) max-content; }
 .p-body.no-now { grid-template-columns: minmax(0, 1fr) max-content; }
-/* A narrower bar shortens the volume rail first; a genuinely narrow one
-   folds the identity to its cover and the volume to its mute button, and
-   draws the transport in. The fold outranks the marks' own component rules
-   by specificity, not by which stylesheet happens to load last. */
-@container player (max-width: 900px) {
-  .p-body .vol { width: 64px; }
-}
+/* The volume rail keeps its full length down to an 800px bar, then shortens
+   with the bar to 64px where it folds at 680px. A genuinely narrow bar folds
+   the identity to its cover and the volume to its mute button, and draws the
+   transport in. The fold outranks the marks' own component rules by
+   specificity, not by which stylesheet happens to load last. */
+.p-body .vol { width: clamp(64px, 64px + (100cqi - 680px) * 32 / 120, 96px); }
 @container player (max-width: 680px) {
   .p-body { grid-template-columns: max-content minmax(0, 1fr) max-content; }
   .p-body > .p-now > :is(.p-meta, .p-saved, .p-heart, .p-edit-indicator) { display: none; }
