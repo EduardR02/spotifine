@@ -99,7 +99,7 @@ const UNAVAILABLE_STOP_LIMIT: usize = 3;
 const LOAD_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 
 /// How long a row whose audio key Spotify withheld waits before each further
-/// attempt, the last step repeating for as long as the queue stays playing.
+/// attempt, the last step repeating up to [`KEY_RETRY_LIMIT`].
 ///
 /// Spotify paces key requests: a burst of new tracks is answered, and then
 /// roughly one more key every half minute until the burst allowance refills.
@@ -114,10 +114,17 @@ const KEY_RETRY_LADDER: [Duration; 4] = [
     Duration::from_secs(30),
 ];
 
-/// What the banner says while a withheld key holds the current row, playing
-/// and paused.
+/// How many rungs of [`KEY_RETRY_LADDER`] a held row climbs before it is held
+/// paused instead: 5 + 10 + 20 + 7 × 30 s, about four minutes. Pacing clears
+/// well within that; a key still refused after it is not coming back on its
+/// own, and asking every half minute forever would only feed the refusal.
+const KEY_RETRY_LIMIT: usize = 10;
+
+/// What the banner says while a withheld key holds the current row: playing,
+/// paused, and given up on after [`KEY_RETRY_LIMIT`].
 const KEY_WAIT_MESSAGE: &str = "Spotify needs a moment before this song can start. It starts by itself.";
 const KEY_WAIT_PAUSED_MESSAGE: &str = "Spotify needs a moment before this song can start. Press play to try again.";
+const KEY_REFUSED_MESSAGE: &str = "Spotify isn't handing out this song right now. Press play to try again.";
 
 /// How much of a track may be left unplayed for its end to still be the end.
 ///
@@ -303,12 +310,16 @@ pub struct Engine {
     /// to "is this track actually playing", and the difference between a track
     /// that ended and a track that never started.
     current_load_produced_audio: bool,
-    /// When the current row should be loaded once more after failing, and how
-    /// many automatic reloads it has already had. See [`LOAD_RETRY_BACKOFF`]
-    /// and [`KEY_RETRY_LADDER`]. Both are cleared by any other load, so a user
-    /// action that moves the playhead cancels a pending retry by construction.
+    /// When the current row should be loaded once more after failing, and the
+    /// retries it has been given: its one retry after a failed load (see
+    /// [`LOAD_RETRY_BACKOFF`]) and the rungs of [`KEY_RETRY_LADDER`] it has
+    /// climbed, counted apart so neither spends the other. Each is taken when
+    /// its retry is armed, and all are cleared by any load other than the
+    /// retry itself, so a user action that moves the playhead cancels a
+    /// pending retry by construction.
     retry_current_at: Option<Instant>,
-    current_row_retries: usize,
+    failure_retried: bool,
+    key_retries: usize,
     /// Whether librespot has said the current track is close enough to its end
     /// for the next one to be worth fetching. See [`Engine::preload_next`].
     preload_armed: bool,
@@ -630,7 +641,8 @@ impl Engine {
             recent_unavailable: VecDeque::new(),
             current_load_produced_audio: false,
             retry_current_at: None,
-            current_row_retries: 0,
+            failure_retried: false,
+            key_retries: 0,
             preload_armed: false,
             next_reconnect: None,
             reconnect_backoff: RECONNECT_BACKOFF_MIN,
@@ -965,7 +977,7 @@ impl Engine {
             .filter(|_| self.player.is_none())
             .filter(|_| self.audio_probe_generation != Some(self.generation))
             .and_then(|unavailable| unavailable.retry_at);
-        let retry = self.state.playing.then_some(self.retry_current_at).flatten();
+        let retry = self.retry_deadline();
         let preload = if active && self.current_load_produced_audio && !self.loading_failed
             && !self.preload_armed
         {
@@ -2317,7 +2329,7 @@ impl Engine {
         self.state.playing = false;
         self.current_needs_load = self.state.current_index.is_some();
         self.current_load_produced_audio = false;
-        self.retry_current_at = None;
+        self.forget_row_retries();
         self.preload_armed = false;
         if let Some(player) = &self.player {
             if let Err(error) = player.stop_and_wait().await {
@@ -2356,8 +2368,7 @@ impl Engine {
         self.loaded_track_id = None;
         self.current_needs_load = false;
         self.current_load_produced_audio = false;
-        self.loading_failed = false;
-        self.retry_current_at = None;
+        self.forget_current_failure();
         self.preload_armed = false;
         self.drain_stop_at = None;
         Ok(true)
@@ -2974,8 +2985,7 @@ impl Engine {
         self.state.playing = false;
         self.history.clear();
         self.shuffle_pool.clear();
-        self.clear_error();
-        self.loading_failed = false;
+        self.forget_current_failure();
         self.loop_pass = 1;
         self.current_needs_load = false;
         self.recent_track_changes.clear();
@@ -3329,7 +3339,7 @@ impl Engine {
         self.current_needs_load = true;
         self.current_load_produced_audio = false;
         self.loading_failed = false;
-        self.retry_current_at = None;
+        self.forget_row_retries();
         self.preload_armed = false;
         self.loop_decoder_eof = false;
         self.loop_jump_pending = false;
@@ -3845,6 +3855,7 @@ impl Engine {
                 self.state.playing = false;
                 self.update_position(0);
                 self.play_request_id = None;
+                self.forget_current_failure();
             }
             Some(current) if index == current => {
                 let start = current.min(self.state.queue.len() - 1);
@@ -3863,6 +3874,7 @@ impl Engine {
                     self.invalidate_audio_signals();
                     self.play_request_id = None;
                     self.current_needs_load = false;
+                    self.forget_current_failure();
                     self.state.error =
                         Some("no eligible tracks remain for automatic playback".to_owned());
                 }
@@ -3982,8 +3994,7 @@ impl Engine {
         // to remember to.
         self.current_load_produced_audio = false;
         self.preload_armed = false;
-        self.retry_current_at = None;
-        self.current_row_retries = 0;
+        self.forget_row_retries();
         // What the engine reports and what it asks librespot for are one
         // statement, made once, here. Callers used to set `playing` beside the
         // call, which let the two say different things — a track change loading
@@ -4146,7 +4157,8 @@ impl Engine {
         // The row gets one more attempt before it is given up on. See
         // [`LOAD_RETRY_BACKOFF`]: the failure is usually transient, and
         // skipping on the first one discards a working track.
-        if self.current_row_retries == 0 {
+        if !self.failure_retried {
+            self.failure_retried = true;
             self.retry_current_at = Some(Instant::now() + LOAD_RETRY_BACKOFF);
             // What the banner says has to be what is happening, and for the
             // next three seconds what is happening is a retry.
@@ -4175,7 +4187,8 @@ impl Engine {
     /// same, so the row is held — never skipped, never counted against the
     /// failure breaker, its cache never touched — and loaded again on
     /// [`KEY_RETRY_LADDER`] until a key arrives or the user picks something
-    /// else, which replaces it at once.
+    /// else, which replaces it at once. After [`KEY_RETRY_LIMIT`] rungs it is
+    /// held paused instead, for Play to try again.
     fn hold_current_for_key(&mut self, track_id: SpotifyUri, failure: AudioKeyFailure) -> bool {
         self.end_failed_load();
         // Pause wins, as it does for any failed load: nothing retries behind
@@ -4185,7 +4198,17 @@ impl Engine {
             eprintln!("transport: audio key for {track_id} {failure} while paused; holding this row");
             return true;
         }
-        let wait = KEY_RETRY_LADDER[self.current_row_retries.min(KEY_RETRY_LADDER.len() - 1)];
+        if self.key_retries >= KEY_RETRY_LIMIT {
+            self.state.playing = false;
+            self.state.error = Some(KEY_REFUSED_MESSAGE.to_owned());
+            eprintln!(
+                "transport: audio key for {track_id} {failure} after {} retries; holding this row paused",
+                self.key_retries,
+            );
+            return true;
+        }
+        let wait = KEY_RETRY_LADDER[self.key_retries.min(KEY_RETRY_LADDER.len() - 1)];
+        self.key_retries += 1;
         self.retry_current_at = Some(Instant::now() + wait);
         self.state.error = Some(KEY_WAIT_MESSAGE.to_owned());
         eprintln!(
@@ -4215,6 +4238,22 @@ impl Engine {
         self.invalidate_audio_signals();
     }
 
+    /// Cancels the current row's pending retry and the retries it was given.
+    fn forget_row_retries(&mut self) {
+        self.retry_current_at = None;
+        self.failure_retried = false;
+        self.key_retries = 0;
+    }
+
+    /// For a current row that is removed without a load replacing it: nothing
+    /// may retry a row that is gone, and what its failure said must not
+    /// outlive it.
+    fn forget_current_failure(&mut self) {
+        self.loading_failed = false;
+        self.forget_row_retries();
+        self.clear_error();
+    }
+
     /// Drives the two things a failing or recovering load needs a clock for.
     /// Called from the work timer when its preload or retry deadline is due, so
     /// no extra timer exists; both checks are a comparison on engine-local state.
@@ -4242,29 +4281,37 @@ impl Engine {
             self.preload_next();
         }
 
-        // A retry belongs to a queue that is still playing. Pause clears
-        // `state.playing` and that is the whole cancellation: the owner's
-        // complaint last time was a pause button that could not stop the
-        // cascade, and an armed timer that outlived it would be the same bug
-        // wearing a different hat.
-        let due = self
-            .retry_current_at
-            .is_some_and(|at| Instant::now() >= at && self.state.playing);
-        if !due {
+        if !self.retry_deadline().is_some_and(|at| Instant::now() >= at) {
             return armed;
         }
-        // `load_current` clears both fields, so the count is restored
-        // afterwards: it marks the load now in flight as one more automatic
-        // attempt at the same row.
-        let retries = self.current_row_retries + 1;
+        // `load_current` clears the row's retries, so they are restored
+        // afterwards: the load now in flight is the same row's retry, not a
+        // new start.
+        let (failure_retried, key_retries) = (self.failure_retried, self.key_retries);
         if let Err(error) = self.load_current(true) {
             self.retry_current_at = None;
             self.state.playing = false;
             self.state.error = Some(error);
             return true;
         }
-        self.current_row_retries = retries;
+        self.failure_retried = failure_retried;
+        self.key_retries = key_retries;
         true
+    }
+
+    /// When the armed retry may fire, if it may at all.
+    ///
+    /// A retry belongs to a queue that is still playing. Pause clears
+    /// `state.playing` and that is the whole cancellation: the owner's
+    /// complaint last time was a pause button that could not stop the
+    /// cascade, and an armed timer that outlived it would be the same bug
+    /// wearing a different hat. Nor does it fire into an audio outage, where
+    /// the load could only fail for want of a player and take the intent to
+    /// play with it; it stays armed and fires on the first tick after the
+    /// device is back.
+    fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_current_at
+            .filter(|_| self.state.playing && self.audio_unavailable.is_none())
     }
 
     fn take_next_index_with_skip(
@@ -4569,7 +4616,8 @@ impl Engine {
                 self.loop_jump_pending = false;
                 // An automatic retry keeps the message that announced it until
                 // the row plays; cleared here, it would blink at every attempt.
-                if self.current_row_retries == 0 {
+                // Any other load has cleared the row's retries.
+                if !self.failure_retried && self.key_retries == 0 {
                     self.clear_error();
                 }
                 self.state.position_ms != previous_position
@@ -4823,8 +4871,7 @@ impl Engine {
         self.loop_jump_pending = false;
         self.recent_track_changes.clear();
         self.current_load_produced_audio = false;
-        self.retry_current_at = None;
-        self.current_row_retries = 0;
+        self.forget_row_retries();
         self.preload_armed = false;
         self.drain_stop_at = None;
         self.mixer = None;
@@ -5026,7 +5073,8 @@ mod tests {
     use super::{
         AUDIO_BLOCKED_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MIN,
         AudioKeyFailure, AudioSignal, AuthFailure, AuthSignal, ConnectedSession, Engine,
-        KEY_RETRY_LADDER, KEY_WAIT_MESSAGE, KEY_WAIT_PAUSED_MESSAGE, LOAD_RETRY_BACKOFF,
+        KEY_REFUSED_MESSAGE, KEY_RETRY_LADDER, KEY_RETRY_LIMIT, KEY_WAIT_MESSAGE,
+        KEY_WAIT_PAUSED_MESSAGE, LOAD_RETRY_BACKOFF,
         PRELOAD_WATERMARK_MS, PlaybackHandles, PlaybackSpeeds, PlaybackState, PlayerSignal,
         RECONNECT_BACKOFF_MAX,
         RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
@@ -8432,7 +8480,7 @@ mod tests {
             Some(0),
             "the retry reloads the same row"
         );
-        assert_eq!(engine.current_row_retries, 1);
+        assert!(engine.failure_retried);
         assert!(engine.retry_current_at.is_none());
 
         // The retry fails too, and only now is the row given up on.
@@ -8478,7 +8526,7 @@ mod tests {
         );
         fire_due_retry(&mut engine);
         assert_eq!(engine.state.current_index, Some(0));
-        assert_eq!(engine.current_row_retries, 1);
+        assert!(engine.failure_retried);
     }
 
     /// The retry a failed row is owed has to ask for the position the row was
@@ -8528,7 +8576,7 @@ mod tests {
             engine.state.position_ms, 0,
             "the retry loads the row where it was asked to start, not at its end"
         );
-        assert_eq!(engine.current_row_retries, 1);
+        assert!(engine.failure_retried);
     }
 
     /// What the UI needs to stop projecting on its own: a playing row reports
@@ -8830,7 +8878,7 @@ mod tests {
             assert!(!engine.tick_playback_health(), "attempt {attempt}: not due yet");
             fire_due_retry(&mut engine);
             assert_eq!(engine.state.current_index, Some(0));
-            assert_eq!(engine.current_row_retries, attempt + 1);
+            assert_eq!(engine.key_retries, attempt + 1);
 
             let play_request_id = engine.play_request_id.expect("the retry loads the row");
             let track_id = SpotifyUri::from_uri(&engine.state.queue[0].uri).unwrap();
@@ -8856,7 +8904,7 @@ mod tests {
         assert_eq!(engine.state.current_index, Some(2));
         assert!(engine.play_request_id.is_some(), "the clicked row loads now");
         assert!(engine.retry_current_at.is_none(), "the held row's retry is gone");
-        assert_eq!(engine.current_row_retries, 0);
+        assert_eq!(engine.key_retries, 0);
         assert!(!engine.loading_failed);
         assert!(!engine.tick_playback_health(), "nothing reloads the row that was let go");
         assert_eq!(engine.state.current_index, Some(2));
@@ -8909,6 +8957,113 @@ mod tests {
         assert!(fail_current_row(&mut engine, 700));
         assert_eq!(engine.recent_unavailable.len(), 1);
         assert!(engine.invalidated_cache_ids.contains(&id), "an isolated real failure still is");
+    }
+
+    /// A failed load's one retry and the withheld key's ladder are counted
+    /// apart: a key retry does not spend the failed load's retry, and the
+    /// failed load's retry does not climb the ladder.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_withheld_key_and_a_failed_load_keep_their_own_retries() {
+        let (mut keyed_first, _keyed_probe) = engine_with_player();
+        keyed_first.state = five_track_state();
+        keyed_first.state.playing = true;
+        assert!(withhold_key(&mut keyed_first, 7, AudioKeyFailure::Refused));
+        fire_due_retry(&mut keyed_first);
+        assert!(fail_current_row(&mut keyed_first, 8));
+        assert_eq!(keyed_first.state.current_index, Some(0), "the failed load gets its retry, not a skip");
+        let left = keyed_first.retry_current_at.expect("a retry is armed").duration_since(Instant::now());
+        assert!(left <= LOAD_RETRY_BACKOFF);
+
+        let (mut failed_first, _failed_probe) = engine_with_player();
+        failed_first.state = five_track_state();
+        failed_first.state.playing = true;
+        assert!(fail_current_row(&mut failed_first, 7));
+        fire_due_retry(&mut failed_first);
+        assert!(withhold_key(&mut failed_first, 8, AudioKeyFailure::Refused));
+        let left = failed_first.retry_current_at.expect("a retry is armed").duration_since(Instant::now());
+        assert!(left <= KEY_RETRY_LADDER[0], "the key starts at the bottom of the ladder: {left:?}");
+    }
+
+    /// An armed retry does not fire into an audio outage, where its load could
+    /// only fail for want of a player and drop the intent to play. It stays
+    /// armed, wakes nothing while it waits, and fires once the device is back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retry_waits_out_an_audio_outage_and_fires_when_it_ends() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = five_track_state();
+        engine.state.playing = true;
+        assert!(withhold_key(&mut engine, 7, AudioKeyFailure::Refused));
+
+        let player = engine.player.take();
+        engine.audio_unavailable = Some(super::AudioUnavailable {
+            message: "no output device".to_owned(),
+            retry_at: None,
+        });
+        engine.retry_current_at = Some(Instant::now() - Duration::from_millis(1));
+        assert!(!engine.tick_playback_health(), "nothing fires into the outage");
+        assert!(engine.state.playing, "the intent to play survives it");
+        assert!(engine.retry_current_at.is_some(), "the retry stays armed");
+        assert!(engine.next_work_deadline().is_none_or(|at| at > Instant::now()),
+            "and wakes nothing while it waits");
+
+        engine.audio_unavailable = None;
+        engine.player = player;
+        assert!(engine.tick_playback_health(), "the retry fires on the first tick after it");
+        assert!(engine.state.playing);
+        assert!(engine.play_request_id.is_some(), "the row loads again");
+    }
+
+    /// A key still withheld after about four minutes of the ladder is not
+    /// pacing, and asking every half minute forever would only feed it. The
+    /// row is held paused instead, and Play starts the ladder over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_row_stops_asking_after_about_four_minutes() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = five_track_state();
+        engine.state.playing = true;
+
+        let mut waited = Duration::ZERO;
+        for attempt in 0..KEY_RETRY_LIMIT {
+            assert!(withhold_key(&mut engine, 800 + attempt as u64, AudioKeyFailure::Refused));
+            waited += KEY_RETRY_LADDER[attempt.min(KEY_RETRY_LADDER.len() - 1)];
+            fire_due_retry(&mut engine);
+        }
+        assert!(waited >= Duration::from_secs(4 * 60) && waited < Duration::from_secs(5 * 60), "{waited:?}");
+
+        assert!(withhold_key(&mut engine, 900, AudioKeyFailure::Refused));
+        assert!(!engine.state.playing, "the row is held paused");
+        assert_eq!(engine.state.current_index, Some(0));
+        assert!(engine.retry_current_at.is_none(), "nothing asks again on its own");
+        assert_eq!(engine.state.error.as_deref(), Some(KEY_REFUSED_MESSAGE));
+
+        assert_eq!(engine.play(), Ok(true));
+        assert!(engine.play_request_id.is_some(), "Play tries again");
+        assert_eq!(engine.key_retries, 0, "from the bottom of the ladder");
+    }
+
+    /// A held row that is removed takes its retry and its message with it,
+    /// whether the queue empties or nothing playable is left.
+    #[tokio::test(flavor = "current_thread")]
+    async fn removing_a_held_row_takes_its_retry_and_message_with_it() {
+        let (mut emptied, _emptied_probe) = engine_with_player();
+        emptied.state = playback_state(240_000);
+        emptied.state.playing = true;
+        assert!(withhold_key(&mut emptied, 7, AudioKeyFailure::Refused));
+        assert_eq!(emptied.remove_queue(0), Ok(true));
+        assert!(emptied.state.queue.is_empty());
+        assert!(emptied.state.error.is_none(), "no message about a song that is gone");
+        assert!(emptied.retry_current_at.is_none());
+        assert!(!emptied.loading_failed);
+
+        let (mut stranded, _stranded_probe) = engine_with_player();
+        stranded.state = playback_state(240_000);
+        stranded.state.queue.push(unavailable_track("0123456789ABCDEFGHIJKM"));
+        stranded.state.playing = true;
+        assert!(withhold_key(&mut stranded, 7, AudioKeyFailure::Refused));
+        assert_eq!(stranded.remove_queue(0), Ok(true));
+        assert_eq!(stranded.state.current_index, None);
+        assert_ne!(stranded.state.error.as_deref(), Some(KEY_WAIT_MESSAGE));
+        assert!(stranded.retry_current_at.is_none());
     }
 
     /// Preloading is a second load per track. While loads are the thing

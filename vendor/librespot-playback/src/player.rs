@@ -1495,22 +1495,33 @@ impl Future for PlayerInternal {
                 if !loader.as_mut().is_terminated() {
                     match loader.as_mut().poll(cx) {
                         Poll::Ready(Ok(mut loaded_track)) => {
-                            if let Some(position_ms) = seek_to {
-                                // This may be blocking.
-                                match loaded_track.decoder.seek(position_ms) {
-                                    Ok(position_ms) => loaded_track.stream_position_ms = position_ms,
-                                    Err(e) => error!("Unable to seek the loaded track to {position_ms} ms: {e}"),
+                            // This may be blocking.
+                            let landed = match seek_to {
+                                Some(position_ms) => loaded_track.decoder.seek(position_ms)
+                                    .map(|position_ms| loaded_track.stream_position_ms = position_ms),
+                                None => Ok(()),
+                            };
+                            match landed {
+                                Ok(()) => {
+                                    self.start_playback(
+                                        track_id,
+                                        play_request_id,
+                                        loaded_track,
+                                        start_playback,
+                                    );
+                                    if let PlayerState::Loading { .. } = self.state {
+                                        error!("The state wasn't changed by start_playback()");
+                                        exit(1);
+                                    }
                                 }
-                            }
-                            self.start_playback(
-                                track_id,
-                                play_request_id,
-                                loaded_track,
-                                start_playback,
-                            );
-                            if let PlayerState::Loading { .. } = self.state {
-                                error!("The state wasn't changed by start_playback()");
-                                exit(1);
+                                // The engine already moved the pipeline and the
+                                // playhead to the seek's target, so audio from
+                                // the load position must not play under it: this
+                                // is a failed load, as in the Seek arm.
+                                Err(e) => {
+                                    error!("Unable to seek the loaded track <{track_id:?}>: {e}");
+                                    let _ = self.fail_decoder_transition(track_id, play_request_id, e.into());
+                                }
                             }
                         }
                         Poll::Ready(Err(LoadFailure::Unavailable)) => {
@@ -3073,17 +3084,71 @@ mod tests {
             "later resume continues the same decoder without losing or replaying a packet");
     }
 
-    struct SeekProbe(Arc<Mutex<Vec<u32>>>);
+    /// Records every seek, and lands it unless told it cannot.
+    struct SeekProbe {
+        seeks: Arc<Mutex<Vec<u32>>>,
+        lands: bool,
+    }
 
     impl AudioDecoder for SeekProbe {
         fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
-            self.0.lock().unwrap().push(position_ms);
-            Ok(position_ms)
+            self.seeks.lock().unwrap().push(position_ms);
+            if self.lands {
+                Ok(position_ms)
+            } else {
+                Err(DecoderError::SymphoniaDecoder("seek past the downloaded audio".to_owned()))
+            }
         }
 
         fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
             Ok(None)
         }
+    }
+
+    struct SeekDuringLoad {
+        player: PlayerInternal,
+        loaded: oneshot::Sender<LoadResult>,
+        events: mpsc::UnboundedReceiver<PlayerEvent>,
+        // The player ends once its command channel closes.
+        _commands: mpsc::UnboundedSender<PlayerCommand>,
+    }
+
+    /// A player still loading the test track, with a seek to 42 s sent to it
+    /// while it loads, and the sender that finishes the load.
+    fn seek_during_load(play: bool, output: &Arc<Mutex<OutputProbe>>) -> SeekDuringLoad {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let (loaded, loading) = oneshot::channel::<LoadResult>();
+        let mut player = test_player(PlayerState::Loading {
+            track_id: test_track(),
+            play_request_id: 1,
+            start_playback: play,
+            loader: Box::pin(loading.map(|result| result.unwrap_or(Err(LoadFailure::Unavailable)))),
+            seek_to: None,
+        }, receiver, output);
+        let (events, heard) = mpsc::unbounded_channel();
+        player.event_senders.push(events);
+        commands.send(PlayerCommand::Seek {
+            position_ms: 42_000,
+            play,
+            transition: DecoderTransition { revision: 2, commit: Box::new(|| true), is_current: Box::new(|| true) },
+        }).unwrap();
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(Pin::new(&mut player).poll(&mut context).is_pending());
+        SeekDuringLoad { player, loaded, events: heard, _commands: commands }
+    }
+
+    fn loaded_track(decoder: SeekProbe) -> LoadResult {
+        Ok(PlayerLoadedTrackData {
+            decoder: Box::new(decoder),
+            normalisation_data: NormalisationData::default(),
+            stream_loader_controller: StreamLoaderController::from_local_file(1),
+            audio_item: test_audio_item(),
+            bytes_per_second: 1,
+            duration_ms: 60_000,
+            stream_position_ms: 0,
+            is_explicit: false,
+            selected_audio: None,
+        })
     }
 
     /// A seek that lands while the track is still loading must not start the
@@ -3093,42 +3158,40 @@ mod tests {
     fn a_seek_during_a_load_moves_where_it_lands_instead_of_loading_again() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _runtime = runtime.enter();
-        let (commands, receiver) = mpsc::unbounded_channel();
         let output = Arc::new(Mutex::new(OutputProbe::default()));
-        let (loaded, loading) = oneshot::channel::<LoadResult>();
-        let mut player = test_player(PlayerState::Loading {
-            track_id: test_track(),
-            play_request_id: 1,
-            start_playback: false,
-            loader: Box::pin(loading.map(|result| result.unwrap_or(Err(LoadFailure::Unavailable)))),
-            seek_to: None,
-        }, receiver, &output);
-        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
-
-        commands.send(PlayerCommand::Seek {
-            position_ms: 42_000,
-            play: false,
-            transition: DecoderTransition { revision: 2, commit: Box::new(|| true), is_current: Box::new(|| true) },
-        }).unwrap();
-        assert!(Pin::new(&mut player).poll(&mut context).is_pending());
+        let SeekDuringLoad { mut player, loaded, _commands, .. } = seek_during_load(false, &output);
         assert!(player.load_handles.lock().unwrap().is_empty(), "no second load was started");
         assert!(matches!(player.state, PlayerState::Loading { seek_to: Some(42_000), .. }));
 
         let seeks = Arc::new(Mutex::new(Vec::new()));
-        loaded.send(Ok(PlayerLoadedTrackData {
-            decoder: Box::new(SeekProbe(Arc::clone(&seeks))),
-            normalisation_data: NormalisationData::default(),
-            stream_loader_controller: StreamLoaderController::from_local_file(1),
-            audio_item: test_audio_item(),
-            bytes_per_second: 1,
-            duration_ms: 60_000,
-            stream_position_ms: 0,
-            is_explicit: false,
-            selected_audio: None,
-        })).ok().unwrap();
+        loaded.send(loaded_track(SeekProbe { seeks: Arc::clone(&seeks), lands: true })).ok().unwrap();
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
         assert!(Pin::new(&mut player).poll(&mut context).is_pending());
         assert_eq!(*seeks.lock().unwrap(), [42_000]);
         assert!(matches!(player.state, PlayerState::Paused { stream_position_ms: 42_000, .. }));
+    }
+
+    /// The engine set up its pipeline and playhead at the seek's target, so a
+    /// load that cannot land there must not start playing from where it
+    /// loaded: it fails like any other load.
+    #[test]
+    fn a_seek_that_cannot_land_fails_the_load_instead_of_playing_from_elsewhere() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime = runtime.enter();
+        let output = Arc::new(Mutex::new(OutputProbe::default()));
+        let SeekDuringLoad { mut player, loaded, mut events, _commands } = seek_during_load(true, &output);
+
+        loaded.send(loaded_track(SeekProbe { seeks: Default::default(), lands: false })).ok().unwrap();
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(Pin::new(&mut player).poll(&mut context).is_pending());
+        assert!(matches!(player.state, PlayerState::Stopped));
+        assert_eq!(output.lock().unwrap().starts, 0, "nothing was played");
+        let mut unavailable = false;
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, PlayerEvent::Playing { .. }), "nothing claimed to play");
+            unavailable |= matches!(event, PlayerEvent::Unavailable { play_request_id: 1, .. });
+        }
+        assert!(unavailable, "the load is reported failed");
     }
 
     /// Dropping a load's future is how a newer click replaces it; the loader
