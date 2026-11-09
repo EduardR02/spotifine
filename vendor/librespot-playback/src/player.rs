@@ -20,7 +20,7 @@ use std::{
 #[cfg(feature = "passthrough-decoder")]
 use crate::decoder::PassthroughDecoder;
 use crate::{
-    audio::{AudioDecrypt, AudioFetchParams, AudioFile, StreamLoaderController},
+    audio::{AudioDecrypt, AudioFetchParams, AudioFile, AudioKeyFailure, KeySource, StreamLoaderController},
     audio_backend::Sink,
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
@@ -31,7 +31,7 @@ use crate::{
     mixer::VolumeGetter,
 };
 use futures_util::{
-    StreamExt, TryFutureExt, future, future::FusedFuture,
+    FutureExt, StreamExt, future, future::FusedFuture,
     stream::futures_unordered::FuturesUnordered,
 };
 use librespot_metadata::{audio::UniqueFields, track::Tracks};
@@ -216,6 +216,13 @@ pub enum PlayerEvent {
         play_request_id: u64,
         track_id: SpotifyUri,
     },
+    // Spotify did not hand over the requested track's audio key, so nothing
+    // was decoded. The track itself is fine; asking again later works.
+    AudioKeyUnavailable {
+        play_request_id: u64,
+        track_id: SpotifyUri,
+        failure: AudioKeyFailure,
+    },
     // The mixer volume was set to a new level.
     VolumeChanged {
         volume: u16,
@@ -288,6 +295,9 @@ impl PlayerEvent {
                 play_request_id, ..
             }
             | Unavailable {
+                play_request_id, ..
+            }
+            | AudioKeyUnavailable {
                 play_request_id, ..
             }
             | Playing {
@@ -723,11 +733,24 @@ struct PlayerLoadedTrackData {
     selected_audio: Option<(crate::core::FileId, AudioFileFormat)>,
 }
 
+/// Why a load produced no track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadFailure {
+    /// The track cannot be played as asked: no such track, no playable file,
+    /// or a file that does not decode.
+    Unavailable,
+    /// Spotify did not hand over the audio key. The track itself is fine.
+    Key(AudioKeyFailure),
+}
+
+type LoadResult = Result<PlayerLoadedTrackData, LoadFailure>;
+type Loader = Pin<Box<dyn FusedFuture<Output = LoadResult> + Send>>;
+
 enum PlayerPreload {
     None,
     Loading {
         track_id: SpotifyUri,
-        loader: Pin<Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send>>,
+        loader: Loader,
     },
     Ready {
         track_id: SpotifyUri,
@@ -743,7 +766,10 @@ enum PlayerState {
         track_id: SpotifyUri,
         play_request_id: u64,
         start_playback: bool,
-        loader: Pin<Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send>>,
+        loader: Loader,
+        /// Where a seek that arrived during the load asked playback to start.
+        /// The load keeps running; the position is applied when it lands.
+        seek_to: Option<u32>,
     },
     Paused {
         track_id: SpotifyUri,
@@ -948,6 +974,18 @@ impl PlayerState {
     }
 }
 
+/// Asks for the audio key only while someone still wants the load: a track
+/// nobody is waiting for any more is not worth one.
+async fn key_unless_abandoned<F: Future>(
+    abandoned: &dyn Fn() -> bool,
+    request: impl FnOnce() -> F,
+) -> Option<F::Output> {
+    if abandoned() {
+        return None;
+    }
+    Some(request().await)
+}
+
 struct PlayerTrackLoader {
     session: Session,
     config: PlayerConfig,
@@ -1007,19 +1045,25 @@ impl PlayerTrackLoader {
         Some(data_rate.ceil() as usize)
     }
 
+    /// `None` when `abandoned` says nobody is waiting for the result any more:
+    /// the player moved on to another load or preload, so the rest of the work,
+    /// the audio key above all, is not worth doing.
     async fn load_track(
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
-    ) -> Option<PlayerLoadedTrackData> {
+        abandoned: &dyn Fn() -> bool,
+    ) -> Option<LoadResult> {
         match track_uri {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
-                self.load_remote_track(track_uri, position_ms).await
+                self.load_remote_track(track_uri, position_ms, abandoned).await
             }
-            SpotifyUri::Local { .. } => self.load_local_track(track_uri, position_ms).await,
+            SpotifyUri::Local { .. } => Some(
+                self.load_local_track(track_uri, position_ms).await.ok_or(LoadFailure::Unavailable),
+            ),
             _ => {
                 error!("Cannot handle load of track with URI: <{track_uri}>",);
-                None
+                Some(Err(LoadFailure::Unavailable))
             }
         }
     }
@@ -1028,15 +1072,19 @@ impl PlayerTrackLoader {
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
-    ) -> Option<PlayerLoadedTrackData> {
+        abandoned: &dyn Fn() -> bool,
+    ) -> Option<LoadResult> {
         let track_id: SpotifyId = match (&track_uri).try_into() {
             Ok(id) => id,
             Err(_) => {
                 warn!("<{track_uri}> could not be converted to a base62 ID");
-                return None;
+                return Some(Err(LoadFailure::Unavailable));
             }
         };
 
+        if abandoned() {
+            return None;
+        }
         let audio_item = match AudioItem::get_file(&self.session, track_uri.clone()).await {
             Ok(audio) => match self.find_available_alternative(audio).await {
                 Some(audio) => audio,
@@ -1045,12 +1093,12 @@ impl PlayerTrackLoader {
                         "spotify:track:<{}> is not available",
                         track_id.to_base62().unwrap_or_default()
                     );
-                    return None;
+                    return Some(Err(LoadFailure::Unavailable));
                 }
             },
             Err(e) => {
                 error!("Unable to load audio item: {e:?}");
-                return None;
+                return Some(Err(LoadFailure::Unavailable));
             }
         };
 
@@ -1103,15 +1151,27 @@ impl PlayerTrackLoader {
                         "<{}> is not available in any supported format",
                         audio_item.name
                     );
-                    return None;
+                    return Some(Err(LoadFailure::Unavailable));
                 }
             };
 
-        let bytes_per_second = self.stream_data_rate(format)?;
+        let Some(bytes_per_second) = self.stream_data_rate(format) else {
+            return Some(Err(LoadFailure::Unavailable));
+        };
 
-        // This is only a loop to be able to reload the file if an error occurred
-        // while opening a cached file.
+        // Songs are always encrypted, so a song without its key has nothing to
+        // decode. Episodes keep librespot's fallback of trying the file plain.
+        let always_encrypted = matches!(track_uri, SpotifyUri::Track { .. });
+        // A kept key gets one chance to be replaced by Spotify's before a file
+        // that will not decode is blamed on the file.
+        let mut kept_key_rejected = false;
+
+        // This is only a loop to be able to reload the file or its key if an
+        // error occurred while opening a cached one.
         loop {
+            if abandoned() {
+                return None;
+            }
             let encrypted_file = AudioFile::open(
                 &self.session,
                 file_id,
@@ -1124,22 +1184,31 @@ impl PlayerTrackLoader {
                 Ok(encrypted_file) => encrypted_file,
                 Err(e) => {
                     error!("Unable to load encrypted file: {e:?}");
-                    return None;
+                    return Some(Err(LoadFailure::Unavailable));
                 }
             };
 
             let is_cached = encrypted_file.is_cached();
 
-            let stream_loader_controller = encrypted_file.get_stream_loader_controller().ok()?;
+            let Ok(stream_loader_controller) = encrypted_file.get_stream_loader_controller() else {
+                return Some(Err(LoadFailure::Unavailable));
+            };
 
-            // Not all audio files are encrypted. If we can't get a key, try loading the track
-            // without decryption. If the file was encrypted after all, the decoder will fail
-            // parsing and bail out, so we should be safe from outputting ear-piercing noise.
-            let key = match self.session.audio_key().request(track_id, file_id).await {
-                Ok(key) => Some(key),
-                Err(e) => {
-                    warn!("Unable to load key, continuing without decryption: {e}");
-                    None
+            let key = key_unless_abandoned(abandoned, || {
+                crate::audio::audio_key(&self.session, &track_uri, track_id, file_id, self.cache_epoch)
+            });
+            let Some(key) = key.await else {
+                return None;
+            };
+            let (key, key_source, key_failure) = match key {
+                Ok((key, source)) => (Some(key), Some(source), None),
+                Err(failure) if always_encrypted => {
+                    warn!("Audio key for <{}> {failure}; nothing to decode without it", audio_item.name);
+                    return Some(Err(LoadFailure::Key(failure)));
+                }
+                Err(failure) => {
+                    warn!("Audio key {failure}, continuing without decryption");
+                    (None, None, Some(failure))
                 }
             };
 
@@ -1163,7 +1232,7 @@ impl PlayerTrackLoader {
                 Ok(audio_file) => audio_file,
                 Err(e) => {
                     error!("PlayerTrackLoader::load_track error opening subfile: {e}");
-                    return None;
+                    return Some(Err(LoadFailure::Unavailable));
                 }
             };
 
@@ -1200,21 +1269,35 @@ impl PlayerTrackLoader {
 
             let mut decoder = match decoder_type {
                 Ok(decoder) => decoder,
-                Err(e) if is_cached => {
-                    warn!("Unable to read cached audio file: {e}. Trying to download it.");
-
-                    if let Err(error) = crate::audio::remove_cached_audio(&self.session, &track_uri, file_id, self.cache_epoch) {
-                        error!("Error removing file from cache: {error}");
-                        return None;
-                    }
-
-                    // Just try it again
+                Err(e) if key_source == Some(KeySource::Kept) && !kept_key_rejected => {
+                    warn!("Unable to read audio file with its kept key: {e}. Asking Spotify for the key again.");
+                    crate::audio::forget_audio_key(&self.session, &track_uri, file_id);
+                    kept_key_rejected = true;
                     continue;
                 }
-                Err(e) => {
-                    error!("Unable to read audio file: {e}");
-                    return None;
-                }
+                Err(e) => match key_failure {
+                    // The plain-file gamble lost: the missing key is the reason,
+                    // and the file says nothing about the cache.
+                    Some(failure) => {
+                        warn!("Unable to read audio file without its key: {e}");
+                        return Some(Err(LoadFailure::Key(failure)));
+                    }
+                    None if is_cached => {
+                        warn!("Unable to read cached audio file: {e}. Trying to download it.");
+
+                        if let Err(error) = crate::audio::remove_cached_audio(&self.session, &track_uri, file_id, self.cache_epoch) {
+                            error!("Error removing file from cache: {error}");
+                            return Some(Err(LoadFailure::Unavailable));
+                        }
+
+                        // Just try it again
+                        continue;
+                    }
+                    None => {
+                        error!("Unable to read audio file: {e}");
+                        return Some(Err(LoadFailure::Unavailable));
+                    }
+                },
             };
 
             let duration_ms = audio_item.duration_ms;
@@ -1240,7 +1323,7 @@ impl PlayerTrackLoader {
                     error!(
                         "PlayerTrackLoader::load_track error seeking to starting position {position_ms}: {e}"
                     );
-                    return None;
+                    return Some(Err(LoadFailure::Unavailable));
                 }
             };
 
@@ -1251,7 +1334,7 @@ impl PlayerTrackLoader {
 
             info!("<{}> ({} ms) loaded", audio_item.name, duration_ms);
 
-            return Some(PlayerLoadedTrackData {
+            return Some(Ok(PlayerLoadedTrackData {
                 decoder,
                 normalisation_data,
                 stream_loader_controller,
@@ -1261,7 +1344,7 @@ impl PlayerTrackLoader {
                 stream_position_ms,
                 is_explicit,
                 selected_audio: Some((file_id, format)),
-            });
+            }));
         }
     }
 
@@ -1402,6 +1485,7 @@ impl Future for PlayerInternal {
                 ref track_id,
                 start_playback,
                 play_request_id,
+                seek_to,
             } = self.state
             {
                 // The loader may be terminated if we are trying to load the same track
@@ -1410,7 +1494,14 @@ impl Future for PlayerInternal {
 
                 if !loader.as_mut().is_terminated() {
                     match loader.as_mut().poll(cx) {
-                        Poll::Ready(Ok(loaded_track)) => {
+                        Poll::Ready(Ok(mut loaded_track)) => {
+                            if let Some(position_ms) = seek_to {
+                                // This may be blocking.
+                                match loaded_track.decoder.seek(position_ms) {
+                                    Ok(position_ms) => loaded_track.stream_position_ms = position_ms,
+                                    Err(e) => error!("Unable to seek the loaded track to {position_ms} ms: {e}"),
+                                }
+                            }
                             self.start_playback(
                                 track_id,
                                 play_request_id,
@@ -1422,13 +1513,19 @@ impl Future for PlayerInternal {
                                 exit(1);
                             }
                         }
-                        Poll::Ready(Err(e)) => {
-                            error!(
-                                "Skipping to next track, unable to load track <{track_id:?}>: {e:?}"
-                            );
+                        Poll::Ready(Err(LoadFailure::Unavailable)) => {
+                            error!("Skipping to next track, unable to load track <{track_id:?}>");
                             self.send_event(PlayerEvent::Unavailable {
                                 track_id,
                                 play_request_id,
+                            })
+                        }
+                        Poll::Ready(Err(LoadFailure::Key(failure))) => {
+                            warn!("Audio key for <{track_id:?}> {failure}; holding the track");
+                            self.send_event(PlayerEvent::AudioKeyUnavailable {
+                                track_id,
+                                play_request_id,
+                                failure,
                             })
                         }
                         Poll::Pending => (),
@@ -1453,7 +1550,13 @@ impl Future for PlayerInternal {
                             loaded_track: Box::new(loaded_track),
                         };
                     }
-                    Poll::Ready(Err(_)) => {
+                    // The load of this track, when it comes, asks for the key
+                    // again; a refusal now says nothing about the track itself.
+                    Poll::Ready(Err(LoadFailure::Key(failure))) => {
+                        debug!("Audio key for preload {track_id:?} {failure}");
+                        self.preload = PlayerPreload::None;
+                    }
+                    Poll::Ready(Err(LoadFailure::Unavailable)) => {
                         debug!("Unable to preload {track_id:?}");
                         self.preload = PlayerPreload::None;
                         // Let Spirc know that the track was unavailable.
@@ -2211,6 +2314,7 @@ impl PlayerInternal {
             play_request_id,
             start_playback: play,
             loader,
+            seek_to: None,
         };
 
         Ok(())
@@ -2268,17 +2372,23 @@ impl PlayerInternal {
     }
 
     fn handle_command_seek(&mut self, position_ms: u32) -> PlayerResult {
-        // When we are still loading, the user may immediately ask to
-        // seek to another position yet the decoder won't be ready for
-        // that. In this case just restart the loading process but
-        // with the requested position.
+        // When we are still loading, the user may immediately ask to seek to
+        // another position yet the decoder won't be ready for that. The load
+        // keeps running and lands at the requested position: starting it over
+        // would pay for the metadata, the file and the audio key again. Only
+        // a load that already failed is started over, at the new position.
         if let PlayerState::Loading {
             ref track_id,
             play_request_id,
             start_playback,
-            ..
+            ref loader,
+            ref mut seek_to,
         } = self.state
         {
+            if !loader.is_terminated() {
+                *seek_to = Some(position_ms);
+                return Ok(());
+            }
             return self.handle_command_load(
                 track_id.clone(),
                 play_request_id,
@@ -2516,12 +2626,16 @@ impl PlayerInternal {
         spotify_uri: SpotifyUri,
         position_ms: u32,
         cache_epoch: u64,
-    ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send + 'static {
+    ) -> impl FusedFuture<Output = LoadResult> + Send + 'static {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
         // audio stream is implemented in a blocking fashion. Thus, we can't turn it into future
         // easily. Instead we spawn a thread to do the work and return a one-shot channel as the
         // future to work with.
+        //
+        // Dropping that future is how a newer load or preload replaces this
+        // one, and the thread watches for it: a load nobody is waiting for
+        // stops before it asks Spotify for anything more.
 
         let loader = PlayerTrackLoader {
             session: self.session.clone(),
@@ -2536,9 +2650,9 @@ impl PlayerInternal {
         let handle = tokio::runtime::Handle::current();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
-            if let Some(data) = data {
-                let _ = result_tx.send(data);
+            let result = handle.block_on(loader.load_track(spotify_uri, position_ms, &|| result_tx.is_closed()));
+            if let Some(result) = result {
+                let _ = result_tx.send(result);
             }
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
@@ -2548,7 +2662,8 @@ impl PlayerInternal {
         let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
         load_handles.insert(load_handle.thread().id(), load_handle);
 
-        result_rx.map_err(|_| ())
+        // A sender dropped without a result means the thread died with it.
+        result_rx.map(|result| result.unwrap_or(Err(LoadFailure::Unavailable)))
     }
 
     fn preload_data_before_playback(&mut self) -> PlayerResult {
@@ -2847,56 +2962,49 @@ mod tests {
         }
     }
 
-    #[test]
-    fn queued_pause_stops_output_before_another_read_and_resume_retains_the_decoder() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let _runtime = runtime.enter();
-        let (commands, receiver) = mpsc::unbounded_channel();
-        let reads = Arc::new(AtomicUsize::new(0));
-        let output = Arc::new(Mutex::new(OutputProbe::default()));
-        let track_id = SpotifyUri::from_uri("spotify:track:0000000000000000000001").unwrap();
+    fn test_track() -> SpotifyUri {
+        SpotifyUri::from_uri("spotify:track:0000000000000000000001").unwrap()
+    }
+
+    fn test_audio_item() -> AudioItem {
+        let track_id = test_track();
+        AudioItem {
+            duration_ms: 60_000,
+            uri: track_id.to_uri().unwrap(),
+            track_id,
+            files: Default::default(),
+            name: "Control test".to_owned(),
+            covers: vec![],
+            language: vec![],
+            is_explicit: false,
+            availability: Ok(()),
+            alternatives: None,
+            unique_fields: UniqueFields::Local {
+                artists: None,
+                album: None,
+                album_artists: None,
+                number: None,
+                disc_number: None,
+                path: Default::default(),
+            },
+        }
+    }
+
+    fn test_player(
+        state: PlayerState,
+        commands: mpsc::UnboundedReceiver<PlayerCommand>,
+        output: &Arc<Mutex<OutputProbe>>,
+    ) -> PlayerInternal {
         let config = PlayerConfig::default();
-        let mut player = PlayerInternal {
+        PlayerInternal {
             session: Session::new(Default::default(), None),
             converter: Converter::new(config.ditherer),
             config,
-            commands: receiver,
+            commands,
             load_handles: Arc::new(Mutex::new(HashMap::new())),
-            state: PlayerState::Paused {
-                track_id: track_id.clone(),
-                play_request_id: 1,
-                decoder: Box::new(ControlledDecoder { reads: Arc::clone(&reads), commands: commands.clone() }),
-                audio_item: AudioItem {
-                    duration_ms: 60_000,
-                    uri: track_id.to_uri().unwrap(),
-                    track_id,
-                    files: Default::default(),
-                    name: "Control test".to_owned(),
-                    covers: vec![],
-                    language: vec![],
-                    is_explicit: false,
-                    availability: Ok(()),
-                    alternatives: None,
-                    unique_fields: UniqueFields::Local {
-                        artists: None,
-                        album: None,
-                        album_artists: None,
-                        number: None,
-                        disc_number: None,
-                        path: Default::default(),
-                    },
-                },
-                normalisation_data: NormalisationData::default(),
-                normalisation_factor: 1.0,
-                stream_loader_controller: StreamLoaderController::from_local_file(1),
-                bytes_per_second: 1,
-                duration_ms: 60_000,
-                stream_position_ms: 1_000,
-                suggested_to_preload_next_track: false,
-                is_explicit: false,
-            },
+            state,
             preload: PlayerPreload::None,
-            sink: Box::new(ProbeSink(Arc::clone(&output))),
+            sink: Box::new(ProbeSink(Arc::clone(output))),
             sink_status: SinkStatus::Closed,
             decoder_revision: 1,
             decoder_is_current: None,
@@ -2913,7 +3021,30 @@ mod tests {
             cache_epoch: 0,
             last_progress_update: Instant::now(),
             local_file_lookup: Arc::new(create_local_file_lookup(&[])),
-        };
+        }
+    }
+
+    #[test]
+    fn queued_pause_stops_output_before_another_read_and_resume_retains_the_decoder() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime = runtime.enter();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(Mutex::new(OutputProbe::default()));
+        let mut player = test_player(PlayerState::Paused {
+            track_id: test_track(),
+            play_request_id: 1,
+            decoder: Box::new(ControlledDecoder { reads: Arc::clone(&reads), commands: commands.clone() }),
+            audio_item: test_audio_item(),
+            normalisation_data: NormalisationData::default(),
+            normalisation_factor: 1.0,
+            stream_loader_controller: StreamLoaderController::from_local_file(1),
+            bytes_per_second: 1,
+            duration_ms: 60_000,
+            stream_position_ms: 1_000,
+            suggested_to_preload_next_track: false,
+            is_explicit: false,
+        }, receiver, &output);
         let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
 
         for _ in 0..3 {
@@ -2940,5 +3071,79 @@ mod tests {
         assert!(!output.running);
         assert_eq!(output.frames, [44_100, 44_541],
             "later resume continues the same decoder without losing or replaying a packet");
+    }
+
+    struct SeekProbe(Arc<Mutex<Vec<u32>>>);
+
+    impl AudioDecoder for SeekProbe {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            self.0.lock().unwrap().push(position_ms);
+            Ok(position_ms)
+        }
+
+        fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+            Ok(None)
+        }
+    }
+
+    /// A seek that lands while the track is still loading must not start the
+    /// load over: that would fetch the metadata, the file and the audio key a
+    /// second time. The running load lands where the seek asked instead.
+    #[test]
+    fn a_seek_during_a_load_moves_where_it_lands_instead_of_loading_again() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime = runtime.enter();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let output = Arc::new(Mutex::new(OutputProbe::default()));
+        let (loaded, loading) = oneshot::channel::<LoadResult>();
+        let mut player = test_player(PlayerState::Loading {
+            track_id: test_track(),
+            play_request_id: 1,
+            start_playback: false,
+            loader: Box::pin(loading.map(|result| result.unwrap_or(Err(LoadFailure::Unavailable)))),
+            seek_to: None,
+        }, receiver, &output);
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+
+        commands.send(PlayerCommand::Seek {
+            position_ms: 42_000,
+            play: false,
+            transition: DecoderTransition { revision: 2, commit: Box::new(|| true), is_current: Box::new(|| true) },
+        }).unwrap();
+        assert!(Pin::new(&mut player).poll(&mut context).is_pending());
+        assert!(player.load_handles.lock().unwrap().is_empty(), "no second load was started");
+        assert!(matches!(player.state, PlayerState::Loading { seek_to: Some(42_000), .. }));
+
+        let seeks = Arc::new(Mutex::new(Vec::new()));
+        loaded.send(Ok(PlayerLoadedTrackData {
+            decoder: Box::new(SeekProbe(Arc::clone(&seeks))),
+            normalisation_data: NormalisationData::default(),
+            stream_loader_controller: StreamLoaderController::from_local_file(1),
+            audio_item: test_audio_item(),
+            bytes_per_second: 1,
+            duration_ms: 60_000,
+            stream_position_ms: 0,
+            is_explicit: false,
+            selected_audio: None,
+        })).ok().unwrap();
+        assert!(Pin::new(&mut player).poll(&mut context).is_pending());
+        assert_eq!(*seeks.lock().unwrap(), [42_000]);
+        assert!(matches!(player.state, PlayerState::Paused { stream_position_ms: 42_000, .. }));
+    }
+
+    /// Dropping a load's future is how a newer click replaces it; the loader
+    /// thread sees that as its sender closing, and asks for no key after it.
+    #[tokio::test]
+    async fn a_replaced_load_asks_for_no_audio_key() {
+        let asked = AtomicUsize::new(0);
+        let ask = || async {
+            asked.fetch_add(1, Ordering::SeqCst);
+        };
+
+        let (wanted, receiver) = oneshot::channel::<()>();
+        assert!(key_unless_abandoned(&|| wanted.is_closed(), ask).await.is_some());
+        drop(receiver);
+        assert!(key_unless_abandoned(&|| wanted.is_closed(), ask).await.is_none());
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
     }
 }

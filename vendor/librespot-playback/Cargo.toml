@@ -1,5 +1,7 @@
 # Vendored crates.io librespot-playback 0.8.0; upstream MIT license: ../LICENSE.
 # Renderer patch: pass the loaded item's URI to AudioFile::open in src/player.rs.
+# Loads take audio keys from librespot-audio's kept keys, report a withheld key
+# as its own event, stop before the key once replaced, and absorb seeks.
 
 [package]
 edition = "2024"

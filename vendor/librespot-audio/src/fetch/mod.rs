@@ -1,4 +1,7 @@
+mod keys;
 mod receive;
+
+pub use self::keys::{AudioKeyFailure, KeySource, audio_key, forget_audio_key};
 
 use std::{
     cmp::min,
@@ -191,11 +194,13 @@ pub fn advance_cache_epoch() -> u64 {
     *epoch
 }
 
-/// Deletes only this cache's audio directory. Shared limiter state is updated
-/// through Cache::remove_file for recognized content-addressed entries.
+/// Deletes only this cache's audio directory, the songs' kept audio keys with
+/// it. Shared limiter state is updated through Cache::remove_file for
+/// recognized content-addressed entries.
 pub fn clear_cached_audio(cache: &Cache) -> Result<(), Error> {
     let mut epoch = CACHE_COMMIT_EPOCH.lock().expect("cache commit mutex poisoned");
     *epoch = epoch.wrapping_add(1);
+    keys::forget_all_audio_keys();
     let Some(sample) = cache.file_path(FileId::from_raw(&[0; 20])) else { return Ok(()); };
     let root = sample.parent().and_then(|parent| parent.parent())
         .ok_or_else(|| Error::failed_precondition("audio cache has no root directory"))?;

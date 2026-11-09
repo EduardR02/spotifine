@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use librespot_audio::AudioKeyFailure;
 use librespot_core::SpotifyUri;
 use librespot_core::cache::Cache;
 use librespot_metadata::Metadata;
@@ -51,15 +52,14 @@ fn remove_leased_cache_files(cache: &Cache, files: &[librespot_core::FileId], le
 /// restart window (OnPrevious in app.cpp) so both sides agree.
 const PREVIOUS_RESTART_THRESHOLD_MS: u32 = 3_000;
 /// Minimum spacing between command-driven track changes (queue replacement,
-/// queue index changes, Next, and Previous). Loading an uncached track fetches
-/// its audio key from Spotify's key service, which rate-limits bursts ("Unable to load
-/// key, continuing without decryption") and playback dies with decoder
-/// errors. 250 ms bounds key requests to roughly 4-8/s while keeping rapid
-/// next/prev responsive; presses are delayed, never dropped. Natural
-/// end-of-track advances are not paced.
+/// queue index changes, Next, and Previous). Every load resolves metadata and
+/// opens its file before anything else, and a track whose audio key is not
+/// kept then asks Spotify, which paces those requests. 250 ms bounds that to
+/// roughly 4-8 loads/s while keeping rapid next/prev responsive; presses are
+/// delayed, never dropped. Natural end-of-track advances are not paced.
 const TRACK_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(250);
-/// Failures from a rapid load burst are commonly key-service or network
-/// transient errors, not evidence that every involved cache entry is bad.
+/// Failures from a rapid load burst are commonly network transient errors,
+/// not evidence that every involved cache entry is bad.
 /// Keep the burst window long enough to cover several paced changes.
 const TRACK_CHANGE_BURST_WINDOW: Duration = Duration::from_secs(2);
 const TRACK_CHANGE_BURST_MINIMUM: usize = 2;
@@ -69,46 +69,55 @@ const TRACK_CHANGE_BURST_MINIMUM: usize = 2;
 ///
 /// This is sized against how far apart *failures* land, not how far apart
 /// clicks land, and the two are nothing alike. A failing load takes seconds to
-/// give up: the audio key times out, librespot falls back to downloading, and
-/// the decoder waits out its own deadline. Measured across a real dead-session
-/// episode, consecutive `Unavailable` events arrived 6.5 s and 8.9 s apart —
-/// so the 2 s window this started at pruned itself empty between every pair,
-/// classified each failure as isolated, and evicted the cache for every track
-/// it touched. The window has to outlast the failure, not the gesture.
+/// give up: a CDN request times out, or the decoder waits out its own
+/// deadline. Measured across a real dead-session episode, consecutive
+/// `Unavailable` events arrived 6.5 s and 8.9 s apart — so a 2 s window would
+/// prune itself empty between every pair, classify each failure as isolated,
+/// and evict the cache for every track it touched. The window has to outlast
+/// the failure, not the gesture.
 const UNAVAILABLE_BURST_WINDOW: Duration = Duration::from_secs(30);
 /// How many current-track load failures inside [`UNAVAILABLE_BURST_WINDOW`]
 /// stop playback outright instead of skipping onward.
 ///
-/// One failure is a track: skip it, which is what the engine has always done
-/// and what a genuinely dead row still deserves. A run of them is not a queue
-/// full of dead rows, it is the service refusing to serve this client at all —
-/// Spotify's key service answers `error audio key 0 2`, librespot warns that it
-/// is "continuing without decryption", and the decoder times out on the
-/// resulting garbage about three seconds later. Skipping through that empties
-/// the whole queue in silence at a key request per track, feeding the very
-/// throttle that caused it, and it outlives the process because the throttle
-/// is server-side. Three is the smallest limit that still lets two genuinely
-/// dead rows sit next to each other in an otherwise working queue.
+/// One failure is a track: skip it, which is what a genuinely dead row
+/// deserves. A run of them is not a queue full of dead rows, it is the network
+/// or the service failing, and skipping through that empties the whole queue
+/// in silence. Three is the smallest limit that still lets two genuinely dead
+/// rows sit next to each other in an otherwise working queue.
+///
+/// A withheld audio key is none of this: the track is fine, so it is held
+/// rather than counted (see [`KEY_RETRY_LADDER`]).
 const UNAVAILABLE_STOP_LIMIT: usize = 3;
 
 /// How long a failed row waits before the engine loads it one more time.
 ///
-/// The refusal this recovers from is transient by nature. Across five separate
-/// episodes in the diagnostic log the key service answered `error audio key
-/// 0 2` in tight bursts of a few minutes and then went back to working
-/// perfectly; no track is individually cursed, and the same track that failed
-/// plays on the next attempt once the bucket refills. Skipping straight past a
-/// row on its first failure therefore throws away a track that was never
-/// broken, and does it at the cost of another key request for the row after.
-///
-/// One retry, not a ladder of them. A longer backoff would ride out more of a
-/// burst, but a queue that sits visibly dead for half a minute and then starts
-/// is worse than one that says so: the honest answer to a burst is
-/// [`UNAVAILABLE_STOP_LIMIT`], and the retry's job is only to separate a
-/// momentary refusal from one. It also makes the breaker reachable without
-/// spending the queue — the first row's two failures plus the next row's one
-/// reach the limit having skipped a single track.
+/// A load that fails for a reason other than its key is usually a network or
+/// CDN hiccup, and the same row plays on the next attempt. Skipping straight
+/// past it on its first failure would throw away a track that was never
+/// broken. One retry, not a ladder: a row that fails twice is given up on, and
+/// the retry's job is only to separate a momentary failure from a dead row.
 const LOAD_RETRY_BACKOFF: Duration = Duration::from_secs(3);
+
+/// How long a row whose audio key Spotify withheld waits before each further
+/// attempt, the last step repeating for as long as the queue stays playing.
+///
+/// Spotify paces key requests: a burst of new tracks is answered, and then
+/// roughly one more key every half minute until the burst allowance refills.
+/// The track itself is fine, so it is held and retried rather than skipped —
+/// the row after it needs a key just the same — and the steps climb to that
+/// half minute. Any load the user asks for replaces the held row at once, so
+/// the newest click is always the one waiting.
+const KEY_RETRY_LADDER: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+];
+
+/// What the banner says while a withheld key holds the current row, playing
+/// and paused.
+const KEY_WAIT_MESSAGE: &str = "Spotify needs a moment before this song can start. It starts by itself.";
+const KEY_WAIT_PAUSED_MESSAGE: &str = "Spotify needs a moment before this song can start. Press play to try again.";
 
 /// How much of a track may be left unplayed for its end to still be the end.
 ///
@@ -294,12 +303,12 @@ pub struct Engine {
     /// to "is this track actually playing", and the difference between a track
     /// that ended and a track that never started.
     current_load_produced_audio: bool,
-    /// When the current row should be loaded once more after failing, and
-    /// whether the load now in flight already is that retry. See
-    /// [`LOAD_RETRY_BACKOFF`]. Both are cleared by any load, so a user action
-    /// that moves the playhead cancels a pending retry by construction.
+    /// When the current row should be loaded once more after failing, and how
+    /// many automatic reloads it has already had. See [`LOAD_RETRY_BACKOFF`]
+    /// and [`KEY_RETRY_LADDER`]. Both are cleared by any other load, so a user
+    /// action that moves the playhead cancels a pending retry by construction.
     retry_current_at: Option<Instant>,
-    current_load_is_retry: bool,
+    current_row_retries: usize,
     /// Whether librespot has said the current track is close enough to its end
     /// for the next one to be worth fetching. See [`Engine::preload_next`].
     preload_armed: bool,
@@ -621,7 +630,7 @@ impl Engine {
             recent_unavailable: VecDeque::new(),
             current_load_produced_audio: false,
             retry_current_at: None,
-            current_load_is_retry: false,
+            current_row_retries: 0,
             preload_armed: false,
             next_reconnect: None,
             reconnect_backoff: RECONNECT_BACKOFF_MIN,
@@ -3974,7 +3983,7 @@ impl Engine {
         self.current_load_produced_audio = false;
         self.preload_armed = false;
         self.retry_current_at = None;
-        self.current_load_is_retry = false;
+        self.current_row_retries = 0;
         // What the engine reports and what it asks librespot for are one
         // statement, made once, here. Callers used to set `playing` beside the
         // call, which let the two say different things — a track change loading
@@ -4041,8 +4050,13 @@ impl Engine {
     /// next Canvas, starts and ends with the audio's.
     fn preload_row(&self) -> Option<&TrackRef> {
         // A preserved player sounding through a reconnect sits on the session
-        // being replaced; no load may reach it, a preload included.
-        if !self.state.ready || !self.preload_armed || !self.recent_unavailable.is_empty() {
+        // being replaced; no load may reach it, a preload included. A row whose
+        // own load failed is not sounding, so there is no end to smooth.
+        if !self.state.ready
+            || !self.preload_armed
+            || self.loading_failed
+            || !self.recent_unavailable.is_empty()
+        {
             return None;
         }
         let row = self.state.queue.get(self.peek_next_index()?)?;
@@ -4080,34 +4094,18 @@ impl Engine {
     /// second kind from being handled, as it was, as a track that finished.
     fn fail_current_load(&mut self, track_id: SpotifyUri) -> bool {
         let burst = self.record_unavailable(Instant::now());
-        self.loading_failed = true;
-        self.finalize_listening(false);
+        self.end_failed_load();
         // `state.playing` is left alone deliberately: it is the intent the
         // retry or skip below has to carry onto whatever loads next. Every
         // branch settles it — a successor loads with this intent, a retry
         // reloads with it, and an exhausted queue stops.
         self.state.error = Some(format!("Spotify track is unavailable: {track_id}"));
 
-        // librespot leaves the failed loader in PlayerState::Loading after
-        // sending Unavailable. Stop it explicitly so a later Play can submit a
-        // fresh Load command instead of toggling start_playback on a
-        // terminated future.
-        if let Some(player) = &self.player {
-            player.stop();
-        }
-        // That stop has a `Stopped` event behind it, and the engine must not
-        // still be listening for one: the failed play request is dead to every
-        // branch below — each either reloads or waits for the owner — and the
-        // arm that handles `Stopped` would otherwise clear `playing` moments
-        // after this, quietly disarming the retry the engine just promised.
-        self.play_request_id = None;
-        self.invalidate_audio_signals();
-
         // An isolated failure can be a corrupt/truncated cache entry;
         // librespot's decoder retry handles one cached format and this removes
         // every format before the next user retry. Once failures cluster,
-        // preserve all cache files: key-service or network failures are not
-        // evidence of corruption.
+        // preserve all cache files: network failures are not evidence of
+        // corruption.
         if !burst.clustered {
             self.evict_track_audio_cache(track_id.clone());
         }
@@ -4126,15 +4124,15 @@ impl Engine {
             return true;
         }
 
-        // A run of failures is the service refusing this client, not a run of
-        // bad rows, so stop and say so rather than spending the rest of the
+        // A run of failures is the network or the service failing, not a run
+        // of bad rows, so stop and say so rather than spending the rest of the
         // queue finding that out one track at a time.
         if burst.consecutive >= UNAVAILABLE_STOP_LIMIT {
             self.state.playing = false;
             // The banner in App.svelte ellipsises a long error, so the part
             // that says what happened comes first.
             self.state.error = Some(format!(
-                "Spotify refused audio for {} tracks in a row; playback stopped",
+                "{} songs in a row didn't load; playback stopped",
                 burst.consecutive
             ));
             eprintln!(
@@ -4146,15 +4144,13 @@ impl Engine {
         }
 
         // The row gets one more attempt before it is given up on. See
-        // [`LOAD_RETRY_BACKOFF`]: the refusal is transient, the track is
-        // usually fine, and skipping on the first failure both discards a
-        // working track and pays another key request to discover the next one
-        // is refused too.
-        if !self.current_load_is_retry {
+        // [`LOAD_RETRY_BACKOFF`]: the failure is usually transient, and
+        // skipping on the first one discards a working track.
+        if self.current_row_retries == 0 {
             self.retry_current_at = Some(Instant::now() + LOAD_RETRY_BACKOFF);
             // What the banner says has to be what is happening, and for the
             // next three seconds what is happening is a retry.
-            self.state.error = Some("Spotify refused audio for this track; retrying".to_owned());
+            self.state.error = Some("This song didn't load; trying once more".to_owned());
             eprintln!(
                 "transport: load failed for {track_id}; retrying this row in {} s",
                 LOAD_RETRY_BACKOFF.as_secs(),
@@ -4172,6 +4168,51 @@ impl Engine {
             self.state.error = Some(error);
         }
         true
+    }
+
+    /// Spotify withheld the current row's audio key, so librespot decoded
+    /// nothing. The track is fine and the next row would need a key just the
+    /// same, so the row is held — never skipped, never counted against the
+    /// failure breaker, its cache never touched — and loaded again on
+    /// [`KEY_RETRY_LADDER`] until a key arrives or the user picks something
+    /// else, which replaces it at once.
+    fn hold_current_for_key(&mut self, track_id: SpotifyUri, failure: AudioKeyFailure) -> bool {
+        self.end_failed_load();
+        // Pause wins, as it does for any failed load: nothing retries behind
+        // it, and Play is the retry.
+        if !self.state.playing {
+            self.state.error = Some(KEY_WAIT_PAUSED_MESSAGE.to_owned());
+            eprintln!("transport: audio key for {track_id} {failure} while paused; holding this row");
+            return true;
+        }
+        let wait = KEY_RETRY_LADDER[self.current_row_retries.min(KEY_RETRY_LADDER.len() - 1)];
+        self.retry_current_at = Some(Instant::now() + wait);
+        self.state.error = Some(KEY_WAIT_MESSAGE.to_owned());
+        eprintln!(
+            "transport: audio key for {track_id} {failure}; retrying this row in {} s",
+            wait.as_secs(),
+        );
+        true
+    }
+
+    /// What every failed current-row load needs, whatever happens next.
+    fn end_failed_load(&mut self) {
+        self.loading_failed = true;
+        self.finalize_listening(false);
+        // librespot leaves the failed loader in PlayerState::Loading after
+        // reporting it. Stop it explicitly so a later Play can submit a fresh
+        // Load command instead of toggling start_playback on a terminated
+        // future.
+        if let Some(player) = &self.player {
+            player.stop();
+        }
+        // That stop has a `Stopped` event behind it, and the engine must not
+        // still be listening for one: the failed play request is dead to every
+        // caller — each either reloads or waits for the owner — and the arm
+        // that handles `Stopped` would otherwise clear `playing` moments after
+        // this, quietly disarming the retry the engine is about to promise.
+        self.play_request_id = None;
+        self.invalidate_audio_signals();
     }
 
     /// Drives the two things a failing or recovering load needs a clock for.
@@ -4212,16 +4253,17 @@ impl Engine {
         if !due {
             return armed;
         }
-        // `load_current` clears both fields, so the flag is set afterwards:
-        // it marks the load now in flight as the one that has already had its
-        // second chance.
+        // `load_current` clears both fields, so the count is restored
+        // afterwards: it marks the load now in flight as one more automatic
+        // attempt at the same row.
+        let retries = self.current_row_retries + 1;
         if let Err(error) = self.load_current(true) {
             self.retry_current_at = None;
             self.state.playing = false;
             self.state.error = Some(error);
             return true;
         }
-        self.current_load_is_retry = true;
+        self.current_row_retries = retries;
         true
     }
 
@@ -4525,7 +4567,11 @@ impl Engine {
                 self.loading_failed = false;
                 self.update_position(position_ms);
                 self.loop_jump_pending = false;
-                self.clear_error();
+                // An automatic retry keeps the message that announced it until
+                // the row plays; cleared here, it would blink at every attempt.
+                if self.current_row_retries == 0 {
+                    self.clear_error();
+                }
                 self.state.position_ms != previous_position
                     || had_error != self.state.error.is_some()
             }
@@ -4660,15 +4706,22 @@ impl Engine {
             } if self.is_current_event(play_request_id, &track_id) => {
                 self.fail_current_load(track_id)
             }
+            PlayerEvent::AudioKeyUnavailable {
+                play_request_id,
+                track_id,
+                failure,
+            } if self.is_current_event(play_request_id, &track_id) => {
+                self.hold_current_for_key(track_id, failure)
+            }
             // A failed *preload*. librespot stamps this with the play request
             // of the track currently playing but the track id of the one it
             // was fetching ahead (`player.rs`, the `PlayerPreload::Loading`
-            // error arm), so it matched neither the current row nor the
-            // ignored-event log's expectations, and fell silently through both
-            // — which is how a whole class of key refusals stayed invisible to
-            // the breaker that exists to count them. It is still evidence
-            // about the service, so it counts; it says nothing about the track
-            // that is playing fine, so nothing else here moves.
+            // error arm), so it matches neither the current row nor the
+            // ignored-event log's expectations. It is still evidence about the
+            // network or the service, so it counts; it says nothing about the
+            // track that is playing fine, so nothing else here moves. A
+            // preload's withheld key is not reported at all: the load of that
+            // track asks again when it comes.
             PlayerEvent::Unavailable {
                 play_request_id,
                 track_id,
@@ -4699,7 +4752,8 @@ impl Engine {
             | PlayerEvent::Paused { .. }
             | PlayerEvent::EndOfTrack { .. }
             | PlayerEvent::Stopped { .. }
-            | PlayerEvent::Unavailable { .. }) => {
+            | PlayerEvent::Unavailable { .. }
+            | PlayerEvent::AudioKeyUnavailable { .. }) => {
                 eprintln!(
                     "transport: ignored {event:?}; engine holds play request {:?}",
                     self.play_request_id
@@ -4770,7 +4824,7 @@ impl Engine {
         self.recent_track_changes.clear();
         self.current_load_produced_audio = false;
         self.retry_current_at = None;
-        self.current_load_is_retry = false;
+        self.current_row_retries = 0;
         self.preload_armed = false;
         self.drain_stop_at = None;
         self.mixer = None;
@@ -4971,7 +5025,8 @@ mod tests {
 
     use super::{
         AUDIO_BLOCKED_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MIN,
-        AudioSignal, AuthFailure, AuthSignal, ConnectedSession, Engine, LOAD_RETRY_BACKOFF,
+        AudioKeyFailure, AudioSignal, AuthFailure, AuthSignal, ConnectedSession, Engine,
+        KEY_RETRY_LADDER, KEY_WAIT_MESSAGE, KEY_WAIT_PAUSED_MESSAGE, LOAD_RETRY_BACKOFF,
         PRELOAD_WATERMARK_MS, PlaybackHandles, PlaybackSpeeds, PlaybackState, PlayerSignal,
         RECONNECT_BACKOFF_MAX,
         RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
@@ -6408,6 +6463,20 @@ mod tests {
         engine.on_player_event(PlayerEvent::Unavailable {
             play_request_id,
             track_id,
+        })
+    }
+
+    /// Reports the current row's audio key as withheld, the way librespot
+    /// does: with the play request the engine is holding and the row's uri.
+    fn withhold_key(engine: &mut Engine, play_request_id: u64, failure: AudioKeyFailure) -> bool {
+        let index = engine.state.current_index.expect("a current row");
+        let track_id =
+            SpotifyUri::from_uri(&engine.state.queue[index].uri).expect("queue uris are valid");
+        engine.play_request_id = Some(play_request_id);
+        engine.on_player_event(PlayerEvent::AudioKeyUnavailable {
+            play_request_id,
+            track_id,
+            failure,
         })
     }
 
@@ -8332,9 +8401,9 @@ mod tests {
         );
     }
 
-    /// A row gets one more attempt before it is given up on: the refusal
-    /// behind these failures is transient, and skipping on the first one
-    /// discards a track that was never broken.
+    /// A row gets one more attempt before it is given up on: a failed load is
+    /// usually transient, and skipping on the first one discards a track that
+    /// was never broken.
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_row_is_retried_once_and_only_then_skipped() {
         let (mut engine, _probe) = engine_with_player();
@@ -8363,7 +8432,7 @@ mod tests {
             Some(0),
             "the retry reloads the same row"
         );
-        assert!(engine.current_load_is_retry);
+        assert_eq!(engine.current_row_retries, 1);
         assert!(engine.retry_current_at.is_none());
 
         // The retry fails too, and only now is the row given up on.
@@ -8409,7 +8478,7 @@ mod tests {
         );
         fire_due_retry(&mut engine);
         assert_eq!(engine.state.current_index, Some(0));
-        assert!(engine.current_load_is_retry);
+        assert_eq!(engine.current_row_retries, 1);
     }
 
     /// The retry a failed row is owed has to ask for the position the row was
@@ -8459,7 +8528,7 @@ mod tests {
             engine.state.position_ms, 0,
             "the retry loads the row where it was asked to start, not at its end"
         );
-        assert!(engine.current_load_is_retry);
+        assert_eq!(engine.current_row_retries, 1);
     }
 
     /// What the UI needs to stop projecting on its own: a playing row reports
@@ -8547,9 +8616,8 @@ mod tests {
         assert_eq!(engine.state.current_index, Some(0));
     }
 
-    /// A run of failures is the key service refusing this client. Stopping is
-    /// the only answer that does not empty the queue in silence and does not
-    /// keep asking the throttle for more keys.
+    /// A run of failures is the network or the service failing. Stopping is
+    /// the only answer that does not empty the queue in silence.
     #[tokio::test(flavor = "current_thread")]
     async fn consecutive_failures_stop_playback_with_an_error() {
         let (mut engine, _probe) = engine_with_player();
@@ -8568,7 +8636,7 @@ mod tests {
         );
 
         // The replacement fails too. Three failures inside the window is the
-        // service refusing this client, not three dead rows.
+        // network or the service, not three dead rows.
         assert!(fail_current_row(&mut engine, 102));
         assert!(!engine.state.playing, "the run trips the breaker");
         assert_eq!(
@@ -8609,7 +8677,7 @@ mod tests {
 
             // The replacement is heard, which is what a lone bad row looks
             // like. librespot's `Playing` deliberately does not count: a track
-            // loaded without its audio key reaches it too.
+            // whose decoder dies before its first packet reaches it too.
             hear_audio(&mut engine);
             assert!(
                 engine.recent_unavailable.is_empty(),
@@ -8618,20 +8686,19 @@ mod tests {
         }
     }
 
-    /// The bug the owner reported twice. Spotify's key service refuses the
-    /// key, librespot loads the track undecrypted anyway and announces it as
-    /// playing, the playhead runs for three seconds over silence, and the
-    /// decoder then chokes and reports `EndOfTrack` — indistinguishable, to
-    /// the engine that used to believe it, from a track that finished. So the
-    /// queue advanced, and advanced, and advanced.
+    /// A track whose decoder chokes before producing anything is announced as
+    /// playing, runs its playhead over silence, and then reports `EndOfTrack`
+    /// — indistinguishable from a track that finished unless the engine checks
+    /// what it heard. Believing it would advance the queue, and advance it,
+    /// and advance it.
     #[tokio::test(flavor = "current_thread")]
     async fn a_track_that_never_produced_audio_did_not_finish() {
         let (mut engine, _probe) = engine_with_player();
         engine.state = five_track_state();
         engine.state.playing = true;
-        // Exactly what librespot reports for a keyless track: loaded, playing,
-        // and then three seconds later, over. The report itself is the echo of
-        // a play this engine already calls playing, so it is not a change.
+        // Loaded, playing, and then three seconds later, over. The report
+        // itself is the echo of a play this engine already calls playing, so
+        // it is not a change.
         assert!(!engine.on_player_event(PlayerEvent::Playing {
             play_request_id: 7,
             track_id: track_uri(),
@@ -8705,9 +8772,9 @@ mod tests {
     }
 
     /// A failed *preload* carries the current track's play request and the
-    /// preloaded track's id, so it matched no arm at all and the breaker never
-    /// saw it. It is evidence about the service, so it counts — and it must
-    /// not disturb the track that is playing perfectly well.
+    /// preloaded track's id, so it matches neither the current row nor the
+    /// ignored-event log. It is evidence about the service, so it counts — and
+    /// it must not disturb the track that is playing perfectly well.
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_preload_counts_toward_the_breaker_without_moving_the_queue() {
         let (mut engine, _probe) = engine_with_player();
@@ -8729,7 +8796,7 @@ mod tests {
         assert_eq!(
             engine.recent_unavailable.len(),
             1,
-            "the refusal still counts against the service"
+            "the failure still counts against the service"
         );
         assert!(
             engine.preload_target().is_none(),
@@ -8737,8 +8804,115 @@ mod tests {
         );
     }
 
-    /// Preloading asks for a second audio key per load. While the key service
-    /// is the thing failing, that is the request that must not be made.
+    /// A withheld audio key holds the row and retries it on the ladder: 5, 10,
+    /// 20, then every 30 s for as long as the queue plays. The row is never
+    /// skipped, because the row after it needs a key just the same.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_withheld_key_holds_the_row_and_retries_on_the_ladder() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = five_track_state();
+        engine.state.playing = true;
+
+        let expected = [5, 10, 20, 30, 30, 30].map(Duration::from_secs);
+        assert_eq!(&expected[..KEY_RETRY_LADDER.len()], &KEY_RETRY_LADDER[..]);
+        for (attempt, wait) in expected.into_iter().enumerate() {
+            let failure = if attempt % 2 == 0 { AudioKeyFailure::Refused } else { AudioKeyFailure::Unanswered };
+            assert!(withhold_key(&mut engine, 500 + attempt as u64, failure));
+            assert_eq!(engine.state.current_index, Some(0), "attempt {attempt}: the row is held");
+            assert!(engine.state.playing, "attempt {attempt}: the queue still means to play");
+            assert!(engine.loading_failed);
+            assert_eq!(engine.state.error.as_deref(), Some(KEY_WAIT_MESSAGE));
+            let left = engine.retry_current_at.expect("a retry is armed").duration_since(Instant::now());
+            assert!(left <= wait && left + Duration::from_secs(1) > wait,
+                "attempt {attempt}: waits {wait:?}, armed for {left:?}");
+            assert!(engine.preload_target().is_none(), "a held row preloads nothing");
+
+            assert!(!engine.tick_playback_health(), "attempt {attempt}: not due yet");
+            fire_due_retry(&mut engine);
+            assert_eq!(engine.state.current_index, Some(0));
+            assert_eq!(engine.current_row_retries, attempt + 1);
+
+            let play_request_id = engine.play_request_id.expect("the retry loads the row");
+            let track_id = SpotifyUri::from_uri(&engine.state.queue[0].uri).unwrap();
+            engine.on_player_event(PlayerEvent::Loading { play_request_id, track_id, position_ms: 0 });
+            assert_eq!(engine.state.error.as_deref(), Some(KEY_WAIT_MESSAGE),
+                "attempt {attempt}: the message stays while the retry loads");
+        }
+    }
+
+    /// Whatever the user picks replaces a row held for its key at once, and
+    /// the held row's retry goes with it. The new row starts the ladder over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_newest_click_replaces_a_row_held_for_its_key() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = five_track_state();
+        engine.state.playing = true;
+        assert!(withhold_key(&mut engine, 7, AudioKeyFailure::Refused));
+        fire_due_retry(&mut engine);
+        assert!(withhold_key(&mut engine, 8, AudioKeyFailure::Refused));
+        assert!(engine.retry_current_at.is_some());
+
+        assert_eq!(engine.play_queue_index(2), Ok(true));
+        assert_eq!(engine.state.current_index, Some(2));
+        assert!(engine.play_request_id.is_some(), "the clicked row loads now");
+        assert!(engine.retry_current_at.is_none(), "the held row's retry is gone");
+        assert_eq!(engine.current_row_retries, 0);
+        assert!(!engine.loading_failed);
+        assert!(!engine.tick_playback_health(), "nothing reloads the row that was let go");
+        assert_eq!(engine.state.current_index, Some(2));
+
+        assert!(withhold_key(&mut engine, 9, AudioKeyFailure::Refused));
+        let left = engine.retry_current_at.expect("a retry is armed").duration_since(Instant::now());
+        assert!(left <= KEY_RETRY_LADDER[0], "a new row starts at the bottom of the ladder");
+    }
+
+    /// Pause wins over a held row as it does over any failed load, and Play is
+    /// the retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_withheld_key_while_paused_holds_without_retrying() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = five_track_state();
+        engine.state.playing = false;
+        assert!(withhold_key(&mut engine, 7, AudioKeyFailure::Refused));
+        assert_eq!(engine.state.current_index, Some(0));
+        assert!(engine.retry_current_at.is_none());
+        assert_eq!(engine.state.error.as_deref(), Some(KEY_WAIT_PAUSED_MESSAGE));
+
+        assert_eq!(engine.play(), Ok(true));
+        assert!(engine.state.playing);
+        assert!(!engine.loading_failed, "Play loads the row again");
+        assert!(engine.play_request_id.is_some());
+        assert!(engine.state.error.is_none());
+    }
+
+    /// A withheld key says nothing about the track or its cached audio, so it
+    /// neither counts toward the failure breaker nor touches the cache, however
+    /// long Spotify keeps it up. An unavailable track still does both.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_withheld_key_never_stops_playback_or_touches_the_cache() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = five_track_state();
+        engine.state.playing = true;
+        let id = engine.state.queue[0].id.clone();
+
+        for attempt in 0..UNAVAILABLE_STOP_LIMIT + 2 {
+            assert!(withhold_key(&mut engine, 600 + attempt as u64, AudioKeyFailure::Refused));
+            fire_due_retry(&mut engine);
+        }
+        assert!(engine.state.playing);
+        assert_eq!(engine.state.current_index, Some(0));
+        assert!(engine.recent_unavailable.is_empty());
+        assert!(!engine.invalidated_cache_ids.contains(&id), "the cache is not suspected");
+
+        // The retries above fired back to back; let their burst window pass.
+        engine.recent_track_changes.clear();
+        assert!(fail_current_row(&mut engine, 700));
+        assert_eq!(engine.recent_unavailable.len(), 1);
+        assert!(engine.invalidated_cache_ids.contains(&id), "an isolated real failure still is");
+    }
+
+    /// Preloading is a second load per track. While loads are the thing
+    /// failing, that is the request that must not be made.
     #[test]
     fn a_failure_burst_holds_back_the_next_track_preload() {
         let mut engine = playing_engine();
@@ -8753,7 +8927,7 @@ mod tests {
         engine.record_unavailable(Instant::now());
         assert!(
             engine.preload_target().is_none(),
-            "a failing engine must not ask for a second audio key per load"
+            "a failing engine must not ask for a second load per track"
         );
         engine.clear_unavailable_burst();
         assert!(

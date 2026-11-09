@@ -1381,11 +1381,12 @@ pub fn touch_playlist_played(playlists: &mut Vec<Playlist>, id: &str, at: i64) -
 /// only ever runs off the UI thread anyway.
 pub const CACHE_STATS_TTL_SECS: i64 = 60;
 
-/// Bookkeeping files that sit in a cache directory without being cached
+/// Bookkeeping entries that sit in a cache directory without being cached
 /// content. `cache-version` is the audio cache's layout marker (written by
 /// the engine's `version_audio_cache`); counting it would report one song too
-/// many for an empty cache.
-const CACHE_NON_CONTENT: &[&str] = &["cache-version"];
+/// many for an empty cache. `keys` holds a 16-byte audio key per song file
+/// librespot-audio has seen; counting those would roughly double the figure.
+const CACHE_NON_CONTENT: &[&str] = &["cache-version", "keys"];
 
 /// Walks one cache directory and totals the files it holds.
 ///
@@ -1408,15 +1409,15 @@ pub fn directory_usage(root: &Path) -> CacheUsage {
             if kind.is_symlink() {
                 continue;
             }
-            if kind.is_dir() {
-                pending.push(entry.path());
-                continue;
-            }
             let name = entry.file_name();
             if CACHE_NON_CONTENT
                 .iter()
                 .any(|skipped| name.eq_ignore_ascii_case(skipped))
             {
+                continue;
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
                 continue;
             }
             if let Ok(metadata) = entry.metadata() {
@@ -2831,13 +2832,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("renderer-usage-{}", now_secs()));
         let shard = dir.join("ab");
         std::fs::create_dir_all(&shard).unwrap();
-        // The audio cache shape: a layout marker beside sharded song files.
+        // The audio cache shape: a layout marker and the kept audio keys
+        // beside sharded song files.
         std::fs::write(dir.join("cache-version"), "2\n").unwrap();
         std::fs::write(shard.join("song-one"), vec![0u8; 1_000]).unwrap();
         std::fs::write(shard.join("song-two"), vec![0u8; 2_500]).unwrap();
+        std::fs::create_dir_all(dir.join("keys")).unwrap();
+        std::fs::write(dir.join("keys").join("song-one"), [0u8; 16]).unwrap();
 
         let usage = directory_usage(&dir);
-        assert_eq!(usage.files, 2, "the version marker is not a cached song");
+        assert_eq!(usage.files, 2, "neither the version marker nor a key is a cached song");
         assert_eq!(usage.bytes, 3_500);
 
         // A directory that was never created reads as empty, not as an error.

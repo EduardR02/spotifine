@@ -1,6 +1,7 @@
 # Vendored crates.io librespot-audio 0.8.0; upstream MIT license: ../LICENSE.
 # Renderer patches in src/fetch/mod.rs: per-load song-only persistent cache,
-# and the audio size bound, which announces every file it prunes.
+# and the audio size bound, which announces every file it prunes. In
+# src/fetch/keys.rs: audio keys kept per file, one request per file at a time.
 
 [package]
 edition = "2024"

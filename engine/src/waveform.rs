@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use librespot_audio::{AudioDecrypt, AudioFile, StreamLoaderController};
+use librespot_audio::{AudioDecrypt, AudioFile, KeySource, StreamLoaderController};
 use librespot_core::{FileId, Session, SpotifyId, SpotifyUri, cache::Cache};
 use librespot_metadata::audio::{AudioFileFormat, AudioFiles, AudioItem};
 use librespot_playback::decoder::{AudioDecoder, SymphoniaDecoder};
@@ -404,35 +404,47 @@ async fn run_job(
         ));
     }
 
-    check_cancelled(&cancellation)?;
-    let encrypted = AudioFile::open(&session, file_id, bytes_per_second, &item.track_id, cache_epoch)
-        .await
-        .map_err(|error| format!("could not open track audio: {error}"))?;
-    check_cancelled(&cancellation)?;
-    let controller = encrypted
-        .get_stream_loader_controller()
-        .map_err(|error| format!("could not control track audio stream: {error}"))?;
-    check_cancelled(&cancellation)?;
-    let key = session
-        .audio_key()
-        .request(resolved_spotify_id, file_id)
-        .await
-        .map_err(|error| format!("could not decrypt track audio: {error}"))?;
-    check_cancelled(&cancellation)?;
-
-    let decoded_cancel = cancellation.clone();
-    let decoded = tokio::task::spawn_blocking(move || {
-        decode_audio(
-            AudioDecrypt::new(Some(key), encrypted),
-            controller,
-            format,
-            duration_ms,
-            &decoded_cancel,
+    // As in playback, a kept key the file will not decode with gets one
+    // chance to be replaced by Spotify's before the file is blamed.
+    let mut kept_key_rejected = false;
+    let decoded = loop {
+        check_cancelled(&cancellation)?;
+        let encrypted = AudioFile::open(&session, file_id, bytes_per_second, &item.track_id, cache_epoch)
+            .await
+            .map_err(|error| format!("could not open track audio: {error}"))?;
+        check_cancelled(&cancellation)?;
+        let controller = encrypted
+            .get_stream_loader_controller()
+            .map_err(|error| format!("could not control track audio stream: {error}"))?;
+        check_cancelled(&cancellation)?;
+        let (key, source) = librespot_audio::audio_key(
+            &session, &item.track_id, resolved_spotify_id, file_id, cache_epoch,
         )
-    })
-    .await
-    .map_err(|error| format!("waveform decoder worker failed: {error}"))??;
-    check_cancelled(&cancellation)?;
+        .await
+        .map_err(|failure| format!("could not decrypt track audio: the audio key was {failure}"))?;
+        check_cancelled(&cancellation)?;
+
+        let decoded_cancel = cancellation.clone();
+        let decoded = tokio::task::spawn_blocking(move || {
+            decode_audio(
+                AudioDecrypt::new(Some(key), encrypted),
+                controller,
+                format,
+                duration_ms,
+                &decoded_cancel,
+            )
+        })
+        .await
+        .map_err(|error| format!("waveform decoder worker failed: {error}"))?;
+        check_cancelled(&cancellation)?;
+        match decoded {
+            Err(_) if source == KeySource::Kept && !kept_key_rejected => {
+                librespot_audio::forget_audio_key(&session, &item.track_id, file_id);
+                kept_key_rejected = true;
+            }
+            decoded => break decoded?,
+        }
+    };
 
     let write_path = path.clone();
     let decoded = tokio::task::spawn_blocking(move || {
