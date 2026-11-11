@@ -45,6 +45,14 @@
                      With no anchor the haze is the restrained glow from
                      the player bar (RESTRAINED).
 
+   haze.tone         written by the haze layer (Ambient.svelte).
+                     The colour of the rail's glass as it is on screen: the
+                     frosted haze under the window's left quarter, as one
+                     CSS colour ("" until a picture has been shown). The
+                     rail lights its selected row with it (app.css, THE
+                     SELECTED PLATE). Read from each picture once, as it is
+                     shown — never per frame.
+
    haze.awaiting     written by the panel.
                      true from a record change until the panel has decided
                      what that record's light comes from (lib/canvas.js):
@@ -133,6 +141,7 @@ export const haze = $state({
   awaiting: false,
   lightTop: 1,
   lightBottom: 1,
+  tone: "",
 });
 
 let onShift = null;

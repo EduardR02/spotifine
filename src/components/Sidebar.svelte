@@ -33,7 +33,7 @@
   import PlaylistRailRow from "./PlaylistRailRow.svelte";
   import { pins, loadPins, isPinned, openFolder, toggleFolder } from "../lib/pins.svelte.js";
   import { avatar, loadAvatar } from "../lib/avatar.svelte.js";
-  import { frost } from "../lib/ambient.svelte.js";
+  import { frost, haze } from "../lib/ambient.svelte.js";
 
   /** What the naming field is making: `{ kind: "playlist" | "folder",
       parent }`, `parent` being the folder a new folder goes in (the field
@@ -609,7 +609,7 @@
   </button>
 {/snippet}
 
-<aside class="sidebar glass-chrome" use:frost>
+<aside class="sidebar glass-chrome" use:frost style:--haze-tone={haze.tone || null}>
   <!-- The rail's top edge moves the window; on macOS the traffic lights sit
        in it. -->
   <div class="sidebar-top" data-tauri-drag-region></div>

@@ -38,6 +38,22 @@ const oklab = (r, g, b) => {
     0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
   ];
 };
+/** An OKLCH colour as encoded sRGB, clipped to the gamut. */
+const oklchToSrgb = (L, C, hueDeg) => {
+  const A = C * Math.cos((hueDeg * Math.PI) / 180), B = C * Math.sin((hueDeg * Math.PI) / 180);
+  const l = (L + 0.3963377774 * A + 0.2158037573 * B) ** 3;
+  const m = (L - 0.1055613458 * A - 0.0638541728 * B) ** 3;
+  const s = (L - 0.0894841775 * A - 1.291485548 * B) ** 3;
+  const enc = (v) => {
+    const c = Math.min(1, Math.max(0, v));
+    return c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055;
+  };
+  return [
+    enc(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+    enc(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+    enc(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s),
+  ];
+};
 /* Read the renderer's current reachability budgets rather than pinning a
    copied calibration; the contrast target is the independent contract. */
 const { G_CMAX, P_PEAK, HK_C, HK_BLUE, HK_A, HK_B } = TUNING.floats;
@@ -131,11 +147,21 @@ test("a selected row in the rail keeps its contrast over the brightest haze", ()
     [".lib-row.liked-row.active", "--saved-wash"],
   ]) {
     const w = wash(token(hue));
-    const bg = over(over(over(chrome, dense.rgb, dense.a), raise.rgb, raise.a), w.rgb, w.a);
-    for (const [name, target] of Object.entries(type)) {
-      const c = contrast(hex(token(name)), bg);
-      if (c < target) throw new Error(`${name} on ${selector}: ${c.toFixed(2)} under ${target}`);
-      expect(c).toBeGreaterThanOrEqual(target);
+    // The plate's light is the record's colour brought up to a light
+    // (--sel-light): any hue, from grey to its full chroma. The white
+    // raise it replaced is held as well, as the bound it was chosen under.
+    const lights = [[raise.rgb, raise.a]];
+    const l = Number(token("--sel-light-l")), cMax = Number(token("--sel-light-c")), a = Number(token("--sel-light-a"));
+    for (const c of [0, cMax / 2, cMax]) {
+      for (let h = 0; h < 360; h += 10) lights.push([oklchToSrgb(l, c, h), a]);
+    }
+    for (const [rgb, alpha] of lights) {
+      const bg = over(over(over(chrome, dense.rgb, dense.a), rgb, alpha), w.rgb, w.a);
+      for (const [name, target] of Object.entries(type)) {
+        const c = contrast(hex(token(name)), bg);
+        if (c < target) throw new Error(`${name} on ${selector}, light ${rgb.map((v) => v.toFixed(2))}: ${c.toFixed(2)} under ${target}`);
+        expect(c).toBeGreaterThanOrEqual(target);
+      }
     }
   }
 });

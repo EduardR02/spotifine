@@ -353,6 +353,15 @@
   --raise-1: rgba(255, 255, 255, 0.03);
   --raise-2: rgba(255, 255, 255, 0.075);
   --raise-3: rgba(255, 255, 255, 0.11);
+  /* The light of a selected row in the rail is the record's own: the hue of
+     the rail's glass as it is on screen (--haze-tone, from the haze layer),
+     at a fixed lightness and at most this chroma. Such a colour is dimmer
+     than white, so it lies on at a little more than the white raise it
+     replaces; glass.test.js holds the type over it for every hue, from
+     grey to the full chroma, and this alpha is what that leaves. */
+  --sel-light-l: 0.82;
+  --sel-light-c: 0.1;
+  --sel-light-a: 0.1;
   /* A selected row in the rail is lit — the raise and an accent wash — and
      light on the thinnest glass over the brightest haze is more than its
      type can stand (--fg-2 fell to 3.5:1). So it is also a step DENSER
@@ -843,16 +852,29 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    out along the row — the light faster, so the plate is never lighter
    than the two ends the type is held on (glass.test.js) — to a breath at
    its far end. Its top edge catches the bracket's colour beside it and
-   plain light beyond, and thins the same way. The playing row in a track
-   list is the same gesture on the pane's own glass. */
+   the plate's light beyond, and thins the same way. The playing row in a
+   track list is the same gesture on the pane's own glass.
+
+   The light is the record's: not white laid on the glass, which greys it,
+   but the colour the rail's glass already is (--haze-tone), brought up to
+   a light (--sel-light). The accent stays where the bracket is — its wash
+   is gone by the middle of the row — so the row is the accent's at its
+   edge and the record's along its length. --haze-tone is registered so
+   that the rail can ease from one record's colour to the next. */
+@property --haze-tone { syntax: "<color>"; inherits: true; initial-value: #5b7a94; }
+.sidebar { transition: --haze-tone 900ms var(--ease); }
 :is(.nav-item.active, .lib-row.active) {
   --plate-wash: var(--accent-wash);
+  --sel-light: oklch(from var(--haze-tone) var(--sel-light-l) min(var(--sel-light-c), calc(c * 2.6)) h);
   background:
     linear-gradient(90deg, color-mix(in srgb, var(--mark, var(--accent)) 44%, transparent),
-      rgb(255 255 255 / 0.1) 34%, rgb(255 255 255 / 0.03)) top / 100% 1px no-repeat,
+      color-mix(in srgb, var(--sel-light) 16%, transparent) 34%,
+      color-mix(in srgb, var(--sel-light) 4%, transparent)) top / 100% 1px no-repeat,
     linear-gradient(90deg, rgb(0 0 0 / 0.16), rgb(0 0 0 / 0.04)) bottom / 100% 1px no-repeat,
-    linear-gradient(90deg, var(--plate-wash), transparent 80%),
-    linear-gradient(90deg, var(--raise-2), rgb(255 255 255 / 0.04) 55%, rgb(255 255 255 / 0.015)),
+    linear-gradient(90deg, var(--plate-wash), transparent 52%),
+    linear-gradient(90deg, color-mix(in srgb, var(--sel-light) calc(var(--sel-light-a) * 100%), transparent),
+      color-mix(in srgb, var(--sel-light) calc(var(--sel-light-a) * 55%), transparent) 55%,
+      color-mix(in srgb, var(--sel-light) calc(var(--sel-light-a) * 20%), transparent)),
     linear-gradient(90deg, var(--tint-active) 36%, rgb(8 9 12 / 0.22));
 }
 .nav-item.active { color: var(--fg); }
