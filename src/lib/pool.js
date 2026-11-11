@@ -9,7 +9,7 @@
    With the pointer still, or anywhere but on a row, nothing runs.
    ===================================================================== */
 
-const ROWS = ".nav-item, .lib-row, .tl-row";
+const ROWS = ".nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row";
 
 /** Start following the pointer. Returns the stop. */
 export function watchPool() {

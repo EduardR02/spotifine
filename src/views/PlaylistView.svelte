@@ -34,6 +34,8 @@
     removePlaylistRecommendation,
   } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
+  import TrackFind from "../components/TrackFind.svelte";
+  import { findTerms, findTracks } from "../lib/find.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
@@ -217,6 +219,28 @@
       return byTrack.get(track)[occurrence];
     });
   });
+
+  /**
+   * Find: the rows whose song or artists match what is typed in the header's
+   * field, in the order the table is showing. It narrows what is shown and
+   * nothing else — a found row plays from its own place in the whole
+   * playlist (`found.at`), so what follows it is the playlist, not the
+   * other matches; Play and Shuffle are the whole playlist's as ever.
+   */
+  let findQuery = $state("");
+  // A query belongs to the playlist it was typed over.
+  $effect.pre(() => {
+    pl?.id;
+    untrack(() => (findQuery = ""));
+  });
+  const found = $derived.by(() => {
+    const terms = findTerms(findQuery);
+    if (!terms.length) return null;
+    const { rows, at } = findTracks(sortedTracks, terms);
+    return { rows, at, keys: at.map((i) => sortedTrackKeys[i]) };
+  });
+  const shownTracks = $derived(found ? found.rows : sortedTracks);
+  const shownTrackKeys = $derived(found ? found.keys : sortedTrackKeys);
 
   /**
    * Ascending, then descending, then off.
@@ -681,10 +705,12 @@
   function playFrom(i) {
     if (!pl) return;
     const queue = sortedTracks;
-    if (!queue[i]) return;
+    // A row found by the header's field is at `found.at` in the whole list.
+    const at = found ? found.at[i] : i;
+    if (!queue[at]) return;
     // The displayed order is a local projection; enqueue that exact array so
     // a click after sorting still targets the row the user selected.
-    playQueue(queue, i).catch(() => {});
+    playQueue(queue, at).catch(() => {});
   }
 
   const playingThis = $derived(isPlayingSource(`playlist:${pl?.id ?? ""}`));
@@ -1014,6 +1040,16 @@
               />
             {/snippet}
           </HeaderMenu>
+          {#if tracks.length}
+            <!-- Keyed to the playlist: another playlist opens with the field
+                 folded away and nothing typed. -->
+            {#key pl.id}
+              <TrackFind
+                bind:query={findQuery}
+                status={found ? `${found.rows.length} of ${tracks.length}` : ""}
+              />
+            {/key}
+          {/if}
         </div>
         {#if automaticStartBlocked}
           <!-- Calm by design: grey type under the controls, not a red banner.
@@ -1027,11 +1063,16 @@
       </div>
     </header>
 
-    {#if tracks.length}
+    {#if found && !found.rows.length}
+      <div class="empty">
+        <p class="h">No songs match “{findQuery.trim()}”.</p>
+        <p class="sub">Find looks at song names and artists in this playlist.</p>
+      </div>
+    {:else if tracks.length}
       <div style="margin-top:var(--s6)">
         <TrackList
-          tracks={sortedTracks}
-          trackKeys={sortedTrackKeys}
+          tracks={shownTracks}
+          trackKeys={shownTrackKeys}
           {playFrom}
           playlistId={editable ? pl.id : null}
           queueContext={`playlist:${pl?.id ?? ""}`}
@@ -1041,7 +1082,7 @@
           onSort={toggleSort}
           excludedTrackIds={excludedTrackIds}
           onSetExcluded={setTrackExcluded}
-          onReorder={editable && ownOrderShown && pl.rows_complete === true && !reorderBlocked ? reorderTracks : null}
+          onReorder={editable && ownOrderShown && !found && pl.rows_complete === true && !reorderBlocked ? reorderTracks : null}
         />
       </div>
     {:else}

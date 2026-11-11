@@ -546,15 +546,15 @@
     border-radius: var(--r2);
     transition: background-color var(--d1) var(--ease);
   }
-  .ep-row:hover, .ep-row:focus-within { background: var(--hover); }
-  /* The playing episode is marked exactly as the playing track row is. */
-  .ep-row.current {
-    background: linear-gradient(90deg, var(--accent-wash), transparent 46%);
-    box-shadow: inset 2px 0 var(--accent);
-  }
-  .ep-row.current:hover, .ep-row.current:focus-within {
-    background: linear-gradient(90deg, var(--accent-wash), transparent 46%), var(--hover);
-  }
+  /* Under the pointer, the rows' pool (app.css, THE POOL); with the
+     keyboard in the row and no pointer on it, the plate whole. */
+  .ep-row:focus-within { background: var(--hover); }
+  .ep-row:hover { background: var(--pool), var(--pool-rest); }
+  /* The playing episode is marked exactly as the playing track row is: the
+     bracket and the lit row are app.css's (THE BRACKET). */
+  .ep-row.current { background: var(--row-lit); }
+  .ep-row.current:focus-within { background: var(--row-lit), var(--hover); }
+  .ep-row.current:hover { background: var(--row-lit), var(--pool), var(--pool-rest); }
   .ep-row.current .ep-title { color: var(--accent); }
 
   /* The art plays, as a card's does: a foam disc rises into it under the

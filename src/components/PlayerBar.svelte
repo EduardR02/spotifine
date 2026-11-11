@@ -1223,7 +1223,7 @@
       background var(--d1) var(--ease);
   }
   .p-saved-row:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--pool), var(--pool-rest);
     color: var(--fg);
   }
   /* The unsaved heart: a 32px target around an 18px glyph, and no surface of

@@ -794,11 +794,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .nav-item svg { flex: none; opacity: 0.8; }
-.nav-item:hover:not(.active) { color: var(--fg); background: var(--pool), var(--hover-rest); }
+.nav-item:hover:not(.active) { color: var(--fg); background: var(--pool), var(--pool-rest); }
 /* THE POOL — the glass answers the hand where the hand is. A row under the
    pointer is not one flat plate: it rests a step under --hover and comes up
    to it in a soft pool around the pointer, which slides along the row with
    it (pool.js writes --px, the pointer's place in the row, on that one row).
+   Every kind of row takes it — the nav, the library, track lists, episodes,
+   history, the panel's up next, and the items of a menu (whose light is
+   the overlay's, a step stronger: --pool-rest and --hover-pool-a say how
+   much).
    It is light on the thing being pointed at and nowhere else, so nothing
    moves at the edge of sight. --px is registered so that it does not
    inherit: a move restyles the row and none of what it holds. Away from
@@ -810,18 +814,25 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    each, so a row under the pointer has an edge like everything else made
    of this material. */
 @property --px { syntax: "<length>"; inherits: false; initial-value: -999px; }
-:is(.nav-item, .lib-row, .tl-row) {
+:is(.nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row) {
+  --pool-rest: var(--hover-rest);
   --pool: radial-gradient(250px 130px at var(--px) 50%,
     rgb(255 255 255 / var(--hover-pool-a)),
     rgb(255 255 255 / calc(var(--hover-pool-a) * 0.55)) 42%,
     rgb(255 255 255 / 0));
   --strip-edge: inset 0 1px 0 rgb(255 255 255 / 0.05), inset 0 -1px 0 rgb(0 0 0 / 0.1);
 }
-:is(.nav-item:not(.active), .lib-row:not(.active), .tl-row:not(.current, .unavailable, .drag-source)):hover {
+:is(.nav-item:not(.active), .lib-row:not(.active), .tl-row:not(.current, .unavailable, .drag-source),
+    .ep-row:not(.current), .hi-main, .np-next):hover {
   box-shadow: var(--strip-edge);
 }
+/* On an overlay a lit item is white 0.08 (glass.test.js): the pool comes up
+   to that and no further. */
+:is(.menu-item, .p-saved-row) { --pool-rest: rgb(255 255 255 / 0.055); --hover-pool-a: 0.0265; }
 @media (prefers-reduced-motion: reduce) {
   :root { --hover-rest: var(--hover); --hover-pool-a: 0; }
+  :is(.menu-item, .p-saved-row) { --pool-rest: rgb(255 255 255 / 0.08); --hover-pool-a: 0; }
+  .np-next { --pool-rest: var(--raise-1); }
 }
 /* THE SELECTED PLATE — "this one" is drawn from its left edge: THE BRACKET
    is the light, and everything else about the row is that light falling
@@ -855,7 +866,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    pixels, and outside it blooms a little onto the glass beside the row,
    fullest at the middle of the line and gone by its ends. All of it is box
    shadows, which is what lets it follow the corners. */
-:is(.nav-item.active, .lib-row.active, .tl-row.current) {
+:is(.nav-item.active, .lib-row.active, .tl-row.current, .ep-row.current) {
   --mark-lit: color-mix(in srgb, var(--mark, var(--accent)) 84%, #fff);
   --bracket:
     inset 2px 0 var(--mark-lit),
@@ -935,7 +946,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .lib-row:hover .lib-name { color: var(--fg); }
 /* The same plate the nav rows above take under the pointer. */
-.lib-row:hover:not(.active) { background: var(--pool), var(--hover-rest); }
+.lib-row:hover:not(.active) { background: var(--pool), var(--pool-rest); }
 .lib-count {
   font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-med);
   color: var(--count);
@@ -1361,7 +1372,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   padding: var(--s2); border-radius: var(--r2); text-align: left;
   transition: background-color var(--d1) var(--ease);
 }
-.np-next:hover { background: var(--raise-1); }
+/* On a card, which is already lit a step: the pool brings the row to what
+   its flat plate was, and it rests under that. */
+.np-next { --pool-rest: rgb(255 255 255 / 0.01); }
+.np-next:hover { background: var(--pool), var(--pool-rest); }
 .np-next-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .np-next-copy strong, .np-next-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .np-next-copy strong { font-size: var(--t-12); font-weight: var(--w-med); }
@@ -2037,7 +2051,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* The lip, drawn as the planes' rim is: a ring one pixel wide over the
    border, in shade along the top and lit along the foot, where the edge of
    the well faces the light. */
-.field::after {
+:is(.field, .seg)::after {
   content: ""; position: absolute; inset: -1px; border-radius: inherit; padding: 1px;
   pointer-events: none;
   background: linear-gradient(176deg,
@@ -2195,7 +2209,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--r2);
   transition: background-color var(--d1) var(--ease);
 }
-.tl-row:hover { background: var(--pool), var(--hover-rest); }
+.tl-row:hover { background: var(--pool), var(--pool-rest); }
 .tl-row.unavailable { cursor: default; }
 .tl-row.unavailable > :not(.c-more):not(.q-actions) { opacity: 0.42; }
 .tl-row.unavailable:hover { background: transparent; }
@@ -2204,15 +2218,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    without reading. A left-anchored accent wash and THE BRACKET do that at
    a glance, where a recoloured title alone only worked once you were
    already looking at it. */
-.tl-row.current {
+:is(.tl-row, .ep-row).current {
   --row-lit:
     linear-gradient(90deg, color-mix(in srgb, var(--accent) 40%, transparent),
       rgb(255 255 255 / 0.07) 22%, transparent 52%) top / 100% 1px no-repeat,
     linear-gradient(90deg, rgb(0 0 0 / 0.14), transparent 52%) bottom / 100% 1px no-repeat,
     linear-gradient(90deg, var(--accent-wash), transparent 46%);
-  background: var(--row-lit);
 }
-.tl-row.current:hover { background: var(--row-lit), var(--pool), var(--hover-rest); }
+.tl-row.current { background: var(--row-lit); }
+.tl-row.current:hover { background: var(--row-lit), var(--pool), var(--pool-rest); }
 .tl-row.current .t-name { color: var(--accent); }
 .tl-row.current .c-idx { color: var(--accent); }
 
@@ -2736,6 +2750,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .menu-item:hover:not(:disabled),
 .menu-item:focus-visible { background: rgba(255, 255, 255, 0.08); color: var(--fg); outline: none; }
+/* Under the pointer the item is lit where the pointer is (THE POOL); an
+   item the keyboard is on has no pointer in it and is lit whole. */
+.menu-item:hover:not(:disabled, :focus-visible) { background: var(--pool), var(--pool-rest); }
 .menu-item .hint { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--fg-2); }
 .menu-item.danger { color: var(--danger); }
 /* A copy that landed takes the colour this app has for a thing you just did;
@@ -3189,13 +3206,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.17), var(--catch);
 }
 .sel-btn:hover:not(:disabled) .icon { color: var(--fg-1); }
-/* Open outranks the hover: the pointer is on the trigger when the list
-   opens, and the plain hover rule took its foam ring and chevron away. */
-.sel-btn.open, .sel-btn.open:hover:not(:disabled) {
+/* Open is the lit pill and nothing more: the list hanging from it already
+   says it is open, and an accent ring on glass said it twice. It holds the
+   lit state when the pointer leaves for the list. */
+.sel-btn.open {
   background: var(--raise-2); color: var(--fg);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 52%, transparent);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.17), var(--catch);
 }
-.sel-btn.open .icon, .sel-btn.open:hover:not(:disabled) .icon { color: var(--accent); }
+.sel-btn.open .icon { color: var(--fg-1); }
 .sel-btn:disabled { opacity: 0.45; }
 .sel-value { font-family: var(--font-number); font-variant-numeric: tabular-nums; }
 
@@ -3330,9 +3348,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
      control into a 74px-tall lozenge with semicircular ends, and 18px leaves
      a rounded rectangle that still looks like the same object. */
   border-radius: 18px;
-  background: rgb(0 0 0 / 0.16); border: 1px solid var(--line);
-  /* A track the segments sit in: pressed into the glass, like THE FIELD. */
-  box-shadow: var(--groove), 0 1px 0 rgb(255 255 255 / 0.035);
+  /* A track the segments sit in: THE FIELD's well, lip and all. */
+  position: relative;
+  background: linear-gradient(180deg, rgb(0 0 0 / 0.3), rgb(0 0 0 / 0.15));
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  box-shadow: var(--well);
 }
 .seg-btn {
   display: inline-flex; align-items: center; gap: var(--s2);
@@ -3341,23 +3361,23 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .seg-btn:hover { color: var(--fg); background: var(--hover); }
-/* Selected: a raised chip lit from the top in foam. Not a solid foam fill —
-   this control sits above a list whose playing row is already foam-washed, and
-   two saturated foam objects in one column makes neither of them the answer. */
+/* Selected: a bead of clear glass lying in the well — lit from above,
+   brightest along its top edge, and standing a little off the floor. No
+   accent: the well it lies in is dark, so the one lit thing in it is
+   already the answer, and the list under this control has the accent's
+   playing row to itself. */
 .seg-btn.on,
 .seg-btn.on:hover {
   color: var(--fg);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--foam) 24%, transparent), transparent),
-    var(--raise-2);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 32%, transparent),
-              var(--catch), 0 1px 2px rgb(0 0 0 / 0.3);
+  background: linear-gradient(180deg, rgb(255 255 255 / 0.14), rgb(255 255 255 / 0.065));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.17), inset 0 0 0 1px rgb(255 255 255 / 0.045),
+              0 1px 2px rgb(0 0 0 / 0.42), 0 3px 8px -3px rgb(0 0 0 / 0.5);
 }
 .seg-n {
   font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-med);
   color: var(--count);
 }
-.seg-btn.on .seg-n { color: color-mix(in srgb, var(--foam) 70%, var(--fg)); }
+.seg-btn.on .seg-n { color: var(--fg-1); }
 /* a pasted paragraph of a search term truncates instead of blowing the row out */
 .chip .label {
   min-width: 0; max-width: 220px; text-align: left; color: inherit;

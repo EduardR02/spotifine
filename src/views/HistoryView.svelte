@@ -874,7 +874,7 @@
     border-radius: var(--r2); text-align: left;
     transition: background-color var(--d1) var(--ease);
   }
-  .hi-main:hover { background: var(--hover); }
+  .hi-main:hover { background: var(--pool), var(--pool-rest); }
 
   /* A day opens with the app's own structural hairline — the one that leads
      with foam and fades into the ordinary line colour — drawn across the top
