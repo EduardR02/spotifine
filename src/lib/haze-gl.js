@@ -32,7 +32,7 @@
    held between records.
    ===================================================================== */
 
-import { prepare, radiusOf, noiseKeys, saturateMatrix, lightOf, TUNING } from "./haze.js";
+import { prepare, radiusOf, noiseKeys, saturateMatrix, lightOf, toneOf, TONE_COLUMNS, TUNING } from "./haze.js";
 
 /** The measure passes sum this many texels each way at a time. */
 const BLOCK = 8;
@@ -612,7 +612,7 @@ export function createGlHaze() {
 
   /**
    * Render a haze and its frosted twin — renderHaze's arguments, and its
-   * answers as bitmaps: { bitmap, frost, grey, light }.
+   * answers as bitmaps: { bitmap, frost, tone, grey, light }.
    */
   function render(src, geo, tint, { scale = 1, seed = 1, frost = null } = {}) {
     if (lost || gl.isContextLost()) return null;
@@ -691,6 +691,7 @@ export function createGlHaze() {
       const bitmap = canvas.transferToImageBitmap();
 
       let frosted = null;
+      let railTone = null;
       if (frost) {
         const fw = Math.ceil(w / 2), fh = Math.ceil(h / 2);
         const sigma = frost.sigma / 2;
@@ -718,6 +719,14 @@ export function createGlHaze() {
           uW: fw,
           uH: fh,
         });
+        /* The rail's colour (toneOf): two columns of the frost, read back
+           here in the worker, where the stall is nobody's frame. */
+        const columns = new Uint8Array(TONE_COLUMNS.length * fh * 4);
+        TONE_COLUMNS.forEach((at, i) => {
+          gl.readPixels(Math.min(fw - 1, Math.floor(fw * at)), 0, 1, fh, gl.RGBA, gl.UNSIGNED_BYTE,
+            columns.subarray(i * fh * 4, (i + 1) * fh * 4));
+        });
+        railTone = toneOf(columns);
         frosted = canvas.transferToImageBitmap();
       }
       if (gl.isContextLost()) {
@@ -726,7 +735,7 @@ export function createGlHaze() {
         frosted?.close();
         return null;
       }
-      return { bitmap, frost: frosted, grey: plan.grey, light };
+      return { bitmap, frost: frosted, tone: railTone, grey: plan.grey, light };
     } finally {
       for (const t of textures) gl.deleteTexture(t);
       textures = [];

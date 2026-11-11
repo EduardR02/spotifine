@@ -942,8 +942,9 @@
       <!-- With no room the panel steps aside on its own, and the button waits
            for the room rather than changing what was asked for. -->
       <button
-        class="btn-round"
+        class="btn-round p-panel"
         class:on={nowPlayingShown()}
+        aria-pressed={nowPlayingShown()}
         disabled={!nowPlayingPanel.fits}
         title={nowPlayingPanel.fits ? "Now playing details" : "Now playing needs a wider window"}
         onclick={() => morphLayout(() => setNowPlayingOpen(!ui.nowPlayingOpen))}
@@ -1045,6 +1046,10 @@
   .p-speed:hover:not(:disabled) { color: var(--fg); background: var(--hover-2); }
   .p-speed[aria-expanded="true"] { color: var(--fg); background: var(--hover-2); }
   .p-speed.on, .p-speed.on:hover:not(:disabled) { color: var(--accent); }
+  /* The panel's button is not marked in the accent while the panel is open:
+     the panel standing beside the bar already says so, and the button sits
+     between neutral glass. It is the lit glyph, as an open menu's is. */
+  .p-panel.on, .p-panel.on:hover:not(:disabled) { color: var(--fg); }
   .p-speed.on::after {
     content: ""; position: absolute; bottom: 1px; left: 50%; margin-left: -1.5px;
     width: 3px; height: 3px; border-radius: 50%; background: var(--accent);

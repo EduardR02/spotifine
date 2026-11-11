@@ -28,7 +28,7 @@
             the loop has been seen: if its representative frame is a
             different picture from the one the haze was made of, render it.
    Messages out (seq, key and fade are echoed):
-     haze   { seq, key, fade, bitmap, frost, grey, light, distance?, gpu, ms }
+     haze   { seq, key, fade, bitmap, frost, tone, grey, light, distance?, gpu, ms }
                                                      a picture to show
      blank  { seq }                                  that frame was black
      light  { key, light }                           the type's light
@@ -108,6 +108,7 @@ function renderOnCpu(src, m, options) {
   return {
     bitmap: bitmapOf(out.rgba, m.geo.w, m.geo.h),
     frost: out.frost ? bitmapOf(out.frost, out.frostW, out.frostH) : null,
+    tone: out.tone,
     grey: out.grey,
     light: out.light,
   };
@@ -143,6 +144,7 @@ function paint(m, src, seen = null, distance = undefined) {
       fade: m.fade,
       bitmap: out.bitmap,
       frost: out.frost,
+      tone: out.tone,
       grey: out.grey,
       light,
       distance,

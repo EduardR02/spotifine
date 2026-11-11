@@ -162,26 +162,6 @@
   let queued = null;
   let z = 1;
 
-  /* The colour of the rail's glass (haze.tone): the frosted picture's left
-     quarter, read through an 8×8 copy of it. The frost is already a 12px
-     blur, so a handful of samples is its colour; one small draw and a
-     64-pixel read per picture shown, which is once or twice a record. */
-  let probe = null;
-  function toneOf(frosted) {
-    probe ??= Object.assign(document.createElement("canvas"), { width: 8, height: 8 })
-      .getContext("2d", { willReadFrequently: true });
-    probe.drawImage(frosted, 0, 0, 8, 8);
-    const px = probe.getImageData(0, 0, 2, 8).data;
-    let r = 0, g = 0, b = 0;
-    for (let i = 0; i < px.length; i += 4) {
-      r += px[i];
-      g += px[i + 1];
-      b += px[i + 2];
-    }
-    const n = px.length / 4;
-    return `rgb(${Math.round(r / n)} ${Math.round(g / n)} ${Math.round(b / n)})`;
-  }
-
   function show(bitmap, frosted, fade, geo) {
     const el = layerEls.find((c) => c && !stack.some((s) => s.el === c));
     if (!el) {
@@ -190,7 +170,6 @@
       queued = { bitmap, frosted, fade, geo };
       return;
     }
-    if (frosted) haze.tone = toneOf(frosted);
     const [hazeCanvas, frostClip] = el.children;
     const frostCanvas = frostClip.firstElementChild;
     hazeCanvas.getContext("bitmaprenderer").transferFromImageBitmap(bitmap);
@@ -349,6 +328,8 @@
           return;
         }
         show(m.bitmap, m.frost, lit ? m.fade : "first", asked?.geo);
+        // The rail's colour, measured in the worker on the frost it made.
+        if (m.tone) haze.tone = `rgb(${m.tone[0]} ${m.tone[1]} ${m.tone[2]})`;
         lit = true;
         grey = m.grey;
         blankTries = 0;

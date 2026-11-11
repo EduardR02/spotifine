@@ -1040,7 +1040,7 @@
               />
             {/snippet}
           </HeaderMenu>
-          {#if tracks.length}
+          {#if tracks.length || findQuery}
             <!-- Keyed to the playlist: another playlist opens with the field
                  folded away and nothing typed. -->
             {#key pl.id}
@@ -1073,6 +1073,7 @@
         <TrackList
           tracks={shownTracks}
           trackKeys={shownTrackKeys}
+          queueOrder={!found}
           {playFrom}
           playlistId={editable ? pl.id : null}
           queueContext={`playlist:${pl?.id ?? ""}`}

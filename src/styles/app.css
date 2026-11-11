@@ -413,11 +413,22 @@
      the root's light anyway. */
   --rim-k: 1;
   --frost-edge: brightness(2.4) saturate(1.3);
-  /* The band's shape: two soft rings that follow the plane's corners at
-     any size (an SVG with no viewBox is laid out at the box it masks, so
-     the radius and the widths stay in pixels) — the line, and under it the
-     tail at a third of its strength — weighted toward the light. */
-  --edge-ring: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='a' x='-5%25' y='-5%25' width='110%25' height='110%25'%3E%3CfeGaussianBlur stdDeviation='0.9'/%3E%3C/filter%3E%3Cfilter id='b' x='-5%25' y='-5%25' width='110%25' height='110%25'%3E%3CfeGaussianBlur stdDeviation='2.4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' rx='12' fill='none' stroke='%23fff' stroke-opacity='0.42' stroke-width='8' filter='url(%23b)'/%3E%3Crect width='100%25' height='100%25' rx='12' fill='none' stroke='%23fff' stroke-opacity='0.8' stroke-width='3.2' filter='url(%23a)'/%3E%3C/svg%3E");
+  /* The band's shape: a line against the rim and under it a tail at a
+     third of its strength, nine and a half pixels deep in all. It is
+     written as its fall-off along the way in from an edge (--edge-run) and
+     the same fall-off round a corner, out from the corner's centre
+     (--edge-turn, for the planes' 12px radius), and the plane masks its
+     band with four edges and four corners of them. Gradients, not a
+     picture: the band was an SVG of two blurred rings laid out at the
+     plane's size, and every frame of a window resize or a panel drag
+     rasterised those blurs again at the size of each plane. */
+  --edge-run: rgb(0 0 0 / 0.86), rgb(0 0 0 / 0.75) 1px, rgb(0 0 0 / 0.51) 2px, rgb(0 0 0 / 0.31) 3px,
+              rgb(0 0 0 / 0.21) 4px, rgb(0 0 0 / 0.14) 5px, rgb(0 0 0 / 0.085) 6px,
+              rgb(0 0 0 / 0.045) 7px, rgb(0 0 0 / 0.02) 8px, rgb(0 0 0 / 0) 9.5px;
+  --edge-turn: rgb(0 0 0 / 0) 2.5px, rgb(0 0 0 / 0.02) 4px, rgb(0 0 0 / 0.045) 5px,
+               rgb(0 0 0 / 0.085) 6px, rgb(0 0 0 / 0.14) 7px, rgb(0 0 0 / 0.21) 8px,
+               rgb(0 0 0 / 0.31) 9px, rgb(0 0 0 / 0.51) 10px, rgb(0 0 0 / 0.75) 11px,
+               rgb(0 0 0 / 0.86) 12px;
   --edge-fall: linear-gradient(168deg, #000, rgb(0 0 0 / 0.62) 38%, rgb(0 0 0 / 0.34));
   --edge-shade: inset 0 -10px 14px -12px rgb(0 0 0 / 0.34);
   --lift-plane:    0 0 0 1px rgb(0 0 0 / 0.24), 0 2px 3px rgb(0 0 0 / 0.24),
@@ -548,12 +559,29 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: inherit; pointer-events: none;
   -webkit-backdrop-filter: var(--frost-edge);
           backdrop-filter: var(--frost-edge);
-  -webkit-mask-image: var(--edge-ring), var(--edge-fall);
-          mask-image: var(--edge-ring), var(--edge-fall);
-  -webkit-mask-size: 100% 100%;
-          mask-size: 100% 100%;
-  -webkit-mask-composite: source-in;
-          mask-composite: intersect;
+  /* The weighting toward the light, cut to the band: the fall, then the
+     four edges (top, bottom, left, right) and the four corners (top left,
+     top right, bottom left, bottom right). */
+  --edge-mask:
+    var(--edge-fall),
+    linear-gradient(to bottom, var(--edge-run)), linear-gradient(to top, var(--edge-run)),
+    linear-gradient(to right, var(--edge-run)), linear-gradient(to left, var(--edge-run)),
+    radial-gradient(circle at 100% 100%, var(--edge-turn)), radial-gradient(circle at 0 100%, var(--edge-turn)),
+    radial-gradient(circle at 100% 0, var(--edge-turn)), radial-gradient(circle at 0 0, var(--edge-turn));
+  --edge-at: 0 0, 12px 0, 12px 100%, 0 12px, 100% 12px, 0 0, 100% 0, 0 100%, 100% 100%;
+  --edge-size: 100% 100%, calc(100% - 24px) 9.5px, calc(100% - 24px) 9.5px,
+               9.5px calc(100% - 24px), 9.5px calc(100% - 24px),
+               12px 12px, 12px 12px, 12px 12px, 12px 12px;
+  -webkit-mask-image: var(--edge-mask);
+          mask-image: var(--edge-mask);
+  -webkit-mask-position: var(--edge-at);
+          mask-position: var(--edge-at);
+  -webkit-mask-size: var(--edge-size);
+          mask-size: var(--edge-size);
+  -webkit-mask-repeat: no-repeat;
+          mask-repeat: no-repeat;
+  -webkit-mask-composite: source-in, source-over, source-over, source-over, source-over, source-over, source-over, source-over, source-over;
+          mask-composite: intersect, add, add, add, add, add, add, add, add;
 }
 .glass-card {
   /* Most cards are no taller than the rim's top light is deep, so the
@@ -655,6 +683,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 :root { --rim-w: 1px; }
 @media (resolution < 1.25dppx) {
   :root { --rim-w: 1.5px; --rim-k: 0.75; }
+  /* A card's own step under the planes, at this density's light. */
+  .glass-card { --rim-k: 0.6; }
 }
 /* A STRIP is the frost without the object: the sticky bars that content
    scrolls under — topbar, table heads — are part of the pane they sit in,
@@ -813,8 +843,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    the overlay's, a step stronger: --pool-rest and --hover-pool-a say how
    much).
    It is light on the thing being pointed at and nowhere else, so nothing
-   moves at the edge of sight. --px is registered so that it does not
-   inherit: a move restyles the row and none of what it holds. Away from
+   moves at the edge of sight. --px and --pool are registered so that they
+   do not inherit: a move restyles the row and none of what it holds
+   (unregistered, --pool carried the pointer's place down to every child
+   of the row, and each move restyled them all). Away from
    it (touch, reduced motion, a row reached before the pointer has moved)
    the pool lies off the row and the plate is the rest alone.
 
@@ -823,6 +855,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    each, so a row under the pointer has an edge like everything else made
    of this material. */
 @property --px { syntax: "<length>"; inherits: false; initial-value: -999px; }
+@property --pool { syntax: "*"; inherits: false; }
 :is(.nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row) {
   --pool-rest: var(--hover-rest);
   --pool: radial-gradient(250px 130px at var(--px) 50%,
@@ -859,13 +892,19 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    but the colour the rail's glass already is (--haze-tone), brought up to
    a light (--sel-light). The accent stays where the bracket is — its wash
    is gone by the middle of the row — so the row is the accent's at its
-   edge and the record's along its length. --haze-tone is registered so
-   that the rail can ease from one record's colour to the next. */
-@property --haze-tone { syntax: "<color>"; inherits: true; initial-value: #5b7a94; }
-.sidebar { transition: --haze-tone 900ms var(--ease); }
+   edge and the record's along its length. The rail carries --haze-tone
+   as a plain value; each row takes it as --row-tone, which is registered
+   and does not inherit, and only a selected row eases it from one record's
+   colour to the next — so a change of record restyles the rail once and
+   then animates two rows, not the rail's whole subtree for every frame of
+   the fade. Every row holds the tone, so a row that becomes selected
+   starts from the colour and does not fade in from nothing. */
+@property --row-tone { syntax: "<color>"; inherits: false; initial-value: #5b7a94; }
+:is(.nav-item, .lib-row) { --row-tone: var(--haze-tone, #5b7a94); }
+:is(.nav-item, .lib-row).active { transition: --row-tone 900ms var(--ease); }
 :is(.nav-item.active, .lib-row.active) {
   --plate-wash: var(--accent-wash);
-  --sel-light: oklch(from var(--haze-tone) var(--sel-light-l) min(var(--sel-light-c), calc(c * 2.6)) h);
+  --sel-light: oklch(from var(--row-tone) var(--sel-light-l) min(var(--sel-light-c), calc(c * 2.6)) h);
   background:
     linear-gradient(90deg, color-mix(in srgb, var(--mark, var(--accent)) 44%, transparent),
       color-mix(in srgb, var(--sel-light) 16%, transparent) 34%,
@@ -2722,16 +2761,26 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .p-right { display: flex; align-items: center; justify-content: flex-end; gap: var(--s2); min-width: 0; }
 .p-right > .p-volume { margin-left: var(--s1); }
 .vol { display: flex; align-items: center; width: 96px; height: 12px; flex: none; cursor: pointer; }
-.vol-rail { position: relative; width: 100%; height: 3px; border-radius: var(--rf);
-  background: rgba(255, 255, 255, 0.13); overflow: hidden; }
-/* The level is clear glass, lit: no colour of its own, brighter toward its
-   head as the seek line is, and up a step under the pointer. The seek line
-   is the one coloured line in the bar — it is the record's time — and a
-   second line in a dulled accent beside it was neither that nor neutral. */
+/* The volume is glass in glass: a groove pressed into the bar — THE FIELD's
+   well at a line's height, shaded under its upper lip, its lower lip lit —
+   and in it a rod of clear glass for the level. The rod has no colour of
+   its own: a bright crown where the light falls on it, a clearer belly, a
+   breath of light back along its foot, and it is fullest at its head and
+   thins toward the far end. It is slid, not stretched (a translate, on the
+   compositor), so its round head stays round at every level. The seek line
+   stays the bar's one coloured line: it is the record's time. */
+.vol-rail { position: relative; width: 100%; height: 4px; border-radius: var(--rf);
+  background: rgb(0 0 0 / 0.3);
+  box-shadow: inset 0 1px 1px rgb(0 0 0 / 0.55), 0 1px 0 rgb(255 255 255 / 0.1);
+  overflow: hidden; }
 .vol-fill {
-  position: absolute; inset: 0; transform-origin: left; transform: scaleX(var(--p, 0.6));
-  background: linear-gradient(90deg, rgb(255 255 255 / 0.5), rgb(255 255 255 / 0.9));
-  opacity: 0.72;
+  position: absolute; inset: 0; border-radius: inherit;
+  transform: translate3d(calc((var(--p, 0.6) - 1) * 100%), 0, 0);
+  background:
+    linear-gradient(90deg, rgb(4 5 8 / 0.24), rgb(4 5 8 / 0) 70%),
+    linear-gradient(180deg, rgb(255 255 255 / 0.96), rgb(255 255 255 / 0.62) 52%, rgb(255 255 255 / 0.78));
+  box-shadow: 0 0 0 0.5px rgb(255 255 255 / 0.12);
+  opacity: 0.86;
   transition: opacity var(--d1) var(--ease);
 }
 .vol:hover .vol-fill, .vol:focus-visible .vol-fill { opacity: 1; }

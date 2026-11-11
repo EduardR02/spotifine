@@ -35,6 +35,10 @@
     /** `tracks`' occurrence keys, when the page holds a proof of them that a
         fresh count cannot give (a local reorder carries its rows' keys). */
     trackKeys = null,
+    /** Whether `tracks` is the queue this list plays, row for row. A list
+        narrowed by a find is not: its rows are at other places in the queue,
+        and the playing row is then found by its song alone. */
+    queueOrder = true,
     playFrom,
     showAlbum = true,
     showArt = true,
@@ -361,7 +365,7 @@
     // When this list IS the playing context the index still agrees, and taking
     // it keeps duplicates resolving to the instance actually playing.
     const i = playback.current_index;
-    if (i >= 0 && i < tracks.length && tracks[i]?.uri === uri) return i;
+    if (queueOrder && i >= 0 && i < tracks.length && tracks[i]?.uri === uri) return i;
     return tracks.findIndex((t) => t.uri === uri);
   });
 

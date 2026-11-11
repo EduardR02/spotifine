@@ -564,6 +564,46 @@ export function sourceStats(src, rect) {
 const TOP_END = 0.18;
 const BOTTOM_START = 0.58;
 
+/** Where the rail's glass is sampled for its colour (toneOf): two columns
+    of the frost, as fractions of its width — the rail is the window's left
+    fifth or so, and the frost is a 12px blur, so two columns are its
+    colour. */
+export const TONE_COLUMNS = [0.07, 0.17];
+
+/**
+ * The colour of the rail's glass (haze.tone, ambient.svelte.js): the mean
+ * of the sampled frost pixels, as [r, g, b] bytes. `samples` is RGBA bytes,
+ * however they were gathered — the CPU path picks them out of the frost it
+ * holds, the GPU path reads the same columns back in the worker.
+ */
+export function toneOf(samples) {
+  let r = 0, g = 0, b = 0;
+  for (let i = 0; i < samples.length; i += 4) {
+    r += samples[i];
+    g += samples[i + 1];
+    b += samples[i + 2];
+  }
+  const n = Math.max(1, samples.length / 4);
+  return [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+}
+
+/** The TONE_COLUMNS of an RGBA picture, one after the other. */
+function toneColumns(rgba, w, h) {
+  const out = new Uint8Array(TONE_COLUMNS.length * h * 4);
+  let o = 0;
+  for (const at of TONE_COLUMNS) {
+    const x = Math.min(w - 1, Math.floor(w * at));
+    for (let y = 0; y < h; y++) {
+      const i = (y * w + x) * 4;
+      out[o++] = rgba[i];
+      out[o++] = rgba[i + 1];
+      out[o++] = rgba[i + 2];
+      out[o++] = rgba[i + 3];
+    }
+  }
+  return out;
+}
+
 /**
  * How bright a picture is under the panel's type: the relative luminance
  * of the bright end (90th percentile) of the top and bottom bands of
@@ -1006,7 +1046,7 @@ function barFalloff(closed, x, y, h) {
  * @param geo   see prepare
  * @param tint  encoded [r, g, b] of the record's colour, for what has none
  * @param frost the glass planes' frost (parseFrost), or null for none
- * @returns { rgba, frost, frostW, frostH, gain, grey, light } — the haze as
+ * @returns { rgba, frost, frostW, frostH, tone, gain, grey, light } — the haze as
  *          8-bit RGBA; the same haze frosted (or null), at half its size
  *          (frostW x frostH); the gain the mean ceilings took; the share of
  *          pixels that took the record's tint; and how bright the panel's
@@ -1293,6 +1333,7 @@ function emit(out, gain, plan, src, seed, frost, seam) {
     frost: frosted,
     frostW: fw,
     frostH: fh,
+    tone: frosted ? toneOf(toneColumns(frosted, fw, fh)) : null,
     gain,
     grey: plan.grey,
     light,

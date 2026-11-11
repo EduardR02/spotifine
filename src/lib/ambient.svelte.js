@@ -50,8 +50,10 @@
                      frosted haze under the window's left quarter, as one
                      CSS colour ("" until a picture has been shown). The
                      rail lights its selected row with it (app.css, THE
-                     SELECTED PLATE). Read from each picture once, as it is
-                     shown — never per frame.
+                     SELECTED PLATE). Measured in the haze worker on each
+                     frost it renders (haze.js, toneOf) and published as
+                     that picture is shown — never per frame, and never
+                     read back on this thread.
 
    haze.awaiting     written by the panel.
                      true from a record change until the panel has decided

@@ -56,8 +56,12 @@
 
   function openTop() {
     if (!top) return;
-    if (top.kind === "track") keep("track", tracks.find((t) => t.id === top.id) ?? top);
-    else keep(top.kind, top, top.sub);
+    // A song is kept as the row it is in the Songs list — the whole track,
+    // which is what playing it again takes; a top hit that is not in the
+    // list is played now but not kept.
+    const row = top.kind === "track" ? tracks.find((t) => t.id === top.id) : null;
+    if (row) keep("track", row);
+    else if (top.kind !== "track") keep(top.kind, top, top.sub);
     if (top.kind === "artist") return navigateArtist(top.id, top.name);
     if (top.kind === "album") return navigate("album", top.id);
     if (top.kind === "playlist") return navigate("playlist", top.id);
@@ -168,7 +172,8 @@
   }
 
   let recents = $state(readList(RECENTS_KEY, RECENTS_MAX, (s) => typeof s === "string" && s.trim()));
-  let opened = $state(readList(OPENED_KEY, OPENED_MAX, (e) => e && typeof e.id === "string" && typeof e.name === "string" && TOP_LABEL[e.kind]));
+  let opened = $state(readList(OPENED_KEY, OPENED_MAX, (e) => e && typeof e.id === "string" && typeof e.name === "string" && TOP_LABEL[e.kind] &&
+    (e.kind !== "track" || typeof e.track?.uri === "string")));
 
   function writeRecents(next) {
     recents = next.slice(0, RECENTS_MAX);
