@@ -1,6 +1,6 @@
 [package]
 name = "spotifine"
-version = "0.2.5"
+version = "0.2.6"
 description = "Spotifine, Spotify without the bloat"
 authors = ["you"]
 edition = "2021"
