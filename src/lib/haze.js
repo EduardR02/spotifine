@@ -16,7 +16,9 @@
    video exactly as the video shows it, and to its left as its own mirror
    image — continuous at the video's edge — magnified with distance, so the
    window is one large view of the picture rather than repeated copies.
-   Then it is blurred lightly, once, and held under the ceilings.
+   Then it is blurred lightly, once, given its fall-off — light has a
+   source, and the haze is brightest there: beside a Canvas, at a cover's
+   tile, over the player bar — and held under the ceilings.
 
    Blur happens in LINEAR light, as a lens does it: a convex mix of linear
    colours is never brighter than its brightest input, so the ceilings hold
@@ -742,6 +744,19 @@ const ZOOM_REACH = 0.55;
 const FALLOFF = 0.2;
 const FALL_EXP = 1.2;
 const FALL_CHROMA = 0.6;
+/** The pool. A Canvas fills the panel from top to bottom, and its light
+    falls off to the left only. A cover is a tile in the panel, POOL_Y of
+    the way down it, and under the panel its light is a pool at that
+    height: it falls off above and below it as well, by POOL (in L) at the
+    panel's further end, along the distance to POOL_EXP — little within
+    the tile's own height, most beyond it — so the tile sits in its own
+    light and the type at the panel's foot on the quiet end of it. Left of
+    the panel the pool dissolves, over POOL_REACH of the space there, into
+    the plain fall-off: the panes keep the light they had. */
+const POOL = 0.2;
+const POOL_EXP = 1.3;
+const POOL_Y = 0.44;
+const POOL_REACH = 0.6;
 /** The lens averages chroma away where colours meet; GIVE_BACK of the
     parts' mean chroma is given back, at most GIVE_MAX times what is left. */
 const GIVE_BACK = 0.85;
@@ -813,7 +828,7 @@ export const TUNING = {
     C_MEAN, C_BUDGET_EXP, P_PEAK, P_MEAN, CAP_KEEP, GAMUT_TOL, GAMUT_STEP, Y_MARGIN,
     LOCAL_GAIN, DETAIL_FLOOR, DETAIL_KMIN, DETAIL_KMAX,
     HK_C, HK_BLUE, HK_A, HK_B,
-    FALL_CHROMA, GIVE_BACK, GIVE_MAX, BAR_KNEE, BAR_TAIL,
+    FALL_CHROMA, POOL, POOL_EXP, POOL_REACH, GIVE_BACK, GIVE_MAX, BAR_KNEE, BAR_TAIL,
     SEAM, SEAM_IN, SEAM_HOLD, SEAM_DIM, GAP, SPILL,
     MEAN: CEILING.mean,
     NOISE_SCALE: 2 ** NOISE_BITS,
@@ -945,8 +960,27 @@ export function prepare(src, geo, tint, scale = 1) {
     /* The means are over what is seen: left of a Canvas, everything else. */
     measureTo: frame && immersive ? Math.max(1, Math.floor(frame.x)) : w,
     cols: frame ? columnsOf(frame, w) : null,
+    pool: cover ? poolOf(frame) : null,
     closed: frame ? null : { k, ox: (w - rw * k) / 2, oy: (h - rh * k) / 2, cx: w * BAR_X, radius: w * BAR_R },
   };
+}
+
+/** The pool's height, and the distance from it to the panel's further
+    end, in haze pixels. */
+function poolOf(frame) {
+  const cy = frame.y + frame.h * POOL_Y;
+  return { cy, span: Math.max(1, cy - frame.y, frame.y + frame.h - cy) };
+}
+
+/** How much of the pool a column takes: all of it under the panel, less
+    with the distance left of it. */
+function poolReach(frame, x) {
+  return 1 - smooth((frame.x - (x + 0.5)) / (POOL_REACH * Math.max(1, frame.x)));
+}
+
+/** How far a row is from the pool's height, 0 to 1, shaped. */
+function poolDrop(pool, y) {
+  return Math.min(1, Math.abs(y + 0.5 - pool.cy) / pool.span) ** POOL_EXP;
 }
 
 /** How much the panel-closed glow keeps at haze pixel (x, y): its fall-off. */
@@ -963,8 +997,10 @@ function barFalloff(closed, x, y, h) {
  * video shows it (geo.video), or under the panel as a cover's light (no
  * video); to its left it carries on as its own mirror image — continuous
  * at the edge — magnified with distance up to ZOOM and falling off a
- * little in lightness. With the panel closed the whole picture covers the
- * window, and a restrained glow rises from the player bar, bottom left.
+ * little in lightness to the left; under the panel a cover's light is
+ * also a pool at its tile's height (POOL). With the panel closed the whole
+ * picture covers the window, and a restrained glow rises from the player
+ * bar, bottom left.
  *
  * @param src   { data, w, h } — RGBA bytes of the whole source
  * @param geo   see prepare
@@ -1033,8 +1069,11 @@ export function renderHaze(src, geo, tint, { scale = 1, seed = 1, frost = null }
     return dx <= 0 || dy <= 0 ? 1 : clamp01(R - Math.sqrt(dx * dx + dy * dy) + 0.5);
   };
   const measureTo = plan.measureTo;
+  /* A cover's pool: how much each column takes of it. */
+  const reach = plan.pool ? Float32Array.from({ length: w }, (_, x) => poolReach(frame, x)) : null;
   let sumC = 0, nC = 0;
   for (let y = 0; y < h; y++) {
+    const drop = plan.pool ? POOL * poolDrop(plan.pool, y) : 0;
     for (let x = 0; x < w; x++) {
       const o = (y * w + x) * 4;
       let r = lensed[o], g = lensed[o + 1], b = lensed[o + 2], mixC = lensed[o + 3];
@@ -1050,7 +1089,10 @@ export function renderHaze(src, geo, tint, { scale = 1, seed = 1, frost = null }
       const c = Math.sqrt(one[1] * one[1] + one[2] * one[2]);
       const kr = c > EPS5 ? Math.min(GIVE_MAX, Math.max(1, (mixC * GIVE_BACK) / c)) : 1;
       let f, Fc;
-      if (frame) {
+      if (reach) {
+        f = cols[x * 4 + 2] * (1 - drop * reach[x]);
+        Fc = pow06(f);
+      } else if (frame) {
         f = cols[x * 4 + 2];
         Fc = cols[x * 4 + 3];
       } else {

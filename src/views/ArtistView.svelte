@@ -1563,15 +1563,15 @@
   .pick-play {
     position: relative; z-index: 2; justify-self: end;
     display: grid; place-items: center; width: 40px; height: 40px;
-    border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
-    box-shadow: 0 8px 20px -8px color-mix(in srgb, var(--foam) 55%, transparent);
+    border-radius: var(--rf); background: var(--accent) var(--bead); color: var(--accent-ink);
+    box-shadow: var(--bead-edge), 0 8px 20px -8px color-mix(in srgb, var(--foam) 55%, transparent);
     transition: background-color var(--d1) var(--ease), transform var(--d1) var(--ease);
   }
-  .pick-play.as-button:hover:not(:disabled) { background: var(--accent-hi); }
+  .pick-play.as-button:hover:not(:disabled) { background-color: var(--accent-hi); }
   .pick-play.as-button:active:not(:disabled) { transform: scale(0.94); }
   /* A pinned song has no separate control, so the glyph is decoration for a
      frame that is itself the button — and it has to react to the frame. */
-  .pick.playable:hover .pick-play { background: var(--accent-hi); }
+  .pick.playable:hover .pick-play { background-color: var(--accent-hi); }
 
   /* ---------------------------------------------------------------- about */
   /* A CONTAINER, so the two-column split below reacts to the width this

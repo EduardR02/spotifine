@@ -144,7 +144,7 @@
   /* --- Hairlines ----------------------------------------------------- */
   --line:   rgba(255, 255, 255, 0.06);
   --line-2: rgba(255, 255, 255, 0.11);
-  --ring:   inset 0 0 0 1px rgba(255, 255, 255, 0.07); /* art edge      */
+  --ring:   inset 0 0 0 1px rgba(255, 255, 255, 0.07), inset 0 1px 0 rgba(255, 255, 255, 0.08); /* art edge, and the light on its top */
 
   /* --- Hover plates: one gesture, three sizes -------------------------
      A hover tint is read as an AREA of light, so one alpha cannot serve a
@@ -158,6 +158,12 @@
      exactly why they diverged, and why the app read very slightly less
      deliberate under the pointer than it does standing still. */
   --hover:   rgba(255, 255, 255, 0.05);  /* rows, nav items, wide plates    */
+  /* A row's plate is not one flat light (THE POOL, with the rows): it rests
+     a step under --hover and is --hover only where the pointer is, so the
+     most light a row is ever given is still the one value its type is held
+     against (glass.test.js). */
+  --hover-rest:   rgba(255, 255, 255, 0.03);
+  --hover-pool-a: 0.0206;
   --hover-2: rgba(255, 255, 255, 0.07);  /* 22-32px round icon buttons      */
   --hover-3: rgba(255, 255, 255, 0.10);  /* 16-18px clear / close marks     */
 
@@ -252,8 +258,10 @@
      --tint-video; .np-details::before).
 
      Each is FROST (what is done to what is behind), a thin TINT that evens
-     it out, a RIM — a hairline that catches the light at the top left and
-     fades away round the edge — with a faint SHEEN inside it, and a LIFT.
+     it out, light in its BODY (the sheen, and on the planes the depth), an
+     EDGE that answers that light (the rim on every weight; the planes also
+     gather the light behind them just inside it), and a LIFT. THE BODY and
+     THE EDGE, below the tints, say how each is drawn.
 
      Every frost is a real one: blur, then saturate, then darken. The haze is
      detailed and patchy on purpose, and glass that softens what is behind
@@ -305,13 +313,29 @@
   --frost-plane:   blur(12px) saturate(1.45) brightness(0.7);
   --frost-strip:   blur(20px) saturate(1.7) brightness(0.9);
   --frost-overlay: blur(20px) saturate(1.8) brightness(3.5) brightness(0.2);
-  /* The details over the Canvas: re-frosted every frame of the video. */
-  --frost-video:   blur(32px) saturate(1.6) brightness(0.21);
+  /* The details over the Canvas: re-frosted every frame of the video. Like
+     the overlay it is a CEILING, not a dimmer — a plain brightness(0.21)
+     held a white frame where the type can stand on it and took every other
+     frame down by the same factor, which left the details darker and
+     greyer than the panes beside them, whose haze is graded to a ceiling
+     rather than scaled. The gain before the cut follows the Canvas
+     (--video-gain: 1 over a bright one, where there is nothing to give
+     back, more over a dark one; NowPlayingPanel sets it from the light the
+     haze measured). Whatever the gain, white comes out at the ceiling, and
+     that is what the type is held against (glass.test.js). The token lives
+     on the panel, where the gain is set: on :root it would be resolved
+     once, with the root's gain. */
   /* Small: a plate sits over a playing video and is re-frosted every frame. */
   --frost-plate:   blur(8px) saturate(1.5) brightness(0.72);
   --tint-chrome:   rgb(10 11 14 / 0.36);
   --tint-pane:     rgb(11 12 15 / 0.38);
   --tint-strip:    rgb(13 14 17 / 0.62);
+  /* The melt under a strip and along the pane's foot (THE MELT): a light
+     frost and half the strip's tint, both thinning to nothing. */
+  --frost-melt:    blur(7px) saturate(1.3);
+  --frost-foot:    blur(10px);
+  --tint-melt:     rgb(13 14 17 / 0.34);
+  --melt-h:        22px;
   /* Light, not shade: the ceiling has already held what is bright, and a
      breath of light over it is what lifts a popup off the dark pane as a
      pane of its own rather than a hole in it. */
@@ -335,14 +359,72 @@
      glass: this lies under the light, and over a dark haze it changes
      almost nothing (glass.test.js). */
   --tint-active: rgb(8 9 12 / 0.55);
-  --glass-sheen:   linear-gradient(158deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0) 34%);
-  --glass-rim:     linear-gradient(145deg,
-                     rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.14) 14%,
-                     rgba(255, 255, 255, 0.06) 36%, rgba(255, 255, 255, 0.03) 68%,
-                     rgba(255, 255, 255, 0.08));
-  --lift-plane:    0 1px 1px rgba(0, 0, 0, 0.16), 0 16px 40px -22px rgba(0, 0, 0, 0.7);
-  --lift-raised:   0 1px 1px rgba(0, 0, 0, 0.14), 0 12px 28px -18px rgba(0, 0, 0, 0.7);
-  --lift-overlay:  0 2px 6px rgba(0, 0, 0, 0.22), 0 20px 44px -18px rgba(0, 0, 0, 0.66);
+  /* THE BODY — the light in the glass itself. The frost's own numbers sit
+     on the type's contrast budget (more light or more chroma fails
+     glass.test.js), so the body is shaped rather than brightened: the SHEEN
+     is a pool of light that falls across the top of a surface from the
+     upper left and is gone two thirds of the way down, never brighter than
+     the one value the type is held against; and the DEPTH is the glass
+     growing denser toward its foot, which only ever darkens. Together a
+     plane is lit from above like the edge that frames it, instead of being
+     one flat tint from corner to corner. */
+  --glass-sheen:   radial-gradient(125% 92% at 14% 0%, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012) 46%, rgba(255, 255, 255, 0) 70%);
+  --glass-depth:   linear-gradient(180deg, rgb(3 4 8 / 0) 45%, rgb(3 4 8 / 0.09));
+
+  /* THE EDGE — what makes a pane of glass a slab rather than a tinted
+     rectangle. Light falls from above and a little from the left, and an
+     edge answers it in four parts, outside in:
+
+       a CONTACT line, one dark pixel where the slab meets what is behind
+       it (in --lift-*), so the edge is drawn against the bright haze of a
+       gutter as sharply as against a dark one;
+       the RIM, the specular hairline: bright along the whole top edge,
+       brightest in a glint at the top-left corner, gone down the sides,
+       and back as a faint catch-light along the bottom, a little stronger
+       at the bottom-right corner, where the light leaves the slab;
+       the GATHER, just inside the rim, where a rounded edge collects the
+       light behind it: the frost there is the same picture, brighter and
+       richer (--frost-edge), so the edge of every plane glows in the
+       playing record's own colour, strongest where its light is, and is
+       not there at all over a dark haze. It is a line and its fall: bright
+       for a pixel or two against the rim, then a faint tail a few pixels
+       deep — drawn as one even band it read as a second, thicker border;
+       and a SHADE inside the bottom edge, the side the light leaves by.
+
+     The gather is light added, so it stays inside the band where no type
+     ever lies: the planes' padding is wider than its six pixels on every
+     side, and the contrast the type is held to (glass.test.js) is measured
+     on the glass beyond it. Like the frosts it multiplies what is behind
+     it and adds no grey of its own. It carries no blur: a blur on a plane
+     was what the pre-rendered frost replaced (GLASS), and this must not
+     bring one back. */
+  /* The rim's strength, per surface: its gradient is written where it is
+     drawn (THE MATERIAL), not as a token here, because a token is resolved
+     once, on :root, and a surface that turns --rim-k down would inherit
+     the root's light anyway. */
+  --rim-k: 1;
+  --frost-edge: brightness(2.4) saturate(1.3);
+  /* The band's shape: two soft rings that follow the plane's corners at
+     any size (an SVG with no viewBox is laid out at the box it masks, so
+     the radius and the widths stay in pixels) — the line, and under it the
+     tail at a third of its strength — weighted toward the light. */
+  --edge-ring: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='a' x='-5%25' y='-5%25' width='110%25' height='110%25'%3E%3CfeGaussianBlur stdDeviation='0.9'/%3E%3C/filter%3E%3Cfilter id='b' x='-5%25' y='-5%25' width='110%25' height='110%25'%3E%3CfeGaussianBlur stdDeviation='2.4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' rx='12' fill='none' stroke='%23fff' stroke-opacity='0.42' stroke-width='8' filter='url(%23b)'/%3E%3Crect width='100%25' height='100%25' rx='12' fill='none' stroke='%23fff' stroke-opacity='0.8' stroke-width='3.2' filter='url(%23a)'/%3E%3C/svg%3E");
+  --edge-fall: linear-gradient(168deg, #000, rgb(0 0 0 / 0.62) 38%, rgb(0 0 0 / 0.34));
+  --edge-shade: inset 0 -10px 14px -12px rgb(0 0 0 / 0.34);
+  --lift-plane:    0 0 0 1px rgb(0 0 0 / 0.24), 0 2px 3px rgb(0 0 0 / 0.24),
+                   0 18px 40px -20px rgb(0 0 0 / 0.78);
+  --lift-raised:   0 0 0 1px rgb(0 0 0 / 0.16), 0 1px 2px rgb(0 0 0 / 0.2),
+                   0 12px 28px -16px rgb(0 0 0 / 0.72);
+  --lift-overlay:  0 0 0 1px rgb(0 0 0 / 0.34), 0 3px 8px rgb(0 0 0 / 0.28),
+                   0 24px 56px -18px rgb(0 0 0 / 0.72);
+  /* A control raised on the glass catches the same light on its own top
+     edge, and a control pressed into it is shaded there instead. */
+  --catch:  inset 0 1px 0 rgb(255 255 255 / 0.09);
+  --groove: inset 0 1px 2px rgb(0 0 0 / 0.38);
+  /* A well (THE FIELD): the shadow its upper lip throws on its floor. */
+  --well: inset 0 1px 3px rgb(0 0 0 / 0.5), inset 0 2px 6px -2px rgb(0 0 0 / 0.4);
+  --bead:      linear-gradient(180deg, rgb(255 255 255 / 0.3), rgb(255 255 255 / 0) 54%, rgb(0 0 0 / 0.08));
+  --bead-edge: inset 0 1px 0 rgb(255 255 255 / 0.5), inset 0 -1px 0 rgb(0 0 0 / 0.12);
 }
 
 
@@ -443,16 +525,33 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* The planes carry no filter: their frost is drawn under them by the haze
    layer, so a plane must also wear `use:frost` (see GLASS). */
 .glass-chrome {
-  background: var(--glass-sheen), var(--tint-chrome);
-  box-shadow: var(--lift-plane);
+  background: var(--glass-sheen), var(--glass-depth), var(--tint-chrome);
+  box-shadow: var(--lift-plane), var(--edge-shade);
 }
 .glass-pane {
-  background: var(--glass-sheen), var(--tint-pane);
-  box-shadow: var(--lift-plane);
+  background: var(--glass-sheen), var(--glass-depth), var(--tint-pane);
+  box-shadow: var(--lift-plane), var(--edge-shade);
+}
+/* The gather (THE EDGE): under everything the plane holds, over its tint.
+   A plane's two pseudo-elements are the material's — this and the rim. */
+:is(.glass-chrome, .glass-pane)::after {
+  content: ""; position: absolute; inset: 0; z-index: -1;
+  border-radius: inherit; pointer-events: none;
+  -webkit-backdrop-filter: var(--frost-edge);
+          backdrop-filter: var(--frost-edge);
+  -webkit-mask-image: var(--edge-ring), var(--edge-fall);
+          mask-image: var(--edge-ring), var(--edge-fall);
+  -webkit-mask-size: 100% 100%;
+          mask-size: 100% 100%;
+  -webkit-mask-composite: source-in;
+          mask-composite: intersect;
 }
 .glass-card {
+  /* Most cards are no taller than the rim's top light is deep, so the
+     whole ring is in it: a step under the planes' keeps it a hairline. */
+  --rim-k: 0.8;
   background: var(--glass-sheen), var(--lift-card);
-  box-shadow: var(--lift-raised);
+  box-shadow: var(--lift-raised), var(--catch);
 }
 /* An overlay is the planes' glass lifted off them: the same sheen and rim,
    over a live frost of whatever it floats on, which keeps that thing's own
@@ -466,7 +565,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   background: var(--glass-sheen), var(--tint-overlay);
   -webkit-backdrop-filter: var(--frost-overlay);
           backdrop-filter: var(--frost-overlay);
-  box-shadow: var(--lift-overlay), inset 0 0 0 1px rgb(255 255 255 / 0.05);
+  box-shadow: var(--lift-overlay), inset 0 0 0 1px rgb(255 255 255 / 0.05), var(--catch);
   color: var(--fg);
 }
 /* A modal overlay is the same glass over its own page, stepped back by a
@@ -486,6 +585,17 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
           backdrop-filter: var(--frost-overlay);
 }
 .glass-overlay:modal::backdrop { background: var(--dim-modal); }
+/* A sheet arrives: it settles into place while its page steps back. The
+   sheet only moves — it does not fade, because an element that is less
+   than opaque is the backdrop root of what it holds, and for the length
+   of the fade the frost under the sheet would have nothing to frost. */
+.glass-overlay:modal { animation: sheet-in 220ms var(--ease) both; }
+.glass-overlay:modal::backdrop { animation: dim-in 220ms var(--ease) both; }
+@keyframes sheet-in { from { transform: translateY(10px) scale(0.985); } }
+@keyframes dim-in { from { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .glass-overlay:modal, .glass-overlay:modal::backdrop { animation: none; }
+}
 .glass-plate {
   background: var(--tint-plate);
   -webkit-backdrop-filter: var(--frost-plate);
@@ -495,7 +605,20 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 :is(.glass-chrome, .glass-pane, .glass-overlay, .glass-card, .glass-plate)::before {
   content: ""; position: absolute; inset: 0; z-index: 60;
   border-radius: inherit; padding: var(--rim-w);
-  background: var(--glass-rim);
+  /* The glint at the top-left corner, the corner the light leaves by, the
+     catch-light along the bottom, and the top light (THE EDGE). */
+  background:
+    radial-gradient(150px 96px at 0 0,
+      rgb(255 255 255 / calc(0.3 * var(--rim-k))), rgb(255 255 255 / 0)),
+    radial-gradient(130px 84px at 100% 100%,
+      rgb(255 255 255 / calc(0.13 * var(--rim-k))), rgb(255 255 255 / 0)),
+    linear-gradient(0deg,
+      rgb(255 255 255 / calc(0.085 * var(--rim-k))), rgb(255 255 255 / 0) 22px),
+    linear-gradient(180deg,
+      rgb(255 255 255 / calc(0.27 * var(--rim-k))),
+      rgb(255 255 255 / calc(0.1 * var(--rim-k))) 26px,
+      rgb(255 255 255 / calc(0.04 * var(--rim-k))) 104px,
+      rgb(255 255 255 / calc(0.04 * var(--rim-k))));
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
           mask-composite: exclude;
@@ -509,15 +632,20 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    the line, and the arc reads as one line again; the straight edges keep
    the same weight. On a denser screen the ring is already wider than a
    device pixel. */
+/* A plate is a small round thing over a picture, smaller than the glints
+   and the top light of the rim above are deep: under them its whole ring
+   was lit, a white outline round a button. Its rim is the same light at
+   its own scale: caught along the top of the bead, gone by its middle,
+   and back as a breath along its foot — an arc of light, not an outline. */
+.glass-plate::before {
+  background: linear-gradient(172deg,
+    rgb(255 255 255 / calc(0.3 * var(--rim-k))), rgb(255 255 255 / calc(0.1 * var(--rim-k))) 30%,
+    rgb(255 255 255 / calc(0.025 * var(--rim-k))) 56%, rgb(255 255 255 / calc(0.025 * var(--rim-k))) 82%,
+    rgb(255 255 255 / calc(0.07 * var(--rim-k))));
+}
 :root { --rim-w: 1px; }
 @media (resolution < 1.25dppx) {
-  :root {
-    --rim-w: 1.5px;
-    --glass-rim: linear-gradient(145deg,
-                   rgba(255, 255, 255, 0.25), rgba(255, 255, 255, 0.1) 14%,
-                   rgba(255, 255, 255, 0.045) 36%, rgba(255, 255, 255, 0.022) 68%,
-                   rgba(255, 255, 255, 0.06));
-  }
+  :root { --rim-w: 1.5px; --rim-k: 0.75; }
 }
 /* A STRIP is the frost without the object: the sticky bars that content
    scrolls under — topbar, table heads — are part of the pane they sit in,
@@ -666,18 +794,76 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .nav-item svg { flex: none; opacity: 0.8; }
-.nav-item:hover { color: var(--fg); background: var(--hover); }
-/* Selected nav: an accent wash over the raised step rather than the raised
-   step alone, plus the existing rail. Colour now carries the state; the
-   luminance change is only the support. */
-.nav-item.active {
-  color: var(--fg);
-  background:
-    linear-gradient(90deg, var(--accent-wash), transparent 78%),
-    linear-gradient(var(--raise-2) 0 0), var(--tint-active);
-  box-shadow: inset 2px 0 var(--accent);
+.nav-item:hover:not(.active) { color: var(--fg); background: var(--pool), var(--hover-rest); }
+/* THE POOL — the glass answers the hand where the hand is. A row under the
+   pointer is not one flat plate: it rests a step under --hover and comes up
+   to it in a soft pool around the pointer, which slides along the row with
+   it (pool.js writes --px, the pointer's place in the row, on that one row).
+   It is light on the thing being pointed at and nowhere else, so nothing
+   moves at the edge of sight. --px is registered so that it does not
+   inherit: a move restyles the row and none of what it holds. Away from
+   it (touch, reduced motion, a row reached before the pointer has moved)
+   the pool lies off the row and the plate is the rest alone.
+
+   The plate itself is a strip of the glass, not a tint: --strip-edge is
+   the light its top edge catches and the shade under its foot, a pixel
+   each, so a row under the pointer has an edge like everything else made
+   of this material. */
+@property --px { syntax: "<length>"; inherits: false; initial-value: -999px; }
+:is(.nav-item, .lib-row, .tl-row) {
+  --pool: radial-gradient(250px 130px at var(--px) 50%,
+    rgb(255 255 255 / var(--hover-pool-a)),
+    rgb(255 255 255 / calc(var(--hover-pool-a) * 0.55)) 42%,
+    rgb(255 255 255 / 0));
+  --strip-edge: inset 0 1px 0 rgb(255 255 255 / 0.05), inset 0 -1px 0 rgb(0 0 0 / 0.1);
 }
+:is(.nav-item:not(.active), .lib-row:not(.active), .tl-row:not(.current, .unavailable, .drag-source)):hover {
+  box-shadow: var(--strip-edge);
+}
+@media (prefers-reduced-motion: reduce) {
+  :root { --hover-rest: var(--hover); --hover-pool-a: 0; }
+}
+/* THE SELECTED PLATE — "this one" is drawn from its left edge: THE BRACKET
+   is the light, and everything else about the row is that light falling
+   away to the right. So the plate of the open page in the nav and the open
+   playlist in the library is not a box with an outline: it is the glass
+   lit and a step denser at the bracket (--tint-active is what lets it be
+   lit at all over a bright haze), and both the light and the density thin
+   out along the row — the light faster, so the plate is never lighter
+   than the two ends the type is held on (glass.test.js) — to a breath at
+   its far end. Its top edge catches the bracket's colour beside it and
+   plain light beyond, and thins the same way. The playing row in a track
+   list is the same gesture on the pane's own glass. */
+:is(.nav-item.active, .lib-row.active) {
+  --plate-wash: var(--accent-wash);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--mark, var(--accent)) 44%, transparent),
+      rgb(255 255 255 / 0.1) 34%, rgb(255 255 255 / 0.03)) top / 100% 1px no-repeat,
+    linear-gradient(90deg, rgb(0 0 0 / 0.16), rgb(0 0 0 / 0.04)) bottom / 100% 1px no-repeat,
+    linear-gradient(90deg, var(--plate-wash), transparent 80%),
+    linear-gradient(90deg, var(--raise-2), rgb(255 255 255 / 0.04) 55%, rgb(255 255 255 / 0.015)),
+    linear-gradient(90deg, var(--tint-active) 36%, rgb(8 9 12 / 0.22));
+}
+.nav-item.active { color: var(--fg); }
 .nav-item.active svg { opacity: 1; color: var(--accent); }
+/* THE BRACKET — "this one", everywhere a list has one: the open page in
+   the nav, the open playlist in the library, the playing row in a track
+   list. A two-pixel line of the accent down the row's left edge that turns
+   in with the row's own corners, so it and the wash that fades away to the
+   right of it are one shape. It is a light: the line is the accent a step
+   toward white, inside it the colour falls off into the wash over a few
+   pixels, and outside it blooms a little onto the glass beside the row,
+   fullest at the middle of the line and gone by its ends. All of it is box
+   shadows, which is what lets it follow the corners. */
+:is(.nav-item.active, .lib-row.active, .tl-row.current) {
+  --mark-lit: color-mix(in srgb, var(--mark, var(--accent)) 84%, #fff);
+  --bracket:
+    inset 2px 0 var(--mark-lit),
+    inset 10px 0 14px -10px color-mix(in srgb, var(--mark, var(--accent)) 58%, transparent),
+    -9px 0 12px -8px color-mix(in srgb, var(--mark, var(--accent)) 62%, transparent);
+  box-shadow: var(--bracket);
+}
+
 /* The nav dims and re-tints its icons for hover and for the selected row; the
    glyph punched out of the mark is neither — it belongs to the tile. */
 .nav-item .nav-mark svg { opacity: 1; color: var(--accent-ink); }
@@ -714,10 +900,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: block; margin: var(--s2) auto 0; font-size: var(--t-11);
 }
 /* The scroller reaches the rail's right edge, its rows keeping their inset
-   as padding, so the overlay bar hugs the glass's edge as the pane's does. */
+   as padding, so the overlay bar hugs the glass's edge as the pane's does —
+   and its left edge too, so the light of a selected row's bracket falls on
+   the glass beside the row instead of being cut at the scroller's edge. */
 .lib-list {
   flex: 1; min-height: 0; overflow-y: auto;
-  margin-right: calc(var(--s3) * -1); padding-right: var(--s3);
+  margin: 0 calc(var(--s3) * -1); padding: 0 var(--s3);
 }
 .lib-list.fade-top.fade-bottom {
   -webkit-mask-image: linear-gradient(180deg, transparent 0, var(--fg) var(--s3), var(--fg) calc(100% - var(--s5)), transparent 100%);
@@ -739,12 +927,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--r2); text-align: left;
   transition: background-color var(--d1) var(--ease);
 }
-.lib-row.active {
-  background:
-    linear-gradient(90deg, var(--accent-wash), transparent 80%),
-    linear-gradient(var(--raise-2) 0 0), var(--tint-active);
-  box-shadow: inset 2px 0 var(--accent);
-}
 .lib-row.active .lib-name { color: var(--fg); }
 .lib-name {
   font-size: var(--t-13); color: var(--fg-1);
@@ -752,6 +934,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: color var(--d1) var(--ease);
 }
 .lib-row:hover .lib-name { color: var(--fg); }
+/* The same plate the nav rows above take under the pointer. */
+.lib-row:hover:not(.active) { background: var(--pool), var(--hover-rest); }
 .lib-count {
   font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-med);
   color: var(--count);
@@ -760,13 +944,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* The one row in the rail whose selected state is warm, because the thing it
    selects is the saved collection. Everything else selected is foam. */
 .lib-row.liked-row.active {
-  background:
-    linear-gradient(90deg, var(--saved-wash), transparent 80%),
-    linear-gradient(var(--raise-2) 0 0), var(--tint-active);
-  /* The rail stays with the row: the nav and every library selection carry
-     the same inset bar, so "selected" is one shape everywhere in the rail —
-     and this one row's bar is warm because its wash is. */
-  box-shadow: inset 2px 0 var(--rose-ink);
+  --plate-wash: var(--saved-wash);
+  /* The bracket stays with the row: the nav and every library selection
+     carry the same one, so "selected" is one shape everywhere in the rail —
+     and this one row's is warm because its wash is. */
+  --mark: var(--rose-ink);
 }
 /* The library's two collections, as the section label rather than as anything
    new in the column. Following used to be a pinned row here and that cost a
@@ -1100,6 +1282,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
      panel, and its backdrop was re-frosted with every frame of the Canvas. */
   clip-path: inset(0);
 }
+.np-panel {
+  --frost-video: blur(32px) saturate(2.1) brightness(var(--video-gain, 1)) brightness(0.21);
+}
 .np-panel.video .np-details::before {
   background: var(--tint-video);
   -webkit-backdrop-filter: var(--frost-video);
@@ -1204,6 +1389,50 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .scroll {
   flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; position: relative;
 }
+/* THE MELT — a page does not meet the glass it slides under at a hard
+   line. Just below the strips, once they are covering the page, and
+   always along the pane's foot, a shallow band frosts what passes through
+   it lightly and thins to nothing, so a row arrives under the top bar, and
+   leaves by the bottom of the pane, over a few pixels instead of being cut.
+
+   The bands are pseudo-elements of what scrolls — the scroller's own two,
+   stuck to its edges, and one in each track list, stuck under its column
+   heads — and take no room in the page. They are not children of the
+   strips: a strip carries a backdrop-filter, which makes it the backdrop
+   root of everything inside it, and a band in there could only frost the
+   strip. A list's band leaves with its list, as its heads do. Column heads
+   still on their way up cross the top bar's band above it, unfrosted, and
+   once stuck they cover it. Each band is a frost like the strips', a
+   fraction of their size. */
+.scroll::after,
+.scroll:has(> .topbar.glass-strip)::before,
+.tl:has(> .tl-head.stuck)::before {
+  content: ""; display: block; position: sticky; z-index: 15;
+  height: var(--melt-h); pointer-events: none;
+  background: var(--tint-melt);
+  -webkit-backdrop-filter: var(--frost-melt);
+          backdrop-filter: var(--frost-melt);
+}
+.scroll:has(> .topbar.glass-strip)::before,
+.tl:has(> .tl-head.stuck)::before {
+  top: var(--topbar-h); margin-bottom: calc(var(--melt-h) * -1);
+  -webkit-mask-image: linear-gradient(180deg, #000, rgb(0 0 0 / 0.55) 40%, rgb(0 0 0 / 0.16) 74%, transparent);
+          mask-image: linear-gradient(180deg, #000, rgb(0 0 0 / 0.55) 40%, rgb(0 0 0 / 0.16) 74%, transparent);
+}
+.tl:has(> .tl-head.stuck)::before { top: calc(var(--topbar-h) + 32px); }
+/* The foot's band is the frost alone, and stops short of the pane's sides.
+   It lies at the end of a page shorter than the pane, over nothing: a tint
+   there would be a stripe across empty glass, and over the light gathered
+   at the pane's edges (THE EDGE) even the blur would cut a notch. A blur
+   of glass that is already smooth is not seen. */
+.scroll::after {
+  bottom: 0; margin: calc(var(--melt-h) * -1) 14px 0;
+  background: none;
+  -webkit-backdrop-filter: var(--frost-foot);
+          backdrop-filter: var(--frost-foot);
+  -webkit-mask-image: linear-gradient(0deg, #000, rgb(0 0 0 / 0.55) 40%, rgb(0 0 0 / 0.16) 74%, transparent);
+          mask-image: linear-gradient(0deg, #000, rgb(0 0 0 / 0.55) 40%, rgb(0 0 0 / 0.16) 74%, transparent);
+}
 
 /* ---------------------------------------------------------------- topbar */
 .topbar {
@@ -1296,10 +1525,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .topbar-play {
   display: grid; place-items: center; width: 28px; height: 28px; flex: none;
-  border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
+  border-radius: var(--rf); background: var(--accent) var(--bead); color: var(--accent-ink);
+  box-shadow: var(--bead-edge);
   transition: background-color var(--d1) var(--ease);
 }
-.topbar-play:hover { background: var(--accent-hi); }
+.topbar-play:hover { background-color: var(--accent-hi); }
 
 /* The search field is THE FIELD (below), filling its grid track, which is
    where the sizing lives. */
@@ -1388,7 +1618,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   -webkit-backdrop-filter: blur(10px) saturate(1.6);
           backdrop-filter: blur(10px) saturate(1.6);
   color: var(--fg);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09), var(--catch);
 }
 /* The exception, and the only one: Liked Songs is the rose page end to end —
    rose tile, rose wash, rose heart — so its tag stays solid rose rather than
@@ -1478,7 +1708,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .art.lg { border-radius: var(--r3); }
 .art.circle { border-radius: var(--rf); }
-.art.raised { box-shadow: 0 14px 34px -10px rgba(0, 0, 0, 0.85); }
+/* A raised cover stands off the glass: a close shadow that draws its edge,
+   a deep one that lifts it, and under both the record's own colour, so the
+   light it throws on the pane is its own. */
+.art.raised {
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 0.5),
+    0 16px 36px -12px rgb(0 0 0 / 0.85),
+    0 28px 64px -24px color-mix(in srgb, var(--tone-glow) 62%, transparent);
+}
 /* While known artwork is still resolving, the tile holds a calm neutral
    ground — the identity tile's composition with the colour and the letter
    taken out — so a cold start paints surface, never a monogram, for a cover
@@ -1625,19 +1863,27 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   font-family: var(--font-small);
   font-size: var(--t-11);
 }
+/* A solid fill on glass is a bead of it, not a sticker: --bead lays the
+   light over whatever colour the control is (its fill stays a plain
+   background-color, so hover and press still move between colours), and
+   --bead-edge catches it on the rim. Every filled control wears the pair —
+   the play buttons, the accent and danger pills, a ticked checkbox. */
 .play-lg {
   display: grid; place-items: center; width: 48px; height: 48px; flex: none;
-  border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
-  box-shadow: 0 8px 20px -6px color-mix(in srgb, var(--foam) 42%, transparent);
-  transition: background-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease);
+  border-radius: var(--rf); background: var(--accent) var(--bead); color: var(--accent-ink);
+  box-shadow: var(--bead-edge), 0 1px 2px rgb(0 0 0 / 0.35),
+              0 8px 22px -6px color-mix(in srgb, var(--foam) 46%, transparent);
+  transition: background-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease),
+              transform var(--d1) var(--ease);
 }
 /* Hover brightens the foam rather than switching hue. Jumping to rose here
    made the primary action look like it changed meaning under the pointer. */
 .play-lg:hover:not(:disabled) {
-  background: var(--accent-hi);
-  box-shadow: 0 10px 26px -6px color-mix(in srgb, var(--foam) 52%, transparent);
+  background-color: var(--accent-hi);
+  box-shadow: var(--bead-edge), 0 1px 2px rgb(0 0 0 / 0.35),
+              0 10px 28px -6px color-mix(in srgb, var(--foam) 58%, transparent);
 }
-.play-lg:active:not(:disabled) { background: var(--accent-lo); transform: scale(0.96); }
+.play-lg:active:not(:disabled) { background-color: var(--accent-lo); transform: scale(0.96); }
 /* =====================================================================
    THE ONE ROSE BUTTON
 
@@ -1654,15 +1900,17 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    this page is one colour rather than a warm field with a cyan button on it.
    ===================================================================== */
 .play-lg.saved {
-  background: var(--rose); color: var(--bg-0);
-  box-shadow: 0 8px 20px -6px color-mix(in srgb, var(--rose) 52%, transparent);
+  background-color: var(--rose); color: var(--bg-0);
+  box-shadow: var(--bead-edge), 0 1px 2px rgb(0 0 0 / 0.35),
+              0 8px 22px -6px color-mix(in srgb, var(--rose) 52%, transparent);
 }
 .play-lg.saved:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--rose) 76%, #ffffff);
-  box-shadow: 0 10px 26px -6px color-mix(in srgb, var(--rose) 62%, transparent);
+  background-color: color-mix(in srgb, var(--rose) 76%, #ffffff);
+  box-shadow: var(--bead-edge), 0 1px 2px rgb(0 0 0 / 0.35),
+              0 10px 28px -6px color-mix(in srgb, var(--rose) 62%, transparent);
 }
 .play-lg.saved:active:not(:disabled) {
-  background: color-mix(in srgb, var(--rose) 84%, var(--bg-0));
+  background-color: color-mix(in srgb, var(--rose) 84%, var(--bg-0));
 }
 
 /* =====================================================================
@@ -1711,7 +1959,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   height: 34px; padding: 0 var(--s4);
   border-radius: var(--rf);
   background: var(--raise-1);
-  box-shadow: inset 0 0 0 1px var(--line-2);
+  box-shadow: inset 0 0 0 1px var(--line-2), var(--catch);
   color: var(--fg-1);
   font-size: var(--t-12); font-weight: var(--w-med); white-space: nowrap;
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease),
@@ -1719,7 +1967,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .pill:hover:not(:disabled) {
   color: var(--fg); background: var(--raise-2);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.17);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.17), var(--catch);
 }
 .pill:active:not(:disabled) { background: var(--raise-3); }
 .pill:disabled { opacity: 0.45; }
@@ -1732,17 +1980,20 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    — keeps its quiet surface and carries the state in its glyph. */
 .pill.on > .icon { color: var(--accent); }
 .pill.accent {
-  background: var(--accent); color: var(--accent-ink); box-shadow: none;
+  background: var(--accent) var(--bead); color: var(--accent-ink); box-shadow: var(--bead-edge);
   font-weight: var(--w-semi);
 }
-.pill.accent:hover:not(:disabled) { background: var(--accent-hi); color: var(--accent-ink); box-shadow: none; }
-.pill.accent:active:not(:disabled) { background: var(--accent-lo); }
+.pill.accent:hover:not(:disabled) {
+  background: var(--accent-hi) var(--bead); color: var(--accent-ink); box-shadow: var(--bead-edge);
+}
+.pill.accent:active:not(:disabled) { background: var(--accent-lo) var(--bead); }
 .pill.danger {
-  background: var(--love); color: var(--bg-0); box-shadow: none;
+  background: var(--love) var(--bead); color: var(--bg-0); box-shadow: var(--bead-edge);
   font-weight: var(--w-semi);
 }
 .pill.danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--love) 86%, var(--rose)); color: var(--bg-0); box-shadow: none;
+  background: color-mix(in srgb, var(--love) 86%, var(--rose)) var(--bead); color: var(--bg-0);
+  box-shadow: var(--bead-edge);
 }
 /* Neutral until the pointer is on it, then unmistakably love. A row of red
    "Clear" buttons at rest reads as an error state, not as available acts. */
@@ -1754,12 +2005,17 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* =====================================================================
    THE FIELD — every single-line text input in the app, one object.
 
-   Pressed INTO the glass rather than laid on it: a shade under it and a
-   hairline, in the search box's shape (round ends, a 16px lead-in for its
-   glyph, a 12px run-out for a control that carries its own hit circle).
-   Focus is three small agreeing signals — the hairline takes foam at
-   hairline strength and the glyph comes up a rung — never a loud ring:
-   the caret is already saying where typing lands.
+   Pressed INTO the glass rather than laid on it, in the search box's shape
+   (round ends, a 16px lead-in for its glyph, a 12px run-out for a control
+   that carries its own hit circle). It is lit by the same light as the
+   panes, which for a well is their edge upside down: its upper lip is in
+   shade and throws a shadow on the floor under it, the floor is darkest
+   there and clears toward the foot, and the lower lip — the one facing the
+   light — catches it. Focus is the same object lit, not a colour laid on
+   it: the hairline comes up to a clear white line with the lip still
+   drawn over it, the well deepens a step and the glyph comes up a rung —
+   never a loud ring, and no accent: the caret, which is the accent, is
+   already saying where typing lands.
 
    The field is the wrapper; the <input> inside it is bare. `.sm` is the
    rail's size, `.lg` a title being renamed in place.
@@ -1768,16 +2024,35 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: flex; align-items: center; gap: var(--s2); min-width: 0;
   height: 32px; padding: 0 var(--s3) 0 var(--s4);
   border-radius: var(--rf);
-  background: rgb(0 0 0 / 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  position: relative;
+  background: linear-gradient(180deg, rgb(0 0 0 / 0.32), rgb(0 0 0 / 0.16));
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  box-shadow: var(--well);
   /* Owns the lead glyph, which inherits it: a glyph carries more ink than
      text of the same value, so it sits one rung below the placeholder. */
   color: var(--fg-3);
-  transition: border-color var(--d1) var(--ease), color var(--d1) var(--ease);
+  transition: border-color var(--d1) var(--ease), color var(--d1) var(--ease),
+              box-shadow var(--d2) var(--ease);
 }
-.field:hover:not(:focus-within) { border-color: rgba(255, 255, 255, 0.14); }
+/* The lip, drawn as the planes' rim is: a ring one pixel wide over the
+   border, in shade along the top and lit along the foot, where the edge of
+   the well faces the light. */
+.field::after {
+  content: ""; position: absolute; inset: -1px; border-radius: inherit; padding: 1px;
+  pointer-events: none;
+  background: linear-gradient(176deg,
+    rgb(0 0 0 / 0.3), rgb(0 0 0 / 0.08) 30%, rgb(255 255 255 / 0.03) 56%, rgb(255 255 255 / 0.2));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  transition: opacity var(--d1) var(--ease);
+}
+.field:has(input[aria-invalid="true"])::after { opacity: 0.35; }
+.field:hover:not(:focus-within) { border-color: rgba(255, 255, 255, 0.12); }
 .field:focus-within {
-  border-color: color-mix(in srgb, var(--foam) 46%, transparent);
+  border-color: rgb(255 255 255 / 0.2);
+  background: linear-gradient(180deg, rgb(0 0 0 / 0.4), rgb(0 0 0 / 0.22));
+  box-shadow: var(--well), 0 0 0 3px rgb(255 255 255 / 0.028);
   color: var(--fg-1);
 }
 .field:has(input[aria-invalid="true"]) { border-color: color-mix(in srgb, var(--love) 55%, transparent); }
@@ -1785,7 +2060,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .field input {
   flex: 1; min-width: 0; height: 100%; padding: 0;
   border: 0; background: none; outline: none;
-  font-size: var(--t-13); color: var(--fg);
+  font-size: var(--t-13); color: var(--fg); caret-color: var(--accent);
   /* The field shrinks with its column, so a placeholder ends rather than
      being sliced through a letter. */
   text-overflow: ellipsis;
@@ -1920,19 +2195,24 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--r2);
   transition: background-color var(--d1) var(--ease);
 }
-.tl-row:hover { background: var(--hover); }
+.tl-row:hover { background: var(--pool), var(--hover-rest); }
 .tl-row.unavailable { cursor: default; }
 .tl-row.unavailable > :not(.c-more):not(.q-actions) { opacity: 0.42; }
 .tl-row.unavailable:hover { background: transparent; }
 .tl-row.unavailable .go:disabled { color: var(--fg-3); cursor: not-allowed; }
 /* The playing row is the one row in a list of fifty that has to be findable
-   without reading. A left-anchored accent wash does that at a glance, where a
-   recoloured title alone only worked once you were already looking at it. */
+   without reading. A left-anchored accent wash and THE BRACKET do that at
+   a glance, where a recoloured title alone only worked once you were
+   already looking at it. */
 .tl-row.current {
-  background: linear-gradient(90deg, var(--accent-wash), transparent 46%);
-  box-shadow: inset 2px 0 var(--accent);
+  --row-lit:
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 40%, transparent),
+      rgb(255 255 255 / 0.07) 22%, transparent 52%) top / 100% 1px no-repeat,
+    linear-gradient(90deg, rgb(0 0 0 / 0.14), transparent 52%) bottom / 100% 1px no-repeat,
+    linear-gradient(90deg, var(--accent-wash), transparent 46%);
+  background: var(--row-lit);
 }
-.tl-row.current:hover { background: linear-gradient(90deg, var(--accent-wash), transparent 46%), var(--hover); }
+.tl-row.current:hover { background: var(--row-lit), var(--pool), var(--hover-rest); }
 .tl-row.current .t-name { color: var(--accent); }
 .tl-row.current .c-idx { color: var(--accent); }
 
@@ -2161,11 +2441,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .card-play {
   position: absolute; right: var(--s2); bottom: var(--s2); z-index: 2;
   display: grid; place-items: center; width: 36px; height: 36px;
-  border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
+  border-radius: var(--rf); background: var(--accent) var(--bead); color: var(--accent-ink);
   opacity: 0; transform: translateY(6px) scale(0.9);
   transition: opacity var(--d2) var(--ease), transform var(--d2) var(--ease),
               background-color var(--d1) var(--ease);
-  box-shadow: 0 8px 18px -4px rgba(0, 0, 0, 0.7);
+  box-shadow: var(--bead-edge), 0 8px 18px -4px rgba(0, 0, 0, 0.7);
 }
 /* Opacity here is not decoration, it is whether the button exists yet — and
    `button:disabled { opacity: 0.35 }` at the top of this file is one step MORE
@@ -2179,12 +2459,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .card:hover .card-play,
 .card-play:focus-visible,
 .card-open:focus-visible ~ .card-play { opacity: 1; transform: none; }
-.card-play:hover { background: var(--accent-hi); }
+.card-play:hover { background-color: var(--accent-hi); }
 .card-play:active { transform: scale(0.93); }
 /* The Liked Songs tile's button. Same argument as `.play-lg.saved`: this is
    the one card in the app whose subject is the person using it. */
-.card-play.saved { background: var(--rose); color: var(--bg-0); }
-.card-play.saved:hover { background: color-mix(in srgb, var(--rose) 76%, #ffffff); }
+.card-play.saved { background-color: var(--rose); color: var(--bg-0); }
+.card-play.saved:hover { background-color: color-mix(in srgb, var(--rose) 76%, #ffffff); }
 /* Its tile is a light source rather than a photograph, so the hover lift is
    its own rose instead of a sampled cover tone. */
 .liked-card:hover .card-art > .liked-mark {
@@ -2299,9 +2579,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .p-now.idle .p-artists { color: var(--fg-3); }
 /* Standard arrangement kept: transport centred, seek rail beneath it. Only
    a very wide window reaches the cap, past which a rail stops reading as
-   one gesture. */
+   one gesture. The pair is centred by its boxes, and the seek row's box is
+   mostly air round a three-pixel line, which left the play button five
+   pixels under the bar's rim: the transport is set four pixels down, into
+   the air it had over the seek row, and the seek line stays where it was. */
 .p-center {
-  display: flex; flex-direction: column; align-items: center; gap: var(--s2);
+  display: flex; flex-direction: column; align-items: center; gap: var(--s1);
+  padding-top: var(--s1);
   justify-self: center; width: 100%; max-width: 900px; min-width: 0;
 }
 .transport { display: flex; align-items: center; gap: var(--s6); flex: none; }
@@ -2326,17 +2610,18 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    on hover, where it is a state and not a decoration. */
 .play-btn {
   display: grid; place-items: center; width: 38px; height: 38px; flex: none;
-  border-radius: var(--rf); background: var(--fg); color: var(--bg-0);
-  box-shadow: 0 4px 14px -4px rgba(0, 0, 0, 0.65);
+  border-radius: var(--rf); background: var(--fg) var(--bead); color: var(--bg-0);
+  box-shadow: var(--bead-edge), 0 1px 2px rgb(0 0 0 / 0.4), 0 6px 16px -4px rgba(0, 0, 0, 0.7);
   transition: background-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease), transform var(--d1) var(--ease);
 }
 .play-btn:hover:not(:disabled) {
-  background: var(--foam);
-  box-shadow: 0 6px 18px -4px color-mix(in srgb, var(--foam) 60%, transparent);
+  background-color: var(--foam);
+  box-shadow: var(--bead-edge), 0 1px 2px rgb(0 0 0 / 0.4),
+              0 6px 20px -4px color-mix(in srgb, var(--foam) 62%, transparent);
 }
 .play-btn:active:not(:disabled) {
-  background: var(--accent-lo); transform: scale(0.94);
-  box-shadow: 0 4px 12px -4px color-mix(in srgb, var(--foam) 55%, transparent);
+  background-color: var(--accent-lo); transform: scale(0.94);
+  box-shadow: var(--bead-edge), 0 4px 12px -4px color-mix(in srgb, var(--foam) 55%, transparent);
 }
 .play-btn:disabled { background: var(--raise-2); color: var(--fg-2); box-shadow: none; }
 
@@ -2370,6 +2655,16 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   margin: -5px 0 0 -5px; border-radius: 50%; background: var(--fg);
   box-shadow: 0 2px 6px rgba(0,0,0,.5); opacity: 0;
   transition: opacity var(--d1) var(--ease);
+}
+/* The line is lit toward its head: over its last stretch the fill comes up
+   toward white, so "now" is the brightest point of the line — inside the
+   rail, clipped by it, with nothing standing out of it. It rides the same
+   composited transform as the knob. */
+.rail-lit {
+  position: absolute; top: 0; bottom: 0; left: -96px; width: 96px; pointer-events: none;
+  transform: translate3d(calc(var(--p, 0) * var(--track-w, 0px)), 0, 0);
+  background: linear-gradient(90deg,
+    rgb(255 255 255 / 0), rgb(255 255 255 / 0.1) 50%, rgb(255 255 255 / 0.26) 82%, rgb(255 255 255 / 0.46));
 }
 .rail-hit:hover .rail, .rail-hit:focus-visible .rail { transform: scaleY(1.667); }
 .rail-hit:hover .rail-knob, .rail-hit:focus-visible .rail-knob { opacity: 1; }
@@ -2426,7 +2721,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   padding: var(--s1);
   border: 0;                            /* the UA gives a popover a border */
   border-radius: var(--r3);
+  /* It arrives, as the listbox does: one short settle, and it is usable
+     from the first frame. */
+  animation: sel-in var(--d2) var(--ease) both;
 }
+@media (prefers-reduced-motion: reduce) { .menu { animation: none; } }
 .menu-item {
   display: flex; align-items: center; gap: var(--s3);
   width: 100%; height: 32px; padding: 0 var(--s3);
@@ -2858,10 +3157,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .set-check:not(:checked):hover:enabled { border-color: var(--fg-3); background: var(--raise-2); }
 .set-check:checked {
-  background: var(--accent);
+  background: var(--accent) var(--bead);
   border-color: var(--accent);
 }
-.set-check:checked:hover:enabled { background: var(--accent-hi); border-color: var(--accent-hi); }
+.set-check:checked:hover:enabled { background: var(--accent-hi) var(--bead); border-color: var(--accent-hi); }
 .set-check:checked::before {
   content: "";
   width: 10px; height: 10px;
@@ -2879,7 +3178,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
   min-width: 140px; height: 34px; padding: 0 var(--s3) 0 var(--s4);
   border-radius: var(--rf);
-  background: var(--raise-1); box-shadow: inset 0 0 0 1px var(--line-2);
+  background: var(--raise-1); box-shadow: inset 0 0 0 1px var(--line-2), var(--catch);
   color: var(--fg-1);
   font-size: var(--t-12); font-weight: var(--w-med);
   transition: box-shadow var(--d1) var(--ease), background-color var(--d1) var(--ease), color var(--d1) var(--ease);
@@ -2887,7 +3186,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .sel-btn .icon { color: var(--fg-2); transition: color var(--d1) var(--ease); }
 .sel-btn:hover:not(:disabled) {
   background: var(--raise-2); color: var(--fg);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.17);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.17), var(--catch);
 }
 .sel-btn:hover:not(:disabled) .icon { color: var(--fg-1); }
 /* Open outranks the hover: the pointer is on the trigger when the list
@@ -2925,6 +3224,43 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    SEARCH / CHIPS / EMPTY
    ===================================================================== */
 .search-intro { padding: var(--s3) 0 var(--s4); }
+/* THE PAGE BEFORE A QUERY — what was opened from search, as a grid of small
+   glass tiles (a cover, a name, what it is), then what was typed into it,
+   as chips. A tile is one target: the whole of it opens the thing, or plays
+   it when it is a song, and the mark that forgets it is there only under
+   the pointer or the keyboard. The first section sits directly under the
+   title: a section's usual top margin separates it from a section above,
+   and there is none. */
+.search-idle { margin-top: 0; }
+.recent-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
+  gap: var(--s2);
+}
+.recent { position: relative; height: 56px; border-radius: var(--r3); }
+.recent:hover, .recent:focus-within { background: var(--glass-sheen), var(--hover); }
+.recent-open {
+  display: grid; grid-template-columns: 40px minmax(0, 1fr); align-items: center;
+  gap: var(--s3); width: 100%; height: 100%;
+  padding: 0 var(--s7) 0 var(--s2);
+  border-radius: inherit; text-align: left;
+}
+.recent-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.recent-name, .recent-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-name { font-size: var(--t-13); color: var(--fg); }
+.recent-sub {
+  font-family: var(--font-small); font-size: var(--t-11); color: var(--fg-2);
+}
+.recent-sub .icon { display: inline-block; margin-right: var(--s1); color: var(--accent); }
+.recent.playing .recent-name { color: var(--accent); }
+.recent-x {
+  position: absolute; right: var(--s2); top: 50%; margin-top: -11px;
+  display: grid; place-items: center; width: 22px; height: 22px;
+  border-radius: var(--rf); color: var(--fg-3); opacity: 0;
+  transition: opacity var(--d1) var(--ease), color var(--d1) var(--ease),
+              background-color var(--d1) var(--ease);
+}
+.recent:hover .recent-x, .recent-x:focus-visible { opacity: 1; }
+.recent-x:hover { color: var(--fg); background: var(--hover-3); }
 /* A fixed slot, faded rather than inserted: the line has to be able to appear
    and disappear on every keystroke without moving the results under it. */
 .search-status {
@@ -2951,6 +3287,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   height: 28px; padding: 0 var(--s2) 0 var(--s3); max-width: 100%;
   border-radius: var(--rf); background: var(--raise-1);
   border: 1px solid var(--line); font-size: var(--t-12); color: var(--fg-1);
+  box-shadow: var(--catch);
   transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
 }
 .chip:hover { background: var(--raise-2); color: var(--fg); }
@@ -2993,7 +3330,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
      control into a 74px-tall lozenge with semicircular ends, and 18px leaves
      a rounded rectangle that still looks like the same object. */
   border-radius: 18px;
-  background: var(--raise-1); border: 1px solid var(--line);
+  background: rgb(0 0 0 / 0.16); border: 1px solid var(--line);
+  /* A track the segments sit in: pressed into the glass, like THE FIELD. */
+  box-shadow: var(--groove), 0 1px 0 rgb(255 255 255 / 0.035);
 }
 .seg-btn {
   display: inline-flex; align-items: center; gap: var(--s2);
@@ -3011,7 +3350,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--foam) 24%, transparent), transparent),
     var(--raise-2);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 32%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 32%, transparent),
+              var(--catch), 0 1px 2px rgb(0 0 0 / 0.3);
 }
 .seg-n {
   font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-med);
@@ -3285,8 +3625,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
     --tint-overlay: var(--bg-sheet); --tint-plate: rgb(9 9 11 / 0.8);
     --tint-active: transparent; --tint-video: var(--bg-nav);
     --frost-plane: none; --frost-strip: none; --frost-overlay: none;
-    --frost-video: none; --frost-plate: none;
+    --frost-plate: none; --frost-edge: none; --frost-melt: none;
+    --frost-foot: none;
+    --tint-melt: transparent;
   }
+  .np-panel { --frost-video: none; }
   .topbar, .tl-head { background: var(--bg-1); }
   .wash .tag, .banner .tag { background: rgba(255, 255, 255, 0.16); }
   .topbar, .tl-head, .np-head, .wash .tag, .banner .tag {

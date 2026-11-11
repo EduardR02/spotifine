@@ -193,6 +193,23 @@ test("the light is strongest at the panel and falls off to the far edge, as colo
   expect(chromaOf(at(out, OPEN, 3, 45))).toBeGreaterThan(0.04);
 });
 
+test("a cover's light is a pool at its tile's height under the panel, and the panes keep theirs", () => {
+  const flat = source(() => [40, 90, 210]);
+  const out = render(flat, COVER);
+  const s = seam(COVER);
+  // Under the panel: brightest at the tile's height, quieter toward its foot and its head.
+  const x = Math.round((s + COVER.w) / 2);
+  expect(lumAt(out, COVER, x, 40)).toBeGreaterThan(lumAt(out, COVER, x, 86) * 1.3);
+  expect(lumAt(out, COVER, x, 40)).toBeGreaterThan(lumAt(out, COVER, x, 3) * 1.15);
+  // At the window's far side the pool has dissolved: a column is one light, top to bottom.
+  const far = (y) => lumAt(out, COVER, 3, y) + lumAt(out, COVER, 4, y) + lumAt(out, COVER, 5, y);
+  expect(Math.abs(far(40) - far(86)) / far(40)).toBeLessThan(0.08);
+  // A Canvas fills the panel and has no pool: its light does not fall off down a column.
+  const canvas = render(flat, OPEN);
+  const beside = (y) => lumAt(canvas, OPEN, s - 3, y) + lumAt(canvas, OPEN, s - 4, y) + lumAt(canvas, OPEN, s - 5, y);
+  expect(Math.abs(beside(40) - beside(86)) / beside(40)).toBeLessThan(0.08);
+});
+
 test("the haze lies under the video exactly as it is shown, and carries on from its edge", () => {
   // A video that floats in the panel, narrower and shorter than it.
   const geo = { ...OPEN, video: { x: 112, y: 12, w: 36, h: 64 } };

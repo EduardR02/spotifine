@@ -56,6 +56,8 @@
 
   function openTop() {
     if (!top) return;
+    if (top.kind === "track") keep("track", tracks.find((t) => t.id === top.id) ?? top);
+    else keep(top.kind, top, top.sub);
     if (top.kind === "artist") return navigateArtist(top.id, top.name);
     if (top.kind === "album") return navigate("album", top.id);
     if (top.kind === "playlist") return navigate("playlist", top.id);
@@ -73,6 +75,7 @@
   /** An episode from the results plays alone: its show is one click away. */
   function playEpisode(episode) {
     playError = "";
+    keep("episode", episode.track, episode.show_name);
     if (episode.track.uri === playback.current_uri) {
       togglePlay();
       return;
@@ -82,7 +85,30 @@
 
   function playTrack(i) {
     playError = "";
+    if (tracks[i]) keep("track", tracks[i]);
     if (tracks.length) api.playQueue(tracks, i, "search").catch((error) => { playError = String(error); });
+  }
+
+  /* Opening a result from its card: the page it leads to, remembered. */
+  function openPlaylist(pl) {
+    keep("playlist", pl, pl.owner || playlistSubtitle(pl));
+    navigate("playlist", pl.id);
+  }
+  function openAlbum(al) {
+    keep("album", al, al.artist_names.join(", "));
+    navigate("album", al.id);
+  }
+  function openShow(show) {
+    keep("show", show, show.publisher);
+    navigate("show", show.id);
+  }
+  function openEpisode(episode) {
+    keep("episode", episode.track, episode.show_name);
+    navigate("episode", episode.track.id);
+  }
+  function openArtist(ar) {
+    keep("artist", ar);
+    navigateArtist(ar.id, ar.name);
   }
 
   const busy = $state({ id: "" });
@@ -112,36 +138,84 @@
     return raw === "Search could not load. Try again." ? "" : raw;
   });
 
-  /* ---- Recent searches ------------------------------------------------
-     Eight, newest first, in localStorage. Reading is wrapped because a
-     webview with storage disabled throws on access rather than returning
-     null, and a search page must not fail to render over a history list. */
+  /* ---- What search remembers -------------------------------------------
+     Two short lists, newest first, in localStorage: the queries that came
+     back, and the results that were actually opened or played from them.
+     The second is what the empty page is for — the thing searched for last
+     week is one click away, with its cover, instead of a word to type
+     again. Reading is wrapped because a webview with storage disabled
+     throws on access rather than returning null, and a search page must
+     not fail to render over a history list. */
   const RECENTS_KEY = "sr.recent-searches";
+  const OPENED_KEY = "sr.search-opened";
   const RECENTS_MAX = 8;
+  const OPENED_MAX = 8;
 
-  function readRecents() {
+  function readList(key, max, valid) {
     try {
-      const raw = JSON.parse(localStorage.getItem(RECENTS_KEY) ?? "[]");
-      if (!Array.isArray(raw)) return [];
-      return raw.filter((s) => typeof s === "string" && s.trim()).slice(0, RECENTS_MAX);
+      const raw = JSON.parse(localStorage.getItem(key) ?? "[]");
+      return Array.isArray(raw) ? raw.filter(valid).slice(0, max) : [];
     } catch {
       return [];
     }
   }
-
-  let recents = $state(readRecents());
-
-  function writeRecents(next) {
-    recents = next.slice(0, RECENTS_MAX);
+  function writeList(key, list) {
     try {
-      localStorage.setItem(RECENTS_KEY, JSON.stringify(recents));
+      localStorage.setItem(key, JSON.stringify(list));
     } catch {
       /* private mode / storage disabled: the list is simply not persisted */
     }
   }
 
+  let recents = $state(readList(RECENTS_KEY, RECENTS_MAX, (s) => typeof s === "string" && s.trim()));
+  let opened = $state(readList(OPENED_KEY, OPENED_MAX, (e) => e && typeof e.id === "string" && typeof e.name === "string" && TOP_LABEL[e.kind]));
+
+  function writeRecents(next) {
+    recents = next.slice(0, RECENTS_MAX);
+    writeList(RECENTS_KEY, recents);
+  }
+  function writeOpened(next) {
+    opened = next.slice(0, OPENED_MAX);
+    writeList(OPENED_KEY, opened);
+  }
+
+  /* A query typed in steps comes back once per pause — "just a", then "just
+     a gent" — and every step used to be kept. The newest entry is replaced
+     when the query only extends or trims it. */
   function remember(q) {
-    writeRecents([q, ...recents.filter((r) => r.toLowerCase() !== q.toLowerCase())]);
+    const lower = q.toLowerCase();
+    writeRecents([q, ...recents.filter((r, i) => {
+      const other = r.toLowerCase();
+      return other !== lower && !(i === 0 && (lower.startsWith(other) || other.startsWith(lower)));
+    })]);
+  }
+
+  /** Remember a result that was opened or played. A song keeps the whole
+      track, which is what playing it again takes. */
+  function keep(kind, item, sub = "") {
+    const entry = {
+      kind,
+      id: item.id,
+      name: item.name,
+      sub: kind === "track" ? (item.artist_names ?? []).join(", ") : sub || "",
+      cover_url: item.cover_url ?? "",
+      cover_urls: item.cover_urls ?? [],
+      track: kind === "track" ? $state.snapshot(item) : null,
+    };
+    writeOpened([entry, ...opened.filter((e) => !(e.kind === kind && e.id === item.id))]);
+  }
+
+  function discard(entry) {
+    writeOpened(opened.filter((e) => e !== entry));
+  }
+
+  function reopen(entry) {
+    writeOpened([entry, ...opened.filter((e) => e !== entry)]);
+    if (entry.kind === "artist") return navigateArtist(entry.id, entry.name);
+    if (entry.kind !== "track") return navigate(entry.kind, entry.id);
+    playError = "";
+    if (entry.track.uri === playback.current_uri) return togglePlay();
+    api.playQueue([$state.snapshot(entry.track)], 0, "search").catch((error) => { playError = String(error); });
   }
 
   function forget(q) {
@@ -170,7 +244,7 @@
 <section class="view page">
   <div class="search-intro">
     <h1 class="page-title">
-      {search.link ? (search.results?.tracks?.[0]?.name ?? "Open a Spotify link") : search.submitted && search.query ? `Results for “${search.query}”` : "Find something to play"}
+      {search.link ? (search.results?.tracks?.[0]?.name ?? "Open a Spotify link") : search.submitted && search.query ? `Results for “${search.query}”` : "Search"}
     </h1>
     <!-- Refining a query keeps the previous results on screen, which is right
          — but then nothing on the page says a newer answer is coming. One
@@ -182,11 +256,53 @@
   </div>
 
   {#if !search.submitted}
-    {#if recents.length}
-      <div class="section" style="margin-top:0">
+    <!-- The page before a query. It holds only what search itself knows:
+         what was opened from it, to go straight back to, and what was typed
+         into it, to run again. Nothing is fetched to fill it. -->
+    {#if opened.length}
+      <div class="section search-idle">
         <div class="section-head">
-          <h2 class="section-title">Recent searches</h2>
-          <button class="link-more" onclick={() => writeRecents([])}>Clear all</button>
+          <h2 class="section-title">Recent</h2>
+          <button class="link-more" onclick={() => writeOpened([])}>Clear</button>
+        </div>
+        <div class="recent-grid">
+          {#each opened as entry (entry.kind + entry.id)}
+            {@const playing = entry.kind === "track" && entry.track.uri === playback.current_uri}
+            <div class="recent glass-card" class:playing>
+              <button
+                class="recent-open"
+                title={entry.kind === "track" ? `Play ${entry.name}` : undefined}
+                onclick={() => reopen(entry)}
+              >
+                <Cover
+                  src={entry.cover_url}
+                  srcs={entry.cover_urls}
+                  id={entry.id}
+                  name={entry.name}
+                  size={40}
+                  circle={entry.kind === "artist"}
+                />
+                <span class="recent-copy">
+                  <span class="recent-name">{entry.name}</span>
+                  <span class="recent-sub">
+                    {#if playing}<Icon name={playback.playing ? "pause" : "play"} size={9} />{/if}
+                    {entry.sub ? `${TOP_LABEL[entry.kind]} · ${entry.sub}` : TOP_LABEL[entry.kind]}
+                  </span>
+                </span>
+              </button>
+              <button class="recent-x" title="Remove" aria-label={`Remove ${entry.name}`} onclick={() => discard(entry)}>
+                <Icon name="x" size={11} />
+              </button>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+    {#if recents.length}
+      <div class="section" class:search-idle={!opened.length}>
+        <div class="section-head">
+          <h2 class="section-title">Searches</h2>
+          <button class="link-more" onclick={() => writeRecents([])}>Clear</button>
         </div>
         <div class="chips">
           {#each recents as q (q)}
@@ -199,17 +315,14 @@
           {/each}
         </div>
       </div>
-    {:else}
+    {/if}
+    {#if !opened.length && !recents.length}
       <div class="empty">
-        <p class="h">Nothing searched yet.</p>
-        <p class="sub">Songs, albums, playlists, artists and audio podcasts all come back from one query.</p>
-        <div class="actions">
-          <button class="pill" onclick={focusSearch}>
-            <Icon name="search" size={14} />Search
-          </button>
-        </div>
+        <p class="h">Search all of Spotify.</p>
+        <p class="sub">Songs, albums, artists, playlists and audio podcasts come back from one query, and a pasted Spotify link opens directly. What you open from here is kept on this page.</p>
       </div>
     {/if}
+    {#if playError}<p class="inline-error" role="alert">{playError}</p>{/if}
   {:else if search.error && !search.results}
     <div class="empty failed" role="alert">
       <p class="h">{search.link ? "This link couldn't open." : "Search couldn't load."}</p>
@@ -389,19 +502,22 @@
                 <button
                   class="card-open"
                   aria-label={`Open ${pl.name}`}
-                  onclick={() => navigate("playlist", pl.id)}
+                  onclick={() => openPlaylist(pl)}
                 ></button>
                 <button
                   class="card-play"
                   aria-label={`Play ${pl.name}`}
                   title={`Play ${pl.name}`}
                   disabled={!!busy.id}
-                  onclick={() => play(pl.id, playPlaylistById, "Could not play this playlist.")}
+                  onclick={() => {
+                    keep("playlist", pl, pl.owner || playlistSubtitle(pl));
+                    play(pl.id, playPlaylistById, "Could not play this playlist.");
+                  }}
                 >
                   <Icon name={busy.id === pl.id ? "more" : "play"} size={15} />
                 </button>
               </div>
-              <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
+              <button class="card-copy" onclick={() => openPlaylist(pl)}>
                 <span class="card-name">{pl.name}</span>
                 <span class="card-sub">{playlistSubtitle(pl)}</span>
               </button>
@@ -422,19 +538,22 @@
                 <button
                   class="card-open"
                   aria-label={`Open ${al.name}`}
-                  onclick={() => navigate("album", al.id)}
+                  onclick={() => openAlbum(al)}
                 ></button>
                 <button
                   class="card-play"
                   aria-label={`Play ${al.name}`}
                   title={`Play ${al.name}`}
                   disabled={!!busy.id}
-                  onclick={() => play(al.id, playAlbumById, "Could not play this release.")}
+                  onclick={() => {
+                    keep("album", al, al.artist_names.join(", "));
+                    play(al.id, playAlbumById, "Could not play this release.");
+                  }}
                 >
                   <Icon name={busy.id === al.id ? "more" : "play"} size={15} />
                 </button>
               </div>
-              <button class="card-copy" onclick={() => navigate("album", al.id)}>
+              <button class="card-copy" onclick={() => openAlbum(al)}>
                 <span class="card-name">{al.name}</span>
                 <!-- One expression, not two adjacent ones: `{year} · {names}`
                      across an {#if} loses the space after the middot, which is
@@ -459,9 +578,9 @@
             <div class="card" use:cardTone={[show.cover_url, show.id]}>
               <div class="card-art">
                 <Cover src={show.cover_url} id={show.id} name={show.name} fill lg />
-                <button class="card-open" aria-label={`Open ${show.name}`} onclick={() => navigate("show", show.id)}></button>
+                <button class="card-open" aria-label={`Open ${show.name}`} onclick={() => openShow(show)}></button>
               </div>
-              <button class="card-copy" onclick={() => navigate("show", show.id)}>
+              <button class="card-copy" onclick={() => openShow(show)}>
                 <span class="card-name">{show.name}</span>
                 <span class="card-sub">{show.publisher || "Podcast"}</span>
               </button>
@@ -478,7 +597,7 @@
             <div class="card" use:cardTone={[episode.track.cover_url, episode.track.id]}>
               <div class="card-art">
                 <Cover src={episode.track.cover_url} id={episode.track.id} name={episode.track.name} fill lg />
-                <button class="card-open" aria-label={`Open ${episode.track.name}`} onclick={() => navigate("episode", episode.track.id)}></button>
+                <button class="card-open" aria-label={`Open ${episode.track.name}`} onclick={() => openEpisode(episode)}></button>
                 {#if !episode.track.unavailable}
                   <button
                     class="card-play"
@@ -490,7 +609,7 @@
                   </button>
                 {/if}
               </div>
-              <button class="card-copy" onclick={() => navigate("episode", episode.track.id)}>
+              <button class="card-copy" onclick={() => openEpisode(episode)}>
                 <span class="card-name">{episode.track.name}</span>
                 <span class="card-sub">{episode.show_name}</span>
               </button>
@@ -507,7 +626,7 @@
             <!-- No play button here, and that is not an omission: an artist is
                  not a record. The whole card opens, which is the same rule the
                  others follow with the exception removed. -->
-            <button class="card" use:cardTone={[ar.cover_url, ar.id]} onclick={() => navigateArtist(ar.id, ar.name)}>
+            <button class="card" use:cardTone={[ar.cover_url, ar.id]} onclick={() => openArtist(ar)}>
               <span class="card-art">
                 <Cover src={ar.cover_url} id={ar.id} name={ar.name} fill circle />
               </span>

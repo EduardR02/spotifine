@@ -441,6 +441,19 @@
      nothing. */
   const shade = $derived(Math.round(Math.min(1, Math.max(0, (haze.lightBottom - 0.03) / 0.27)) * 20) / 20);
   const plateAlpha = $derived(Math.round((0.4 + 0.24 * Math.min(1, haze.lightTop / 0.5)) * 50) / 50);
+  /* How much the details' frost gives back of a Canvas before its ceiling
+     (app.css, --frost-video): enough that the brightest the Canvas gets
+     under the type — as a grey of that luminance, sRGB-encoded — comes out
+     just under the ceiling, so a dark Canvas is seen through the glass at
+     most of its own light instead of a fifth of it, and a bright one, or
+     one not yet measured, is cut exactly as before. Capped where the
+     panes' own frost is (0.7 of the picture). In steps, like the rest. */
+  const VIDEO_GAIN_MAX = 3.3;
+  const encoded = (y) => (y <= 0.0031308 ? 12.92 * y : 1.055 * y ** (1 / 2.4) - 0.055);
+  const videoGain = $derived.by(() => {
+    const brightest = encoded(Math.min(1, Math.max(haze.lightTop, haze.lightBottom)));
+    return Math.round(Math.min(VIDEO_GAIN_MAX, Math.max(1, 0.85 / Math.max(brightest, 0.01))) * 10) / 10;
+  });
 </script>
 
 <aside
@@ -452,6 +465,7 @@
   style:--tone-glow={open && pageVisible ? tone.glow : undefined}
   style:--np-shade={shade}
   style:--plate-a={plateAlpha}
+  style:--video-gain={videoGain}
 >
   {#if current}
     <!-- The picture layer, pinned under the scrolling column. -->

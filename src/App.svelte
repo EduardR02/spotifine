@@ -27,6 +27,7 @@
   import NowPlayingPanel from "./components/NowPlayingPanel.svelte";
   import Ambient from "./components/Ambient.svelte";
   import { scrollbar } from "./lib/scrollbar.js";
+  import { watchPool } from "./lib/pool.js";
   import { frost, shiftHaze } from "./lib/ambient.svelte.js";
   import { panelLayout, snapPanel } from "./lib/layout.js";
   import { panel, setPanelWidth, nowPlayingShown } from "./lib/panel.svelte.js";
@@ -63,6 +64,9 @@
   document.documentElement.dataset.os = os;
 
   $effect(() => watchFrame());
+
+  // The light a row takes under the pointer (pool.js).
+  $effect(() => watchPool());
 
   let trackEditor = null;
   const loadTrackEditor = () => (trackEditor ??= import("./views/TrackEditorView.svelte"));

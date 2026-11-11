@@ -399,15 +399,15 @@
     position: absolute; right: var(--s2); bottom: var(--s2); z-index: 2;
     width: 34px; height: 34px; border-radius: var(--rf);
     display: grid; place-items: center;
-    background: var(--accent); color: var(--accent-ink);
-    box-shadow: 0 8px 18px -4px rgba(0, 0, 0, 0.7);
+    background: var(--accent) var(--bead); color: var(--accent-ink);
+    box-shadow: var(--bead-edge), 0 8px 18px -4px rgba(0, 0, 0, 0.7);
     opacity: 0; transform: translateY(4px);
     transition: opacity var(--d1) var(--ease), transform var(--d2) var(--ease),
                 background-color var(--d1) var(--ease);
   }
   .release-art:hover .release-play,
   .release-play:focus-visible { opacity: 1; transform: none; }
-  .release-play:hover { background: var(--accent-hi); }
+  .release-play:hover { background-color: var(--accent-hi); }
 
   .release-body h3 { margin: 0; }
   .release-name {

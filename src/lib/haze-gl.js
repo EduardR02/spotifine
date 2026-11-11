@@ -16,7 +16,8 @@
      layout   laid out over the window: per column (cols) or, closed, whole
      blur ×6  the lens; and the softer lens under a cover
      mix      the lenses mixed at the panel's corners, the chroma given
-              back, the fall-off: Oklab
+              back, the fall-off (a cover's pool, a Canvas's columns, the
+              bar's glow): Oklab
      measure  the mean chroma, then the means of luminance and perceived
               lightness, summed 8×8 at a time down to one texel, which the
               next pass reads — no round trip to the CPU
@@ -295,6 +296,7 @@ uniform bool uFramed;
 uniform bool uCover;
 uniform vec4 uFrame;
 uniform float uCorner;
+uniform vec2 uPool;
 uniform vec2 uBar;
 uniform float uH;
 void main() {
@@ -311,7 +313,12 @@ void main() {
   float c = length(lab.yz);
   float kr = c > EPS5 ? min(GIVE_MAX, max(1.0, l.a * GIVE_BACK / c)) : 1.0;
   float f, Fc;
-  if (uFramed) {
+  if (uCover) {
+    float reach = 1.0 - smooth01((uFrame.x - x) / (POOL_REACH * max(1.0, uFrame.x)));
+    float drop = POOL * pow(min(1.0, abs(y - uPool.x) / uPool.y), POOL_EXP);
+    f = texelFetch(uCols, ivec2(p.x, 0), 0).z * (1.0 - drop * reach);
+    Fc = pow(f, FALL_CHROMA);
+  } else if (uFramed) {
     vec4 col = texelFetch(uCols, ivec2(p.x, 0), 0);
     f = col.z;
     Fc = col.w;
@@ -639,6 +646,7 @@ export function createGlHaze() {
         uCover: plan.cover,
         uFrame: at,
         uCorner: plan.corner,
+        uPool: plan.pool ? [plan.pool.cy, plan.pool.span] : [0, 1],
         uBar: plan.closed ? [plan.closed.cx, plan.closed.radius] : [0, 1],
         uH: h,
       });

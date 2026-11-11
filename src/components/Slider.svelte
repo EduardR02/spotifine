@@ -211,7 +211,7 @@
   {#if kind === "vol"}
     <span class="vol-rail"><span class="vol-fill" style:--p={p}></span></span>
   {:else}
-    <span class="rail"><span class="rail-fill" style:--p={p}></span></span>
+    <span class="rail"><span class="rail-fill" style:--p={p}></span><span class="rail-lit" style:--p={p}></span></span>
     <span class="rail-knob" style:--p={p}></span>
     <span
       id={tooltipId}

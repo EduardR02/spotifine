@@ -823,7 +823,8 @@
 }
 .preview-button {
   padding: 0 var(--s3); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  background: var(--accent); color: var(--accent-ink);
+  background: var(--accent) var(--bead); color: var(--accent-ink);
+  box-shadow: var(--bead-edge);
   font-size: var(--t-12); font-weight: var(--w-semi);
   transition: filter var(--d1) var(--ease), transform var(--d1) var(--ease);
 }

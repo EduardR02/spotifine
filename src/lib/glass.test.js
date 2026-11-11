@@ -80,6 +80,10 @@ test("type on the glass planes keeps its contrast over the brightest haze", () =
   const floor = brightestFrost(frost);
   const sheen = Number(token("--glass-sheen").match(/rgba\(255, 255, 255, ([\d.]+)\)/)[1]);
   const hover = rgba(token("--hover"));
+  const rest = rgba(token("--hover-rest"));
+  const pool = Number(token("--hover-pool-a"));
+  // The pool brings a row up to the hover and no further.
+  expect(1 - (1 - rest.a) * (1 - pool)).toBeLessThanOrEqual(hover.a + 1e-4);
   const lift = rgba(token("--lift-card"));
   const type = { "--fg": 7, "--fg-2": 4.5, "--fg-3": 3 };
   for (const plane of ["--tint-chrome", "--tint-pane"]) {
@@ -88,7 +92,10 @@ test("type on the glass planes keeps its contrast over the brightest haze", () =
     for (const [where, bg] of [
       ["plain", glass],
       ["sheen", over(glass, [1, 1, 1], sheen)],
-      ["hovered row", over(over(glass, [1, 1, 1], sheen), hover.rgb, hover.a)],
+      // A row under the pointer rests a step under the hover and comes up
+      // in a pool where the pointer is (THE POOL): its type is held at the
+      // pool's centre, the most light a row is given.
+      ["hovered row", over(over(over(glass, [1, 1, 1], sheen), rest.rgb, rest.a), [1, 1, 1], pool)],
       // A card is the plane's glass with light added; the now-playing
       // album card lights to the hover under the pointer (instead of its
       // lift).
@@ -146,9 +153,7 @@ function holds(surface, grounds) {
 }
 
 /* Glass over arbitrary content has no ceiling under it: the worst it can
-   frost is white, and white frosted is its brightness() (saturate leaves
-   it white). */
-const frostedWhite = (name) => [1, 1, 1].map((v) => v * parseFrost(token(name), 1).brightness);
+   frost is white, so its own filter chain has to hold white down. */
 
 /* A filter chain's colour steps exactly as CSS runs them: in order, on
    encoded values, each clamped to [0, 1]. The blur only averages colours,
@@ -214,7 +219,16 @@ test("the now-playing details keep their contrast over a white frame of the Canv
   // planes' test holds; over a Canvas, the tint over a live frost of the
   // video.
   const tint = rgba(token("--tint-video"));
-  const glass = over(frostedWhite("--frost-video"), tint.rgb, tint.a);
+  // The frost is a ceiling whose gain follows the Canvas (--video-gain):
+  // whatever the gain, nothing comes out of it brighter than white does.
+  const frost = token("--frost-video");
+  expect(frost).toContain("brightness(var(--video-gain, 1))");
+  let brightest = [0, 0, 0];
+  for (const gain of [1, 2, 3.3, 8]) {
+    const out = brightestThrough(chain(frost.replace("var(--video-gain, 1)", String(gain))));
+    if (Y(out) > Y(brightest)) brightest = out;
+  }
+  const glass = over(brightest, tint.rgb, tint.a);
   // The type is on glass cards: their light and the sheen, and the album
   // card lit to the hover under the pointer.
   const lift = rgba(token("--lift-card"));

@@ -571,11 +571,11 @@
   .ep-row:hover .ep-play, .ep-play:focus-visible, .ep-row.current .ep-play { opacity: 1; }
   .ep-play-disc {
     display: grid; place-items: center; width: 30px; height: 30px;
-    border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
-    box-shadow: 0 6px 14px -4px rgba(0, 0, 0, 0.7);
+    border-radius: var(--rf); background: var(--accent) var(--bead); color: var(--accent-ink);
+    box-shadow: var(--bead-edge), 0 6px 14px -4px rgba(0, 0, 0, 0.7);
     transition: background-color var(--d1) var(--ease), transform var(--d1) var(--ease);
   }
-  .ep-play:hover .ep-play-disc { background: var(--accent-hi); }
+  .ep-play:hover .ep-play-disc { background-color: var(--accent-hi); }
   .ep-play:active .ep-play-disc { transform: scale(0.93); }
 
   .ep-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
