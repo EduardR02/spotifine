@@ -19,6 +19,8 @@
     renameLibraryFolder,
     deleteLibraryFolder,
     moveLibraryItem,
+    presentation,
+    libraryKind,
   } from "../lib/state.svelte.js";
   import { pressLibraryItem, railDrag, trackDrag } from "../lib/dnd.svelte.js";
   import { findFolder, folderContents, moveItem, playlistIds } from "../lib/library-tree.js";
@@ -123,7 +125,10 @@
   $effect(() => { loadPins(session.username); });
   $effect(() => { loadAvatar(session.username); });
   const filteredLibrary = $derived(libraryRailEntries(library, libraryState.tree, pins.ids, filterQuery, pins.folders));
-  const showLiked = $derived(!filterQuery.trim() || "liked songs".includes(filterQuery.trim().toLocaleLowerCase()));
+  /* A presentation shows its configured library and nothing to edit: no
+     Liked Songs, nothing to create, nothing to drag into place. */
+  const writable = $derived(!presentation.name);
+  const showLiked = $derived(writable && (!filterQuery.trim() || "liked songs".includes(filterQuery.trim().toLocaleLowerCase())));
 
   /* ---------------- Saved podcasts ----------------
      Read once the tab is first opened — like Following, the collection costs
@@ -294,7 +299,7 @@
      a folder heading (into it) or a row (beside it, in its folder). Not while
      filtering — a filtered list shows no folders to aim at. */
   function pressRow(event, item) {
-    if (filterQuery.trim() || renaming || event.target.closest?.("input")) return;
+    if (!writable || filterQuery.trim() || renaming || event.target.closest?.("input")) return;
     pressLibraryItem({
       event,
       rowEl: event.currentTarget,
@@ -508,7 +513,7 @@
   /* A right-click on the list itself, not on a row, is where Spotify offers
      the same two: it is also the way in when the narrow rail hides "+". */
   function openListMenu(event) {
-    if (mode !== "playlists" || event.target.closest(".lib-row, .lib-folder, form, button, input")) return;
+    if (!writable || mode !== "playlists" || event.target.closest(".lib-row, .lib-folder, form, button, input")) return;
     event.preventDefault();
     if (trackDrag.active || railDrag.active || !session.username) return;
     createMenu = { anchor: null, at: { x: event.clientX, y: event.clientY } };
@@ -602,11 +607,11 @@
     return playback.current_index >= 0 ? planned : Math.max(0, planned - 1);
   });
 
-  /** The playlist context of the current queue row, when it is a playlist. */
+  /** The library context of the current queue row: a playlist or an album. */
   const playingId = $derived.by(() => {
     const context = playback.queue[playback.current_index]?.context;
     if (typeof context !== "string") return null;
-    const match = /^playlist:([^:]+)$/.exec(context);
+    const match = /^(?:playlist|album):([^:]+)$/.exec(context);
     return match?.[1] ?? null;
   });
 
@@ -688,7 +693,7 @@
                same header geometry without advertising an unrelated action.
                One "+" for both things a library makes, as Spotify's is; a
                right-click on the list opens the same menu. -->
-          {#if mode === "playlists"}
+          {#if mode === "playlists" && writable}
             <button
               class="btn-round lib-head-btn lib-new"
               title="Create"
@@ -849,7 +854,7 @@
           {:else}
             <PlaylistRailRow playlist={entry.playlist} depth={entry.depth} parent={entry.parent} {observeCover}
               pinned={isPinned(entry.playlist.id)}
-              active={route.name === "playlist" && route.id === entry.playlist.id} playing={playingId === entry.playlist.id}
+              active={route.name === libraryKind(entry.playlist) && route.id === entry.playlist.id} playing={playingId === entry.playlist.id}
               onmenu={openRailMenu}
               onpress={(event, playlist) => pressRow(event, { kind: "playlist", id: playlist.id })} />
           {/if}
@@ -870,7 +875,7 @@
           <!-- The filter is also a way to make the playlist you did not find. -->
           <p class="lib-filter-empty">
             No matching playlists
-            <button class="link-more" onclick={createFromFilter}>Create “{filterQuery.trim()}”</button>
+            {#if writable}<button class="link-more" onclick={createFromFilter}>Create “{filterQuery.trim()}”</button>{/if}
           </p>
         {:else if libraryState.loaded && !library.length}
           <p class="lib-filter-empty">No playlists in your library yet</p>

@@ -1295,6 +1295,8 @@ impl EngineClient {
             .arg(settings.normalisation.to_string())
             .arg("--spotify-listening-enabled")
             .arg(settings.spotify_listening_enabled.to_string())
+            .arg("--presentation")
+            .arg(crate::presentation::active().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(

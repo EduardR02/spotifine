@@ -97,6 +97,7 @@ function applyEntry(entry) {
 export function navigate(name, id = null, param = null) {
   const current = history.entries[history.cursor];
   if (current && current.name === name && current.id === id && current.param === param) return;
+  if (!presentationShows(name, id)) return;
   if (!navigationAllowed({ name, id, param }, "navigate")) return;
   // Navigating from the middle of the stack starts a new branch, so anything
   // ahead of the cursor is dropped.
@@ -576,6 +577,32 @@ export function maybeBackfillLazyQueue() {
     Log in buttons disable on it so one click cannot become two flows. */
 export const session = $state({ username: null, error: null, authPending: false });
 
+/* ---------------- Presentation mode ----------------
+   A run started with SPOTIFINE_PRESENTATION, for recording the app against a
+   real account. The shell owns most of it: the library is the configured
+   one, writes are refused, nothing is stored, plays are neither recorded nor
+   reported, and the webview is private. What the window adds is the identity
+   and the few places it would otherwise lead to the account's own things.
+   `name` is null in an ordinary run, and is known before any identity is
+   applied (`initEvents`). */
+export const presentation = $state({ name: null });
+
+/** The configured name stands in for the account's username from the first
+    message on, so everything that shows or compares the account sees the
+    presented person; the account's own playlists are then not "yours". */
+function presentedIdentity(payload) {
+  return presentation.name && payload?.username
+    ? { ...payload, username: presentation.name }
+    : payload;
+}
+
+/** Routes that would show the account's own collection or profile. */
+function presentationShows(name, id) {
+  if (!presentation.name) return true;
+  if (name === "liked") return false;
+  return !(name === "profile" && (!id || id === session.username));
+}
+
 /* ---------------- Playhead projection ---------------- */
 /* The Rust side emits a full `state` only when something other than the
    playhead changed; a plain heartbeat arrives as a `position` number. Between
@@ -687,6 +714,7 @@ function namedQueueRevision(value) {
 
 export function applyPlayback(payload) {
   if (!payload) return;
+  payload = presentedIdentity(payload);
   if (("output_device_id" in payload && payload.output_device_id !== playback.output_device_id)
     || ("current_index" in payload && payload.current_index !== playback.current_index)
     || ("current_uri" in payload && payload.current_uri !== playback.current_uri)
@@ -800,7 +828,8 @@ let cacheMarkTick = $state(0);
 
 export function isCached(track) {
   cacheMarkTick;
-  return !!track?.cached;
+  // A download mark says the account has played the song before.
+  return !!track?.cached && !presentation.name;
 }
 const pendingCacheReads = new Set();
 const CACHE_PAYLOAD_KEYS = ["tracks", "top_tracks", "queue", "track", "releases", "episodes", "entries", "playback"];
@@ -879,6 +908,7 @@ function propagateCacheMarks(ids, cached = true) {
 
 export function applySession(payload) {
   if (!payload) return;
+  payload = presentedIdentity(payload);
   const loggedOut = observeSearchSession(payload);
   if (payload.auth_state != null) {
     // Auth identity lives once, on `playback`: every reader needs the same
@@ -1995,7 +2025,9 @@ export function mergePersonalizedPlaylists(rootlist = library) {
  * visible and can only be retried by a later Home visit after the backoff.
  */
 export function ensurePersonalizedDiscovery(rootlist = library) {
-  if (!isSearchReady()) return Promise.resolve(personalizedDiscovery.playlists);
+  // The account's Daily Mixes are its listening; a presentation shows only
+  // what was configured.
+  if (!isSearchReady() || presentation.name) return Promise.resolve(personalizedDiscovery.playlists);
   if (personalizedDiscovery.sessionEpoch !== searchSessionEpoch) {
     resetPersonalizedDiscoveryForSession();
   }
@@ -2064,7 +2096,16 @@ function activityValue(playlist) {
   return Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY;
 }
 
+/** What a library row is, and so the route that opens it: an album when its
+    URI says so (a presentation library holds albums), otherwise a playlist. */
+export function libraryKind(row) {
+  return row?.uri?.startsWith("spotify:album:") ? "album" : "playlist";
+}
+
 export function setLibrary(playlists, { fresh = false, tree } = {}) {
+  // A presentation run has no stored library: its one answer is the
+  // configured library, and until then the rail keeps its loading frame.
+  if (presentation.name && !fresh) return;
   libraryAuthorityGeneration += 1;
   if (tree !== undefined) libraryState.tree = tree;
   const ordered = [...(playlists ?? [])];
@@ -2196,7 +2237,8 @@ export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "",
  * create a fake Home listening-history entry.
  */
 export function promotePlaylist(id, { played = false } = {}) {
-  if (!id) return false;
+  // The presented library keeps its configured order and has no listening.
+  if (!id || presentation.name) return false;
   const index = library.findIndex((playlist) => playlist?.id === id);
   if (index < 0) return false;
   const playlist = library[index];
@@ -3250,6 +3292,9 @@ function refreshedRows(current, incoming) {
 export async function initEvents() {
   if (bootstrapped) return;
   bootstrapped = true;
+  // Before any identity is applied: in a presentation run the account's name
+  // must never reach the screen, not even for one event.
+  presentation.name = await invoke("get_presentation").catch(() => null) || null;
   // A startup snapshot may arrive after live events. The independent event
   // lanes must not overwrite one another while the initial pull is in flight.
   let stateEvents = 0;

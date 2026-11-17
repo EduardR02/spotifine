@@ -25,6 +25,7 @@ use crate::personal_api::{
     Status as PersonalStatus,
 };
 use crate::playback_router::{Action as PlaybackAction, DeviceDiscovery, PlaybackRouter};
+use crate::presentation;
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail, CacheStats, EpisodeDetail, HistoryPageDetail, LibraryNodeDetail, LikedSongsDetail, PlaybackEvent, PlaybackState, Playlist, PlaylistDetail, PlaylistRecommendationsDetail, ProfileDetail, RadioDetail, SearchResult, Show, ShowDetail, SongwriterPlaylist, Track, TrackCreditsDetail, TrackPlaylistRef, TrackWaveform
 };
@@ -504,6 +505,10 @@ pub async fn browse_profile(
     state: State<'_, Mutex<AppState>>,
     username: String,
 ) -> Result<ProfileDetail, String> {
+    // The account's own profile is its name, picture and playlists.
+    if presentation::active() && username == state.lock().me_id {
+        return Err(presentation::REFUSAL.to_owned());
+    }
     let known_playlists = ProfileDetail::library_artwork_refs(&state.lock().playlists);
     let mut profile = ProfileDetail::from(client.browse_profile(&username, &known_playlists).await?);
     profile.enrich_library_metadata(&state.lock().playlists);
@@ -622,6 +627,9 @@ pub async fn enable_account_canvas(client: State<'_, Arc<EngineClient>>) -> Resu
 pub async fn browse_followed_artists(
     client: State<'_, Arc<EngineClient>>,
 ) -> Result<Vec<Artist>, String> {
+    if let Some(presentation) = presentation::get() {
+        return presentation.artists(&client).await;
+    }
     Ok(client
         .browse_followed_artists()
         .await?
@@ -638,6 +646,10 @@ pub async fn browse_followed_artists(
 pub async fn browse_saved_shows(
     client: State<'_, Arc<EngineClient>>,
 ) -> Result<Vec<Show>, String> {
+    // A presentation library holds no podcasts.
+    if presentation::active() {
+        return Ok(Vec::new());
+    }
     Ok(client
         .browse_saved_shows()
         .await?
@@ -1120,6 +1132,13 @@ pub async fn get_state(state: State<'_, Mutex<AppState>>, router: State<'_, Arc<
         library_fresh: library_visible && guard.library_fresh,
         me_id: if library_visible { guard.me_id.clone() } else { String::new() },
     })
+}
+
+/// The name a presentation run shows for the account, or nothing in an
+/// ordinary run. The window asks once, before it applies any identity.
+#[tauri::command]
+pub fn get_presentation() -> Option<String> {
+    presentation::get().map(|presentation| presentation.name.clone())
 }
 
 /// Records that a successful playback started *from* playlist `id`.
@@ -2076,7 +2095,7 @@ fn spawn_refresh_library(app: AppHandle) {
 /// Keep cached rows on a failed read; publish only a fenced, complete rootlist.
 async fn refresh_library(
     state: &Mutex<AppState>,
-    client: &EngineClient,
+    client: &Arc<EngineClient>,
     app: &AppHandle,
 ) -> Result<(), String> {
     let result = fetch_library(state, client).await?;
@@ -2437,11 +2456,24 @@ fn library_generation_is_current(state: &AppState, generation: u64) -> bool {
 
 async fn fetch_library(
     state: &Mutex<AppState>,
-    client: &EngineClient,
+    client: &Arc<EngineClient>,
 ) -> Result<LibraryFetchResult, String> {
     let mut generation = state.lock().library_generation;
-    let mut playlists = Vec::new();
-    let mut playlist_tree = LibraryNodeDetail::split(client.browse_playlist_tree(LIBRARY_PAGE_SIZE).await?, &mut playlists);
+    let (mut playlists, mut playlist_tree) = match presentation::get() {
+        // The configured library stands where the rootlist would, flat and in
+        // the file's order; the account's rootlist is never read.
+        Some(presentation) => {
+            let account = state.lock().me_id.clone();
+            let playlists = presentation.library(client, &account).await?;
+            let tree = playlists.iter().map(|row| LibraryNodeDetail::Playlist { id: row.id.clone() }).collect();
+            (playlists, tree)
+        }
+        None => {
+            let mut playlists = Vec::new();
+            let tree = LibraryNodeDetail::split(client.browse_playlist_tree(LIBRARY_PAGE_SIZE).await?, &mut playlists);
+            (playlists, tree)
+        }
+    };
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
@@ -2565,6 +2597,9 @@ async fn fetch_playlist(
     };
     let tracks_key = browse.tracks_key.clone();
     let mut detail = PlaylistDetail::from(browse);
+    if let Some(presentation) = presentation::get() {
+        presentation.mask_owner(&mut detail.playlist, &state.lock().me_id);
+    }
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();

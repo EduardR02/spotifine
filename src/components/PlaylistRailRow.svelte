@@ -1,5 +1,5 @@
 <script>
-  import { navigate } from "../lib/state.svelte.js";
+  import { navigate, libraryKind } from "../lib/state.svelte.js";
   import { railDrag, trackDrag } from "../lib/dnd.svelte.js";
   import Cover from "./Cover.svelte";
   import Icon from "./Icon.svelte";
@@ -16,7 +16,7 @@
   use:observeCover={playlist.id}
   style:padding-left={`${8 + depth * 16}px`}
   aria-haspopup="menu"
-  onclick={() => navigate("playlist", playlist.id)}
+  onclick={() => navigate(libraryKind(playlist), playlist.id)}
   onpointerdown={(event) => onpress?.(event, playlist)}
   oncontextmenu={(event) => onmenu?.(event, playlist)}
   onkeydown={(event) => onmenu?.(event, playlist)}>

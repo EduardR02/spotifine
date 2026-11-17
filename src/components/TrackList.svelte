@@ -15,6 +15,7 @@
     isCached,
     session,
     sessionEpoch,
+    presentation,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
@@ -119,7 +120,9 @@
      beyond the one rect the drag loop already reads per frame.
      ===================================================================== */
   const canReorder = $derived(!!onReorder);
-  const dragEnabled = $derived(allowAddToPlaylist || !!onReorder);
+  /* A presentation adds to no playlist, by menu or by drag. */
+  const canAddToPlaylist = $derived(allowAddToPlaylist && !presentation.name);
+  const dragEnabled = $derived(canAddToPlaylist || !!onReorder);
   /* This table's body element — the reorder zone registered below. */
   const zoneEl = $derived(disableWindowing ? flatBody : bodyEl);
   const engaged = $derived(trackDrag.active && !!zoneEl && trackDrag.listEl === zoneEl);
@@ -1173,7 +1176,7 @@
     <button class="menu-item" onclick={() => { menu.open = false; api.addQueue(menu.track, queueSource).catch(() => {}); }}>
       <Icon name="queue-add" size={16} /><span class="menu-label">Add to queue</span>
     </button>
-    {#if allowAddToPlaylist && menu.track?.uri?.startsWith("spotify:track:")}
+    {#if canAddToPlaylist && menu.track?.uri?.startsWith("spotify:track:")}
       <button class="menu-item" aria-haspopup="menu" aria-expanded={picker.open} onclick={openPicker}>
         <Icon name="playlist-add" size={16} /><span class="menu-label">Add to playlist</span>
         <span class="chev"><Icon name="forward" size={14} /></span>
