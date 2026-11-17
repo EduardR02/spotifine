@@ -18,6 +18,11 @@
    so the light never rests beside the pointer.
    ===================================================================== */
 
+/* Typed attr() (app.css, THE POOL) reads the place from an attribute,
+   which restyles the row alone. An engine without it (WebKit) is handed
+   the place as a custom property, which restyles what the row holds too. */
+const BY_ATTR = globalThis.CSS?.supports?.("background-position-x", "attr(data-px px)") ?? false;
+
 const ROWS = ".nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row";
 /** The least time between two writes, in ms. */
 const GAP = 32;
@@ -40,12 +45,14 @@ export function watchPool() {
     if (!row || wanted === written) return;
     due = performance.now() + GAP;
     written = wanted;
-    row.setAttribute("data-px", wanted);
+    if (BY_ATTR) row.setAttribute("data-px", wanted);
+    else row.style.setProperty("--px", `${wanted}px`);
   };
   const leave = () => {
     if (timer) clearTimeout(timer);
     timer = 0;
-    row?.removeAttribute("data-px");
+    if (BY_ATTR) row?.removeAttribute("data-px");
+    else row?.style.removeProperty("--px");
     row = null;
   };
   const move = (event) => {

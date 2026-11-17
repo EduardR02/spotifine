@@ -196,8 +196,10 @@ export function frost(node) {
   };
 }
 
-/** For the layer: call `clip(css)` with a clip-path value whenever the
-    frosted region changes. Returns the unsubscribe. */
+/** For the layer: call `clip(css, boxes)` with a clip-path value, and the
+    planes' boxes ({ x, y, w, h, r }: r the four corner radii, clockwise from
+    the top left) for their edges, whenever the frosted region changes.
+    Returns the unsubscribe. */
 export function watchFrost(clip) {
   onClip = clip;
   lastClip = null;
@@ -216,18 +218,23 @@ export function watchFrost(clip) {
 function trace() {
   if (!onClip) return;
   const parts = [];
+  const boxes = [];
   for (const el of planes) {
     const b = el.getBoundingClientRect();
     const st = getComputedStyle(el);
     const r = [st.borderTopLeftRadius, st.borderTopRightRadius, st.borderBottomRightRadius, st.borderBottomLeftRadius].map(
       (v) => parseFloat(v) || 0,
     );
-    if (b.width > 0 && b.height > 0) parts.push(roundRect({ x: b.left, y: b.top, w: b.width, h: b.height, r }));
+    if (b.width > 0 && b.height > 0) {
+      const box = { x: b.left, y: b.top, w: b.width, h: b.height, r };
+      parts.push(roundRect(box));
+      boxes.push(box);
+    }
   }
   const clip = parts.length ? `path("${parts.join(" ")}")` : "inset(50%)";
   if (clip === lastClip) return;
   lastClip = clip;
-  onClip(clip);
+  onClip(clip, boxes);
 }
 
 const px = (v) => Math.round(v * 100) / 100;

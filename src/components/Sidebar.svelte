@@ -35,6 +35,21 @@
   import { avatar, loadAvatar } from "../lib/avatar.svelte.js";
   import { frost, haze } from "../lib/ambient.svelte.js";
 
+  /* The record's tone for the selected row's light (app.css, THE SELECTED
+     PLATE), in two slots: a new record's tone goes into the slot not
+     showing, and the rail turns to it, which crossfades the light on the
+     compositor. The first tone fills both. */
+  let railTone = $state({ a: "", b: "", onB: false });
+  $effect(() => {
+    const tone = haze.tone;
+    if (!tone) return;
+    untrack(() => {
+      const t = railTone;
+      if (!t.a) railTone = { a: tone, b: tone, onB: false };
+      else if (tone !== (t.onB ? t.b : t.a)) railTone = t.onB ? { a: tone, b: t.b, onB: false } : { a: t.a, b: tone, onB: true };
+    });
+  });
+
   /** What the naming field is making: `{ kind: "playlist" | "folder",
       parent }`, `parent` being the folder a new folder goes in (the field
       then sits under that folder's heading), or null. */
@@ -609,7 +624,8 @@
   </button>
 {/snippet}
 
-<aside class="sidebar glass-chrome" use:frost style:--haze-tone={haze.tone || null}>
+<aside class="sidebar glass-chrome" use:frost class:rail-tone-b={railTone.onB}
+  style:--rail-tone-a={railTone.a || null} style:--rail-tone-b={railTone.b || null}>
   <!-- The rail's top edge moves the window; on macOS the traffic lights sit
        in it. -->
   <div class="sidebar-top" data-tauri-drag-region></div>

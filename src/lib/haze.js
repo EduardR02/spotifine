@@ -1045,10 +1045,12 @@ function barFalloff(closed, x, y, h) {
  * @param src   { data, w, h } — RGBA bytes of the whole source
  * @param geo   see prepare
  * @param tint  encoded [r, g, b] of the record's colour, for what has none
- * @param frost the glass planes' frost (parseFrost), or null for none
- * @returns { rgba, frost, frostW, frostH, tone, gain, grey, light } — the haze as
- *          8-bit RGBA; the same haze frosted (or null), at half its size
- *          (frostW x frostH); the gain the mean ceilings took; the share of
+ * @param frost the glass planes' frost (parseFrost), with its edge (parseEdge)
+ *              or none, or null for no frost
+ * @returns { rgba, frost, frostW, frostH, tone, gather, gain, grey, light } — the
+ *          haze as 8-bit RGBA; the same haze frosted (or null), at half its
+ *          size (frostW x frostH); its gathered twin, the same size (null
+ *          without frost.edge); the gain the mean ceilings took; the share of
  *          pixels that took the record's tint; and how bright the panel's
  *          picture is under its type (see lightOf)
  */
@@ -1334,6 +1336,7 @@ function emit(out, gain, plan, src, seed, frost, seam) {
     frostW: fw,
     frostH: fh,
     tone: frosted ? toneOf(toneColumns(frosted, fw, fh)) : null,
+    gather: frosted && frost.edge ? gatherOf(frosted, frost.edge) : null,
     gain,
     grey: plan.grey,
     light,
@@ -1381,6 +1384,56 @@ export function parseFrost(value, pxPerHaze) {
   const blurPx = num("blur");
   if (!blurPx) return null;
   return { sigma: blurPx / pxPerHaze, saturate: num("saturate") ?? 1, brightness: num("brightness") ?? 1 };
+}
+
+/**
+ * THE GATHER (app.css, THE EDGE): just inside a plane's rim the glass
+ * gathers the light behind it — the frost there, brighter and richer. The
+ * frost is a still picture, so its gathered twin is drawn once with it,
+ * here, and the haze layer lays it into each plane's edge band
+ * (Ambient.svelte, THE EDGES), where a backdrop-filter on every plane used
+ * to filter it again for each frame anything inside the plane changed.
+ *
+ * The twin lies UNDER the plane's tint, where the filter's output lay over
+ * it, so it is what lands on screen once the tint is laid on it: with the
+ * filter F of the tinted frost B = (1 - a)·v + a·T, the twin G is the colour
+ * the tint (T at alpha a) turns into F — G = (F(B) - a·T) / (1 - a).
+ * Encoded values, clamped between the filter's steps as CSS clamps them.
+ *
+ * Read from the tokens: `--frost-edge` (its brightness and saturate) and
+ * `--tint-pane`; null when the edge has no filter (reduced transparency).
+ */
+export function parseEdge(filter, tint) {
+  const f = String(filter ?? "");
+  const num = (name) => {
+    const m = f.match(new RegExp(name + String.raw`\(\s*([\d.]+)(%)?\s*\)`));
+    return m ? (m[2] ? Number(m[1]) / 100 : Number(m[1])) : null;
+  };
+  const gain = num("brightness"), saturate = num("saturate");
+  if (gain == null && saturate == null) return null;
+  const c = String(tint ?? "").match(/rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:\s*[,/]\s*([\d.]+)(%)?)?\s*\)/);
+  const alpha = c && c[4] != null ? (c[5] ? Number(c[4]) / 100 : Number(c[4])) : 0;
+  const t = c ? [Number(c[1]) / 255, Number(c[2]) / 255, Number(c[3]) / 255] : [0, 0, 0];
+  return { gain: gain ?? 1, saturate: saturate ?? 1, alpha: Math.min(0.95, alpha), tint: t };
+}
+
+/** The gathered twin of a frost (RGBA bytes), as RGBA bytes: see parseEdge. */
+export function gatherOf(frost, edge) {
+  const out = new Uint8ClampedArray(frost.length);
+  const m = saturateMatrix(edge.saturate), k = edge.gain, a = edge.alpha, t = edge.tint;
+  const at = [a * t[0], a * t[1], a * t[2]];
+  const clamp = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+  for (let i = 0; i < frost.length; i += 4) {
+    const b0 = clamp(((1 - a) * frost[i] / 255 + at[0]) * k);
+    const b1 = clamp(((1 - a) * frost[i + 1] / 255 + at[1]) * k);
+    const b2 = clamp(((1 - a) * frost[i + 2] / 255 + at[2]) * k);
+    for (let c = 0; c < 3; c++) {
+      const f = clamp(m[c * 3] * b0 + m[c * 3 + 1] * b1 + m[c * 3 + 2] * b2);
+      out[i + c] = Math.round(clamp((f - at[c]) / (1 - a)) * 255);
+    }
+    out[i + 3] = 255;
+  }
+  return out;
 }
 
 /** CSS's saturate(s) as a colour matrix, by rows. */

@@ -354,7 +354,7 @@
   --raise-2: rgba(255, 255, 255, 0.075);
   --raise-3: rgba(255, 255, 255, 0.11);
   /* The light of a selected row in the rail is the record's own: the hue of
-     the rail's glass as it is on screen (--haze-tone, from the haze layer),
+     the rail's glass as it is on screen (haze.tone, from the haze layer),
      at a fixed lightness and at most this chroma. Such a colour is dimmer
      than white, so it lies on at a little more than the white raise it
      replaces; glass.test.js holds the type over it for every hue, from
@@ -406,30 +406,24 @@
      on the glass beyond it. Like the frosts it multiplies what is behind
      it and adds no grey of its own. It carries no blur: a blur on a plane
      was what the pre-rendered frost replaced (GLASS), and this must not
-     bring one back. */
+     bring one back.
+
+     Nor is it filtered live: what is behind a plane is the haze, still
+     between records, so the haze layer bakes the band — the frost's
+     gathered twin, drawn by the haze worker with the frost (haze.js,
+     parseEdge), in the band's shape — into a few small strips under each
+     plane, drawn again only when a picture is shown or a plane moves
+     (lib/edges.js, which holds the band's shape). As a masked
+     backdrop-filter on each plane it was filtered again on every frame in
+     which anything inside a plane changed, and lifted most of what the
+     planes hold onto layers of their own. --frost-edge is that filter,
+     read by the haze layer. */
   /* The rim's strength, per surface: its gradient is written where it is
      drawn (THE MATERIAL), not as a token here, because a token is resolved
      once, on :root, and a surface that turns --rim-k down would inherit
      the root's light anyway. */
   --rim-k: 1;
   --frost-edge: brightness(2.4) saturate(1.3);
-  /* The band's shape: a line against the rim and under it a tail at a
-     third of its strength, nine and a half pixels deep in all. It is
-     written as its fall-off along the way in from an edge (--edge-run) and
-     the same fall-off round a corner, out from the corner's centre
-     (--edge-turn, for the planes' 12px radius), and the plane masks its
-     band with four edges and four corners of them. Gradients, not a
-     picture: the band was an SVG of two blurred rings laid out at the
-     plane's size, and every frame of a window resize or a panel drag
-     rasterised those blurs again at the size of each plane. */
-  --edge-run: rgb(0 0 0 / 0.86), rgb(0 0 0 / 0.75) 1px, rgb(0 0 0 / 0.51) 2px, rgb(0 0 0 / 0.31) 3px,
-              rgb(0 0 0 / 0.21) 4px, rgb(0 0 0 / 0.14) 5px, rgb(0 0 0 / 0.085) 6px,
-              rgb(0 0 0 / 0.045) 7px, rgb(0 0 0 / 0.02) 8px, rgb(0 0 0 / 0) 9.5px;
-  --edge-turn: rgb(0 0 0 / 0) 2.5px, rgb(0 0 0 / 0.02) 4px, rgb(0 0 0 / 0.045) 5px,
-               rgb(0 0 0 / 0.085) 6px, rgb(0 0 0 / 0.14) 7px, rgb(0 0 0 / 0.21) 8px,
-               rgb(0 0 0 / 0.31) 9px, rgb(0 0 0 / 0.51) 10px, rgb(0 0 0 / 0.75) 11px,
-               rgb(0 0 0 / 0.86) 12px;
-  --edge-fall: linear-gradient(168deg, #000, rgb(0 0 0 / 0.62) 38%, rgb(0 0 0 / 0.34));
   --edge-shade: inset 0 -10px 14px -12px rgb(0 0 0 / 0.34);
   --lift-plane:    0 0 0 1px rgb(0 0 0 / 0.24), 0 2px 3px rgb(0 0 0 / 0.24),
                    0 18px 40px -20px rgb(0 0 0 / 0.78);
@@ -551,37 +545,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .glass-pane {
   background: var(--glass-sheen), var(--glass-depth), var(--tint-pane);
   box-shadow: var(--lift-plane), var(--edge-shade);
-}
-/* The gather (THE EDGE): under everything the plane holds, over its tint.
-   A plane's two pseudo-elements are the material's — this and the rim. */
-:is(.glass-chrome, .glass-pane)::after {
-  content: ""; position: absolute; inset: 0; z-index: -1;
-  border-radius: inherit; pointer-events: none;
-  -webkit-backdrop-filter: var(--frost-edge);
-          backdrop-filter: var(--frost-edge);
-  /* The weighting toward the light, cut to the band: the fall, then the
-     four edges (top, bottom, left, right) and the four corners (top left,
-     top right, bottom left, bottom right). */
-  --edge-mask:
-    var(--edge-fall),
-    linear-gradient(to bottom, var(--edge-run)), linear-gradient(to top, var(--edge-run)),
-    linear-gradient(to right, var(--edge-run)), linear-gradient(to left, var(--edge-run)),
-    radial-gradient(circle at 100% 100%, var(--edge-turn)), radial-gradient(circle at 0 100%, var(--edge-turn)),
-    radial-gradient(circle at 100% 0, var(--edge-turn)), radial-gradient(circle at 0 0, var(--edge-turn));
-  --edge-at: 0 0, 12px 0, 12px 100%, 0 12px, 100% 12px, 0 0, 100% 0, 0 100%, 100% 100%;
-  --edge-size: 100% 100%, calc(100% - 24px) 9.5px, calc(100% - 24px) 9.5px,
-               9.5px calc(100% - 24px), 9.5px calc(100% - 24px),
-               12px 12px, 12px 12px, 12px 12px, 12px 12px;
-  -webkit-mask-image: var(--edge-mask);
-          mask-image: var(--edge-mask);
-  -webkit-mask-position: var(--edge-at);
-          mask-position: var(--edge-at);
-  -webkit-mask-size: var(--edge-size);
-          mask-size: var(--edge-size);
-  -webkit-mask-repeat: no-repeat;
-          mask-repeat: no-repeat;
-  -webkit-mask-composite: source-in, source-over, source-over, source-over, source-over, source-over, source-over, source-over, source-over;
-          mask-composite: intersect, add, add, add, add, add, add, add, add;
 }
 .glass-card {
   /* Most cards are no taller than the rim's top light is deep, so the
@@ -868,10 +831,21 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
     rgb(255 255 255 / 0)) -999px 50% / 500px 100% no-repeat;
   --strip-edge: inset 0 1px 0 rgb(255 255 255 / 0.05), inset 0 -1px 0 rgb(0 0 0 / 0.1);
 }
-/* The pool's place: the tile's centre on the pointer. A selected row in the
-   rail never shows the pool, and its first layers are its own. */
-:is(.nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row):not(.active)[data-px] {
-  background-position-x: calc(attr(data-px px) - 250px), 0%, 0%, 0% !important;
+/* The pool's place: the tile's centre on the pointer, only while the row is
+   under it (a row the pointer left by leaving the window keeps its place
+   until the next move, and its own first layer must not take it). A
+   selected row in the rail never shows the pool. An engine without typed
+   attr() (WebKit) is handed the place as a custom property instead
+   (pool.js), which restyles what the row holds as well, but lights it. */
+@supports (background-position-x: attr(data-px px)) {
+  :is(.nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row):not(.active):hover[data-px] {
+    background-position-x: calc(attr(data-px px) - 250px), 0%, 0%, 0% !important;
+  }
+}
+@supports not (background-position-x: attr(data-px px)) {
+  :is(.nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row):not(.active):hover {
+    background-position-x: calc(var(--px, -749px) - 250px), 0%, 0%, 0% !important;
+  }
 }
 :is(.nav-item:not(.active), .lib-row:not(.active), .tl-row:not(.current, .unavailable, .drag-source),
     .ep-row:not(.current), .hi-main, .np-next):hover {
@@ -898,32 +872,48 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    track list is the same gesture on the pane's own glass.
 
    The light is the record's: not white laid on the glass, which greys it,
-   but the colour the rail's glass already is (--haze-tone), brought up to
-   a light (--sel-light). The accent stays where the bracket is — its wash
-   is gone by the middle of the row — so the row is the accent's at its
-   edge and the record's along its length. The rail carries --haze-tone
-   as a plain value; each row takes it as --row-tone, which is registered
-   and does not inherit, and only a selected row eases it from one record's
-   colour to the next — so a change of record restyles the rail once and
-   then animates two rows, not the rail's whole subtree for every frame of
-   the fade. Every row holds the tone, so a row that becomes selected
-   starts from the colour and does not fade in from nothing. */
-@property --row-tone { syntax: "<color>"; inherits: false; initial-value: #5b7a94; }
-:is(.nav-item, .lib-row) { --row-tone: var(--haze-tone, #5b7a94); }
-:is(.nav-item, .lib-row).active { transition: --row-tone 900ms var(--ease); }
+   but the colour the rail's glass already is (the haze's tone), brought
+   up to a light (--sel-light). The accent stays where the bracket is — its
+   wash is gone by the middle of the row — so the row is the accent's at
+   its edge and the record's along its length.
+
+   From one record to the next the light crossfades, and only the light
+   moves: it lies in the row's two pseudo-elements, one in each of the
+   rail's two tones (--rail-tone-a and -b, Sidebar.svelte, which writes a new
+   record's tone into the one not showing and turns the rail to it), and
+   the change is their opacity, which the compositor runs. Nothing is
+   restyled or repainted for a frame of it; easing the tone itself, a
+   colour, restyled and repainted the row and all it holds on every frame
+   of the fade. A row that becomes selected starts in the current tone. */
 :is(.nav-item.active, .lib-row.active) {
   --plate-wash: var(--accent-wash);
-  --sel-light: oklch(from var(--row-tone) var(--sel-light-l) min(var(--sel-light-c), calc(c * 2.6)) h);
+  position: relative; isolation: isolate;
   background:
-    linear-gradient(90deg, color-mix(in srgb, var(--mark, var(--accent)) 44%, transparent),
-      color-mix(in srgb, var(--sel-light) 16%, transparent) 34%,
-      color-mix(in srgb, var(--sel-light) 4%, transparent)) top / 100% 1px no-repeat,
+    linear-gradient(90deg, color-mix(in srgb, var(--mark, var(--accent)) 44%, transparent), transparent 34%)
+      top / 100% 1px no-repeat,
     linear-gradient(90deg, rgb(0 0 0 / 0.16), rgb(0 0 0 / 0.04)) bottom / 100% 1px no-repeat,
     linear-gradient(90deg, var(--plate-wash), transparent 52%),
+    linear-gradient(90deg, var(--tint-active) 36%, rgb(8 9 12 / 0.22));
+}
+:is(.nav-item.active, .lib-row.active)::before,
+:is(.nav-item.active, .lib-row.active)::after {
+  content: ""; position: absolute; inset: 0; z-index: -1;
+  border-radius: inherit; pointer-events: none;
+  --sel-light: oklch(from var(--plate-tone, #5b7a94) var(--sel-light-l) min(var(--sel-light-c), calc(c * 2.6)) h);
+  background:
+    linear-gradient(90deg, transparent, color-mix(in srgb, var(--sel-light) 16%, transparent) 34%,
+      color-mix(in srgb, var(--sel-light) 4%, transparent)) top / 100% 1px no-repeat,
     linear-gradient(90deg, color-mix(in srgb, var(--sel-light) calc(var(--sel-light-a) * 100%), transparent),
       color-mix(in srgb, var(--sel-light) calc(var(--sel-light-a) * 55%), transparent) 55%,
-      color-mix(in srgb, var(--sel-light) calc(var(--sel-light-a) * 20%), transparent)),
-    linear-gradient(90deg, var(--tint-active) 36%, rgb(8 9 12 / 0.22));
+      color-mix(in srgb, var(--sel-light) calc(var(--sel-light-a) * 20%), transparent));
+  transition: opacity 900ms var(--ease);
+}
+:is(.nav-item.active, .lib-row.active)::before { --plate-tone: var(--rail-tone-a); }
+:is(.nav-item.active, .lib-row.active)::after { --plate-tone: var(--rail-tone-b); opacity: 0; }
+.rail-tone-b :is(.nav-item.active, .lib-row.active)::before { opacity: 0; }
+.rail-tone-b :is(.nav-item.active, .lib-row.active)::after { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  :is(.nav-item.active, .lib-row.active)::before, :is(.nav-item.active, .lib-row.active)::after { transition: none; }
 }
 .nav-item.active { color: var(--fg); }
 .nav-item.active svg { opacity: 1; color: var(--accent); }
@@ -1470,8 +1460,16 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    No scrollbar gutter: the bar is an overlay (SCROLLBARS), so the sticky
    topbar and its search field keep the pane's full width whether or not the
    page scrolls, and nothing ends short of the pane's edge. */
+/* The page scrolls on the compositor. At one device pixel per CSS pixel
+   Chromium keeps a scroller that is not opaque on the main thread, so each
+   step of a scroll repainted the pane under it, glass body and all (the
+   sheen, the depth, the edge's shade), as well as the rows. Glass is never
+   opaque, so this asks for it: the scrolled page is a layer of its own and
+   a step moves it. Nothing it holds changes for that: it makes no stacking
+   context, no containing block and no backdrop root. */
 .scroll {
   flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; position: relative;
+  will-change: scroll-position;
 }
 /* THE MELT — a page does not meet the glass it slides under at a hard
    line. Just below the strips, once they are covering the page, and

@@ -449,7 +449,18 @@ uniform float uPx;
 uniform uint uKey;
 uniform int uW;
 uniform int uH;
+/* The gathered twin (haze.js, parseEdge): the frost under the plane's tint,
+   through --frost-edge, less the tint laid back on it. */
+uniform bool uGather;
+uniform float uGain;
+uniform mat3 uEdgeSat;
+uniform float uAlpha;
+uniform vec3 uTint;
 vec3 frosted(vec3 b) { return clamp(clamp(uSat * b, 0.0, 1.0) * uBright, 0.0, 1.0); }
+vec3 gathered(vec3 v) {
+  vec3 f = clamp(uEdgeSat * clamp(mix(v, uTint, uAlpha) * uGain, 0.0, 1.0), 0.0, 1.0);
+  return clamp((f - uAlpha * uTint) / (1.0 - uAlpha), 0.0, 1.0);
+}
 void main() {
   ivec2 p = ivec2(int(gl_FragCoord.x), uH - 1 - int(gl_FragCoord.y));
   vec3 v = frosted(texelFetch(uFrost, p, 0).rgb);
@@ -457,6 +468,7 @@ void main() {
     float k = 1.0 - smooth01(((uFrame.x - 2.0 * (float(p.x) + 0.5)) * uPx - GAP) / SPILL);
     if (k > 0.0) v += (frosted(texelFetch(uFrostLit, p, 0).rgb) - v) * k;
   }
+  if (uGather) v = gathered(v);
   int i = (p.y * uW + p.x) * 4;
   outColor = vec4(floor(v.r * 255.0 + noiseAt(i, uKey)), floor(v.g * 255.0 + noiseAt(i + 1, uKey)), floor(v.b * 255.0 + noiseAt(i + 2, uKey)), 255.0) / 255.0;
 }`;
@@ -612,7 +624,8 @@ export function createGlHaze() {
 
   /**
    * Render a haze and its frosted twin — renderHaze's arguments, and its
-   * answers as bitmaps: { bitmap, frost, tone, grey, light }.
+   * answers as bitmaps: { bitmap, frost, gather, tone, grey, light } (gather as
+   * RGBA bytes, { data, w, h }).
    */
   function render(src, geo, tint, { scale = 1, seed = 1, frost = null } = {}) {
     if (lost || gl.isContextLost()) return null;
@@ -691,6 +704,7 @@ export function createGlHaze() {
       const bitmap = canvas.transferToImageBitmap();
 
       let frosted = null;
+      let gather = null;
       let railTone = null;
       if (frost) {
         const fw = Math.ceil(w / 2), fh = Math.ceil(h / 2);
@@ -707,7 +721,9 @@ export function createGlHaze() {
         canvas.width = fw;
         canvas.height = fh;
         const m = saturateMatrix(frost.saturate);
-        run("frost", null, {
+        const edge = frost.edge;
+        const e = saturateMatrix(edge?.saturate ?? 1);
+        const frostPass = {
           uFrost: blurred,
           uFrostLit: lit,
           uSpill: Boolean(plan.seam),
@@ -718,7 +734,13 @@ export function createGlHaze() {
           uKey: frostKey,
           uW: fw,
           uH: fh,
-        });
+          uGather: false,
+          uGain: edge?.gain ?? 1,
+          uEdgeSat: [e[0], e[3], e[6], e[1], e[4], e[7], e[2], e[5], e[8]],
+          uAlpha: edge?.alpha ?? 0,
+          uTint: edge?.tint ?? [0, 0, 0],
+        };
+        run("frost", null, frostPass);
         /* The rail's colour (toneOf): two columns of the frost, read back
            here in the worker, where the stall is nobody's frame. */
         const columns = new Uint8Array(TONE_COLUMNS.length * fh * 4);
@@ -728,6 +750,17 @@ export function createGlHaze() {
         });
         railTone = toneOf(columns);
         frosted = canvas.transferToImageBitmap();
+        /* Its gathered twin, for the planes' edges (haze.js, parseEdge). */
+        /* Read back here, where the stall is nobody's frame: the main
+           thread draws the edges from it on the CPU (lib/edges.js). */
+        if (edge) {
+          run("frost", null, { ...frostPass, uGather: true });
+          const rows = new Uint8Array(fw * fh * 4);
+          gl.readPixels(0, 0, fw, fh, gl.RGBA, gl.UNSIGNED_BYTE, rows);
+          const data = new Uint8ClampedArray(fw * fh * 4);
+          for (let y = 0; y < fh; y++) data.set(rows.subarray((fh - 1 - y) * fw * 4, (fh - y) * fw * 4), y * fw * 4);
+          gather = { data, w: fw, h: fh };
+        }
       }
       if (gl.isContextLost()) {
         /* Lost part-way: what came out is not the picture. */
@@ -735,7 +768,7 @@ export function createGlHaze() {
         frosted?.close();
         return null;
       }
-      return { bitmap, frost: frosted, tone: railTone, grey: plan.grey, light };
+      return { bitmap, frost: frosted, gather, tone: railTone, grey: plan.grey, light };
     } finally {
       for (const t of textures) gl.deleteTexture(t);
       textures = [];

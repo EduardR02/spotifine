@@ -3,7 +3,8 @@
   import { playback, ui, coverUrl as imageUrl } from "../lib/state.svelte.js";
   import { coverTone, toneSettled } from "../lib/covertone.svelte.js";
   import { haze, publishLight, frost, watchFrost, watchShift } from "../lib/ambient.svelte.js";
-  import { rgbOf, parseFrost, RESTRAINED } from "../lib/haze.js";
+  import { rgbOf, parseFrost, parseEdge, RESTRAINED } from "../lib/haze.js";
+  import { stripsOf, drawStrip, holdTwin } from "../lib/edges.js";
   import { frame } from "../lib/window-frame.svelte.js";
 
   /* =====================================================================
@@ -138,13 +139,54 @@
   $effect(() => {
     const el = ambientEl;
     if (!el) return;
-    return watchFrost((clip) => el.style.setProperty("--frost-clip", clip));
+    return watchFrost((clip, boxes) => {
+      el.style.setProperty("--frost-clip", clip);
+      planeBoxes = boxes;
+      for (const s of stack) paintEdges(s);
+    });
   });
 
-  /** The planes' frost as the worker needs it, read from the glass token. */
+  /* ---- The edges (lib/edges.js) --------------------------------------------
+     Each layer holds its picture's gathered twin and lays it into four
+     strips per plane, as the frost lies under the planes. They are drawn
+     when the picture is shown, when a plane moves, and when a drag slides
+     the picture: never per frame otherwise. */
+  let planeBoxes = [];
+
+  function paintEdges(entry) {
+    const holder = entry.el.children[2];
+    const twin = entry.twin;
+    holder.hidden = !twin;
+    if (!twin) return;
+    const view = { w: window.innerWidth || 1, h: window.innerHeight || 1, dpr: window.devicePixelRatio || 1, slide: entry.shift };
+    let i = 0;
+    for (const box of planeBoxes) {
+      for (const strip of stripsOf(box.w, box.h)) {
+        let canvas = holder.children[i++];
+        if (!canvas) canvas = holder.appendChild(document.createElement("canvas"));
+        const s = canvas.style;
+        s.left = `${box.x + strip[0]}px`;
+        s.top = `${box.y + strip[1]}px`;
+        s.width = `${strip[2]}px`;
+        s.height = `${strip[3]}px`;
+        drawStrip(canvas, twin, box, strip, view);
+      }
+    }
+    while (holder.children.length > i) holder.lastElementChild.remove();
+  }
+
+  function releaseEdges(entry) {
+    entry.twin = null;
+    entry.el.children[2].hidden = true;
+  }
+
+  /** The planes' frost as the worker needs it, read from the glass tokens:
+      the frost, and the gather at its edges (null with no edge filter). */
   function frostFor(geo) {
-    const token = getComputedStyle(document.documentElement).getPropertyValue("--frost-plane");
-    return parseFrost(token, geo.px);
+    const root = getComputedStyle(document.documentElement);
+    const frost = parseFrost(root.getPropertyValue("--frost-plane"), geo.px);
+    if (frost) frost.edge = parseEdge(root.getPropertyValue("--frost-edge"), root.getPropertyValue("--tint-pane"));
+    return frost;
   }
 
   /* ---- The layers ---------------------------------------------------------
@@ -162,12 +204,12 @@
   let queued = null;
   let z = 1;
 
-  function show(bitmap, frosted, fade, geo) {
+  function show(bitmap, frosted, twin, fade, geo) {
     const el = layerEls.find((c) => c && !stack.some((s) => s.el === c));
     if (!el) {
       queued?.bitmap.close();
       queued?.frosted?.close();
-      queued = { bitmap, frosted, fade, geo };
+      queued = { bitmap, frosted, twin, fade, geo };
       return;
     }
     const [hazeCanvas, frostClip] = el.children;
@@ -188,8 +230,11 @@
       anim: el.animate([{ opacity: 0 }, { opacity: 1 }], { duration, easing, fill: "forwards" }),
       left: geo?.left ?? null,
       covered: coversPanel(geo),
+      twin: frosted && twin ? holdTwin(twin) : null,
+      shift: null,
     };
     slide(entry, dragEdge);
+    paintEdges(entry);
     stack.push(entry);
     if (stats) stats.fades.push({ fade, ms: duration, at: Math.round(performance.now()), key: asked?.key });
     entry.anim.finished.then(
@@ -202,7 +247,7 @@
         if (queued) {
           const next = queued;
           queued = null;
-          show(next.bitmap, next.frosted, next.fade, next.geo);
+          show(next.bitmap, next.frosted, next.twin, next.fade, next.geo);
         }
       },
       () => {},
@@ -214,6 +259,7 @@
     entry.el.style.visibility = "hidden";
     entry.el.style.opacity = "0";
     slide(entry, null);
+    releaseEdges(entry);
   }
 
   /* ---- The drag ------------------------------------------------------------
@@ -249,6 +295,7 @@
     const from = entry.left == null ? null : entry.left * vw;
     if (edge == null || from == null || Math.abs(edge - from) < 0.25) {
       for (const c of canvases) c.style.transform = "";
+      entry.shift = null;
       return;
     }
     const stretch = edge > from
@@ -260,6 +307,10 @@
       c.style.transformOrigin = origin;
       c.style.transform = transform;
     }
+    /* The edges are drawn from the picture where it now lies, when the
+       planes are traced in this same frame (a drag moves them), or when
+       the picture is shown: once a frame at most. */
+    entry.shift = { from, edge, stretch };
   }
 
   /* ---- The worker -------------------------------------------------------- */
@@ -327,7 +378,7 @@
           m.frost?.close();
           return;
         }
-        show(m.bitmap, m.frost, lit ? m.fade : "first", asked?.geo);
+        show(m.bitmap, m.frost, m.gather, lit ? m.fade : "first", asked?.geo);
         // The rail's colour, measured in the worker on the frost it made.
         if (m.tone) haze.tone = `rgb(${m.tone[0]} ${m.tone[1]} ${m.tone[2]})`;
         lit = true;
@@ -693,6 +744,7 @@
       <div class="layer" bind:this={layerEls[i]}>
         <canvas width="1" height="1"></canvas>
         <div class="frost" hidden><canvas width="1" height="1"></canvas></div>
+        <div class="edges" hidden></div>
       </div>
     {/each}
   </div>
@@ -730,7 +782,12 @@
   .frost {
     clip-path: var(--frost-clip, inset(50%));
   }
-  .frost[hidden] {
+  .frost[hidden],
+  .edges[hidden] {
     display: none;
+  }
+  /* The planes' edge strips (lib/edges.js), laid by paintEdges. */
+  .edges > :global(canvas) {
+    position: absolute;
   }
 </style>
