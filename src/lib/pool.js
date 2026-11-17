@@ -2,18 +2,20 @@
    THE POOL — the light a row takes under the pointer (app.css, THE POOL).
 
    One listener for the window. A move over a row writes the pointer's
-   place in that row, in pixels from its left edge, on that row alone; the
-   row's own hover plate draws the light there. The row's left edge is read
-   once, as the pointer enters it — a row does not move sideways under a
-   pointer that is on it — so a move reads nothing and lays nothing out.
-   With the pointer still, or anywhere but on a row, nothing runs.
+   place in that row, in pixels from its left edge, as the row's data-px;
+   the row's own hover plate slides its light there. The row's left edge
+   is read once, as the pointer enters it — a row does not move sideways
+   under a pointer that is on it — so a move reads nothing and lays nothing
+   out. With the pointer still, or anywhere but on a row, nothing runs.
 
-   A write is a style pass for the row and a repaint of it, so there are
-   as few as the eye needs: the place is kept to two pixels, and written at
-   most once every GAP milliseconds — the light is 250px of soft glow, and
-   thirty places a second is as smooth as it can be seen to be. The last
-   place of a gesture is always written, a moment late at most, so the
-   light never rests beside the pointer.
+   An attribute, not a custom property: a custom property written on a row
+   restyles everything the row holds, and this restyles the row alone. A
+   write is still a style pass for the row and a repaint of it, so there
+   are as few as the eye needs: the place is kept to two pixels, and
+   written at most once every GAP milliseconds — the light is 250px of soft
+   glow, and thirty places a second is as smooth as it can be seen to be.
+   The last place of a gesture is always written, a moment late at most,
+   so the light never rests beside the pointer.
    ===================================================================== */
 
 const ROWS = ".nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row";
@@ -38,12 +40,12 @@ export function watchPool() {
     if (!row || wanted === written) return;
     due = performance.now() + GAP;
     written = wanted;
-    row.style.setProperty("--px", `${wanted}px`);
+    row.setAttribute("data-px", wanted);
   };
   const leave = () => {
     if (timer) clearTimeout(timer);
     timer = 0;
-    row?.style.removeProperty("--px");
+    row?.removeAttribute("data-px");
     row = null;
   };
   const move = (event) => {

@@ -197,3 +197,8 @@
 
   {#if framed}<WindowControls />{/if}
 </div>
+
+<!-- The melt under the bar (app.css, THE MELT), only while the bar covers
+     the page. A sibling, not a child: the bar is the backdrop root of what
+     it holds, and a band in it could only frost the bar. -->
+{#if covering}<div class="topbar-melt" aria-hidden="true"></div>{/if}

@@ -1063,6 +1063,7 @@
 
 <div
   class="tl"
+  class:head-stuck={headStuck}
   class:dense
   class:reordering={engaged}
   bind:this={rootEl}

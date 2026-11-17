@@ -837,32 +837,41 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* THE POOL — the glass answers the hand where the hand is. A row under the
    pointer is not one flat plate: it rests a step under --hover and comes up
    to it in a soft pool around the pointer, which slides along the row with
-   it (pool.js writes --px, the pointer's place in the row, on that one row).
-   Every kind of row takes it — the nav, the library, track lists, episodes,
-   history, the panel's up next, and the items of a menu (whose light is
-   the overlay's, a step stronger: --pool-rest and --hover-pool-a say how
-   much).
+   it (pool.js writes data-px, the pointer's place in the row, on that one
+   row). Every kind of row takes it — the nav, the library, track lists,
+   episodes, history, the panel's up next, and the items of a menu (whose
+   light is the overlay's, a step stronger: --pool-rest and --hover-pool-a
+   say how much).
    It is light on the thing being pointed at and nowhere else, so nothing
-   moves at the edge of sight. --px and --pool are registered so that they
-   do not inherit: a move restyles the row and none of what it holds
-   (unregistered, --pool carried the pointer's place down to every child
-   of the row, and each move restyled them all). Away from
-   it (touch, reduced motion, a row reached before the pointer has moved)
-   the pool lies off the row and the plate is the rest alone.
+   moves at the edge of sight. The light is one fixed picture, a 500px tile
+   with the pool at its centre (--pool); a move only slides the tile, and
+   the row reads where from its own attribute (attr(), in the rule below).
+   It is an attribute and a standard property on purpose: a custom property
+   written on a row restyles everything the row holds, registered or not
+   (17 elements a move, where this is the row alone), and a pool every
+   rule draws the same way needs the place in one rule, not in each. The
+   pool is the first layer of every plate that has one, so its place is
+   the first of the list and the layers under it keep theirs. Away from it
+   (touch, reduced motion, a row reached before the pointer has moved, an
+   engine without typed attr()) the tile lies off the row and the plate is
+   the rest alone.
 
    The plate itself is a strip of the glass, not a tint: --strip-edge is
    the light its top edge catches and the shade under its foot, a pixel
    each, so a row under the pointer has an edge like everything else made
    of this material. */
-@property --px { syntax: "<length>"; inherits: false; initial-value: -999px; }
-@property --pool { syntax: "*"; inherits: false; }
 :is(.nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row) {
   --pool-rest: var(--hover-rest);
-  --pool: radial-gradient(250px 130px at var(--px) 50%,
+  --pool: radial-gradient(250px 130px at 50% 50%,
     rgb(255 255 255 / var(--hover-pool-a)),
     rgb(255 255 255 / calc(var(--hover-pool-a) * 0.55)) 42%,
-    rgb(255 255 255 / 0));
+    rgb(255 255 255 / 0)) -999px 50% / 500px 100% no-repeat;
   --strip-edge: inset 0 1px 0 rgb(255 255 255 / 0.05), inset 0 -1px 0 rgb(0 0 0 / 0.1);
+}
+/* The pool's place: the tile's centre on the pointer. A selected row in the
+   rail never shows the pool, and its first layers are its own. */
+:is(.nav-item, .lib-row, .tl-row, .ep-row, .hi-main, .np-next, .menu-item, .p-saved-row):not(.active)[data-px] {
+  background-position-x: calc(attr(data-px px) - 250px), 0%, 0%, 0% !important;
 }
 :is(.nav-item:not(.active), .lib-row:not(.active), .tl-row:not(.current, .unavailable, .drag-source),
     .ep-row:not(.current), .hi-main, .np-next):hover {
@@ -1470,31 +1479,39 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    it lightly and thins to nothing, so a row arrives under the top bar, and
    leaves by the bottom of the pane, over a few pixels instead of being cut.
 
-   The bands are pseudo-elements of what scrolls — the scroller's own two,
-   stuck to its edges, and one in each track list, stuck under its column
-   heads — and take no room in the page. They are not children of the
-   strips: a strip carries a backdrop-filter, which makes it the backdrop
-   root of everything inside it, and a band in there could only frost the
-   strip. A list's band leaves with its list, as its heads do. Column heads
-   still on their way up cross the top bar's band above it, unfrosted, and
-   once stuck they cover it. Each band is a frost like the strips', a
-   fraction of their size. */
+   The bands ride what scrolls and take no room in the page: the scroller's
+   own ::after, stuck to its foot; the top bar's, an element the bar lays
+   just after itself while it covers the page (TopBar.svelte); and one in
+   each track list, its ::before while its column heads are stuck
+   (.head-stuck, TrackList.svelte). They are not children of the strips: a
+   strip carries a backdrop-filter, which makes it the backdrop root of
+   everything inside it, and a band in there could only frost the strip. A
+   list's band leaves with its list, as its heads do. Column heads still on
+   their way up cross the top bar's band above it, unfrosted, and once
+   stuck they cover it. Each band is a frost like the strips', a fraction
+   of their size.
+
+   The bar and the list say when their band is there, with an element and
+   a class, rather than the scroller and the list asking with :has(): a
+   :has() over a scroller is asked again whenever a scrolled list adds or
+   drops a row, and restyled the scroller and the list on every frame of a
+   scroll. */
 .scroll::after,
-.scroll:has(> .topbar.glass-strip)::before,
-.tl:has(> .tl-head.stuck)::before {
+.topbar-melt,
+.tl.head-stuck::before {
   content: ""; display: block; position: sticky; z-index: 15;
   height: var(--melt-h); pointer-events: none;
   background: var(--tint-melt);
   -webkit-backdrop-filter: var(--frost-melt);
           backdrop-filter: var(--frost-melt);
 }
-.scroll:has(> .topbar.glass-strip)::before,
-.tl:has(> .tl-head.stuck)::before {
+.topbar-melt,
+.tl.head-stuck::before {
   top: var(--topbar-h); margin-bottom: calc(var(--melt-h) * -1);
   -webkit-mask-image: linear-gradient(180deg, #000, rgb(0 0 0 / 0.55) 40%, rgb(0 0 0 / 0.16) 74%, transparent);
           mask-image: linear-gradient(180deg, #000, rgb(0 0 0 / 0.55) 40%, rgb(0 0 0 / 0.16) 74%, transparent);
 }
-.tl:has(> .tl-head.stuck)::before { top: calc(var(--topbar-h) + 32px); }
+.tl.head-stuck::before { top: calc(var(--topbar-h) + 32px); }
 /* The foot's band is the frost alone, and stops short of the pane's sides.
    It lies at the end of a page shorter than the pane, over nothing: a tint
    there would be a stripe across empty glass, and over the light gathered
@@ -2287,7 +2304,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
     linear-gradient(90deg, var(--accent-wash), transparent 46%);
 }
 .tl-row.current { background: var(--row-lit); }
-.tl-row.current:hover { background: var(--row-lit), var(--pool), var(--pool-rest); }
+.tl-row.current:hover { background: var(--pool), var(--row-lit), var(--pool-rest); }
 .tl-row.current .t-name { color: var(--accent); }
 .tl-row.current .c-idx { color: var(--accent); }
 
@@ -2764,11 +2781,20 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* The volume is glass in glass: a groove pressed into the bar — THE FIELD's
    well at a line's height, shaded under its upper lip, its lower lip lit —
    and in it a rod of clear glass for the level. The rod has no colour of
-   its own: a bright crown where the light falls on it, a clearer belly, a
-   breath of light back along its foot, and it is fullest at its head and
-   thins toward the far end. It is slid, not stretched (a translate, on the
-   compositor), so its round head stays round at every level. The seek line
-   stays the bar's one coloured line: it is the record's time. */
+   its own: it is tinted by the light it stands in, the record's (--haze-
+   tone, carried by .p-volume, brought up to a light at a low chroma as the
+   rail's selected row is), so over a blue record it is blue glass and over
+   a grey one clear. Lit from above, row by row at one device pixel each:
+   a near-white crown where the light falls on it, the tint densest just
+   under the crown and clearer below it, and the light that came through
+   gathered along its foot. It is clearer toward its tail and lit toward
+   its head, as the seek line is, so the level reads at its end. It is
+   slid, not stretched (a translate, on the compositor), so its round head
+   stays round at every level. The tint takes the new record's as its
+   picture is shown, at once: eased, it was a style pass and a repaint on
+   every frame of a second at every change of song, for a line four pixels
+   tall. The seek line stays the bar's one accent-coloured line: it is the
+   record's time. */
 .vol-rail { position: relative; width: 100%; height: 4px; border-radius: var(--rf);
   background: rgb(0 0 0 / 0.3);
   box-shadow: inset 0 1px 1px rgb(0 0 0 / 0.55), 0 1px 0 rgb(255 255 255 / 0.1);
@@ -2776,11 +2802,17 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .vol-fill {
   position: absolute; inset: 0; border-radius: inherit;
   transform: translate3d(calc((var(--p, 0.6) - 1) * 100%), 0, 0);
+  --rod-light: oklch(from var(--haze-tone, #5b7a94) 0.86 min(0.075, calc(c * 2.6)) h);
   background:
-    linear-gradient(90deg, rgb(4 5 8 / 0.24), rgb(4 5 8 / 0) 70%),
-    linear-gradient(180deg, rgb(255 255 255 / 0.96), rgb(255 255 255 / 0.62) 52%, rgb(255 255 255 / 0.78));
-  box-shadow: 0 0 0 0.5px rgb(255 255 255 / 0.12);
-  opacity: 0.86;
+    linear-gradient(90deg, rgb(255 255 255 / 0) calc(100% - 56px), rgb(255 255 255 / 0.1) calc(100% - 20px),
+      rgb(255 255 255 / 0.34)),
+    linear-gradient(90deg, rgb(4 5 8 / 0.3), rgb(4 5 8 / 0) 65%),
+    linear-gradient(180deg,
+      color-mix(in oklab, color-mix(in oklab, var(--rod-light) 40%, white) 84%, transparent) 0 1px,
+      color-mix(in oklab, var(--rod-light) 72%, transparent) 1px 2px,
+      color-mix(in oklab, var(--rod-light) 60%, transparent) 2px 3px,
+      color-mix(in oklab, var(--rod-light) 82%, transparent) 3px);
+  opacity: 0.9;
   transition: opacity var(--d1) var(--ease);
 }
 .vol:hover .vol-fill, .vol:focus-visible .vol-fill { opacity: 1; }

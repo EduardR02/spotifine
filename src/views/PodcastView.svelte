@@ -554,7 +554,7 @@
      bracket and the lit row are app.css's (THE BRACKET). */
   .ep-row.current { background: var(--row-lit); }
   .ep-row.current:focus-within { background: var(--row-lit), var(--hover); }
-  .ep-row.current:hover { background: var(--row-lit), var(--pool), var(--pool-rest); }
+  .ep-row.current:hover { background: var(--pool), var(--row-lit), var(--pool-rest); }
   .ep-row.current .ep-title { color: var(--accent); }
 
   /* The art plays, as a card's does: a foam disc rises into it under the

@@ -23,7 +23,7 @@
   import Menu from "./Menu.svelte";
   import { formatTime } from "../lib/time.js";
   import { morphLayout } from "../lib/layout.js";
-  import { frost } from "../lib/ambient.svelte.js";
+  import { frost, haze } from "../lib/ambient.svelte.js";
   import { panel as nowPlayingPanel, nowPlayingShown } from "../lib/panel.svelte.js";
   import { scrollbar } from "../lib/scrollbar.js";
   import { listen } from "@tauri-apps/api/event";
@@ -951,7 +951,9 @@
       >
         <Icon name="panel" size={18} />
       </button>
-      <div class="p-volume" class:no-mute={!controls.mute} bind:this={volumeControl}>
+      <!-- The level is clear glass that takes the record's colour (app.css, .vol-fill). -->
+      <div class="p-volume" class:no-mute={!controls.mute} bind:this={volumeControl}
+        style:--haze-tone={haze.tone || null}>
         {#if controls.mute}
         <button
           class="btn-round"
@@ -1225,7 +1227,7 @@
     cursor: pointer;
     transition:
       color var(--d1) var(--ease),
-      background var(--d1) var(--ease);
+      background-color var(--d1) var(--ease);
   }
   .p-saved-row:hover:not(:disabled) {
     background: var(--pool), var(--pool-rest);
