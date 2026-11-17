@@ -1,0 +1,137 @@
+<!doctype html>
+<!-- The demo's record covers: a stock photograph each (Unsplash License; see
+     demo/public/CREDITS.md), with type set on it the way a record sleeve
+     would. render.js photographs one cover per run (?k=<key>) into
+     demo/public/media/covers/. The fonts are Google Fonts (SIL OFL). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=Bebas+Neue&family=Cormorant+Garamond:ital,wght@0,500;1,400&family=DM+Serif+Display&family=Fraunces:ital,opsz,wght@0,9..144,300..800;1,9..144,300..800&family=Instrument+Serif:ital@0;1&family=Italiana&family=Rubik+Mono+One&family=Space+Grotesk:wght@400;700&family=Space+Mono&family=Syne:wght@500;800&family=Unbounded:wght@700;900&display=block">
+<style>
+  html, body { margin: 0; background: #000; }
+  .cover { display: none; position: relative; width: 600px; height: 600px; overflow: hidden; background: center / cover no-repeat; color: #fff; }
+  .cover.on { display: block; }
+  .cover > * { position: absolute; margin: 0; }
+
+  /* Marisol Vey: an italic serif under the jellyfish, the name in small caps. */
+  #tidepool { background-image: url("https://images.unsplash.com/photo-1543007168-5fa9b3c5f5fb?w=1200&h=1200&fit=crop&q=85"); }
+  #tidepool .a { left: 40px; top: 38px; font: 600 15px/1 "Space Grotesk"; letter-spacing: 0.32em; text-transform: uppercase; opacity: 0.92; }
+  #tidepool .t { left: 36px; bottom: 34px; font: italic 400 76px/0.9 "Instrument Serif"; letter-spacing: -0.01em; text-shadow: 0 2px 30px rgb(20 0 60 / 0.35); }
+
+  /* Kestrel Lane: neon alley, the title stacked tall down the left. */
+  #afterglow { background-image: url("https://images.unsplash.com/photo-1561344640-2453889cde5b?w=1200&h=1200&fit=crop&q=85"); }
+  #afterglow .t { left: 34px; bottom: 30px; font: 400 104px/0.84 "Bebas Neue"; letter-spacing: 0.01em; color: #ffe9f6; text-shadow: 0 0 18px rgb(255 60 170 / 0.75), 0 0 2px rgb(255 255 255 / 0.6); }
+  #afterglow .a { right: 34px; top: 36px; font: 700 14px/1 "Space Grotesk"; letter-spacing: 0.28em; text-transform: uppercase; color: #bfe7ff; }
+
+  /* June Arbor: small lowercase in the sky over a pastel sea. */
+  #slowcoast { background-image: url("https://images.unsplash.com/photo-1741421927314-bd391d166ddd?w=1200&h=1200&fit=crop&q=85"); }
+  #slowcoast .t { left: 0; right: 0; top: 70px; text-align: center; font: italic 300 44px/1 "Fraunces"; letter-spacing: -0.01em; color: #3d3550; }
+  #slowcoast .a { left: 0; right: 0; top: 128px; text-align: center; font: 500 13px/1 "Space Grotesk"; letter-spacing: 0.4em; text-transform: lowercase; color: #4c4462; }
+
+  /* Noor Halloway: a dahlia on black, the name set wide and fine. */
+  #goldleaf { background-image: url("https://images.unsplash.com/photo-1524602997322-c1900e093d3d?w=1200&h=1200&fit=crop&q=85"); }
+  #goldleaf .a { left: 0; right: 0; top: 46px; text-align: center; font: 400 36px/1 "Italiana"; letter-spacing: 0.3em; color: #efe3c4; }
+  #goldleaf .t { left: 0; right: 0; bottom: 44px; text-align: center; font: 500 14px/1 "Cormorant Garamond"; letter-spacing: 0.5em; text-transform: uppercase; color: #d6b46a; }
+
+  /* The Dry Creek Social: a road record, the band's name heavy in the sky. */
+  #milemarker { background-image: url("https://images.unsplash.com/photo-1783111509647-3482c20d2605?w=1200&h=1200&fit=crop&q=85"); }
+  #milemarker .a { left: 30px; right: 30px; top: 34px; font: 900 68px/0.86 "Archivo"; font-stretch: 62%; letter-spacing: -0.005em; text-transform: uppercase; color: #3a2a1e; }
+  #milemarker .t { left: 32px; top: 166px; font: 600 15px/1 "Archivo"; font-stretch: 100%; letter-spacing: 0.24em; text-transform: uppercase; color: #5a4532; }
+
+  /* Ilse Marwood: fog, a serif name, nothing else. */
+  #hollowpines { background-image: url("https://images.unsplash.com/photo-1486707471592-8e7eb7e36f78?w=1200&h=1200&fit=crop&q=85"); }
+  #hollowpines .a { left: 0; right: 0; top: 96px; text-align: center; font: italic 400 58px/1 "Cormorant Garamond"; color: #26302c; }
+  #hollowpines .t { left: 0; right: 0; top: 168px; text-align: center; font: 500 13px/1 "Cormorant Garamond"; letter-spacing: 0.6em; text-transform: uppercase; color: #3d4a45; }
+
+  /* Teo Valcourt: the picture does the work; a small credit low on the left. */
+  #coralhour { background-image: url("https://images.unsplash.com/photo-1489321336462-efe12c02d099?w=1200&h=1200&fit=crop&q=85"); }
+  #coralhour .a { left: 34px; bottom: 58px; font: 800 26px/1 "Syne"; letter-spacing: 0.02em; }
+  #coralhour .t { left: 34px; bottom: 34px; font: 500 15px/1 "Syne"; letter-spacing: 0.08em; opacity: 0.9; }
+
+  /* Sugar Atlas: pop on white, ink and a round heavy face. */
+  #bloomtheory { background-image: url("https://images.unsplash.com/photo-1619963258837-b83f3406cfcd?w=1200&h=1200&fit=crop&q=85"); }
+  #bloomtheory .a { left: 34px; top: 30px; font: 900 40px/0.95 "Unbounded"; letter-spacing: -0.02em; color: #141414; }
+  #bloomtheory .t { right: 34px; bottom: 32px; font: 700 18px/1 "Unbounded"; letter-spacing: -0.01em; color: #141414; }
+
+  /* Halvard: a monolith, the name in mono with a catalogue number. */
+  #monolith { background-image: url("https://images.unsplash.com/photo-1787728165633-e7c56bc88623?w=1200&h=1200&fit=crop&q=85"); }
+  #monolith .a { left: 34px; top: 34px; font: 400 22px/1.3 "Space Mono"; letter-spacing: 0.06em; color: #f3efe6; }
+  #monolith .t { right: 34px; top: 34px; font: 400 13px/1.3 "Space Mono"; letter-spacing: 0.08em; color: #f3efe6; text-align: right; }
+
+  /* Mio & the Midnight Line: a display serif over a lantern-lit lane. */
+  #lasttrain { background-image: url("https://images.unsplash.com/photo-1534214526114-0ea4d47b04f2?w=1200&h=1200&fit=crop&q=85"); background-position: 30% 50%; }
+  #lasttrain .t { right: 34px; bottom: 76px; font: 400 54px/0.95 "DM Serif Display"; text-align: right; text-shadow: 0 2px 24px rgb(0 0 30 / 0.6); }
+  #lasttrain .a { right: 36px; bottom: 40px; font: 500 15px/1 "Space Grotesk"; letter-spacing: 0.14em; text-align: right; color: #ffd9cf; }
+
+  /* sleepwalker fm: a lo-fi tape label under the moon. */
+  #waning { background-image: url("https://images.unsplash.com/photo-1627277291166-a9e873004023?w=1200&h=1200&fit=crop&q=85"); }
+  #waning .t { left: 0; right: 0; bottom: 52px; text-align: center; font: 400 22px/1 "Space Mono"; letter-spacing: 0.3em; color: #dfe9ff; }
+  #waning .a { left: 0; right: 0; bottom: 30px; text-align: center; font: 400 12px/1 "Space Mono"; letter-spacing: 0.3em; color: #9fb4e0; }
+
+  /* Rosa Vallée: a soft serif across a pink dusk. */
+  #palmcinema { background-image: url("https://images.unsplash.com/photo-1764610666468-f24126175b0f?w=1200&h=1200&fit=crop&q=85"); }
+  #palmcinema .a { left: 0; right: 0; top: 52px; text-align: center; font: italic 600 64px/1 "Fraunces"; letter-spacing: -0.02em; color: #fff3ee; text-shadow: 0 3px 30px rgb(60 0 40 / 0.4); }
+  #palmcinema .t { left: 0; right: 0; top: 132px; text-align: center; font: 700 14px/1 "Space Grotesk"; letter-spacing: 0.5em; text-transform: uppercase; color: #ffe1e6; }
+
+  /* Lido Twins: chunky mono caps over the pool. */
+  #shallowend { background-image: url("https://images.unsplash.com/photo-1590033509078-7a65dd609114?w=1200&h=1200&fit=crop&q=85"); }
+  #shallowend .a { left: 32px; top: 30px; font: 400 50px/1 "Rubik Mono One"; letter-spacing: -0.02em; color: #fffbea; text-shadow: 0 2px 0 rgb(0 60 90 / 0.25); }
+  #shallowend .t { left: 34px; top: 92px; font: 700 16px/1 "Space Grotesk"; letter-spacing: 0.2em; text-transform: uppercase; color: #fffbea; }
+
+  /* Cass Ortega: light trails, a thin wide name at the top. */
+  #overpass { background-image: url("https://images.unsplash.com/photo-1501290301209-7a0323622985?w=1200&h=1200&fit=crop&q=85"); }
+  #overpass .a { left: 0; right: 0; top: 40px; text-align: center; font: 500 20px/1 "Syne"; letter-spacing: 0.7em; text-transform: uppercase; }
+  #overpass .t { left: 0; right: 0; top: 70px; text-align: center; font: 800 13px/1 "Syne"; letter-spacing: 0.7em; text-transform: uppercase; color: #ff8f7c; }
+
+  /* Ember & Vine: a rock record, condensed caps around a ring of sparks. */
+  #wildfire { background-image: url("https://images.unsplash.com/photo-1483488792196-78bedff29c21?w=1200&h=1200&fit=crop&q=85"); }
+  #wildfire .a { left: 0; right: 0; top: 30px; text-align: center; font: 400 92px/1 "Bebas Neue"; letter-spacing: 0.06em; color: #ffe2bf; }
+  #wildfire .t { left: 0; right: 0; bottom: 34px; text-align: center; font: 400 30px/1 "Bebas Neue"; letter-spacing: 0.4em; color: #ffb26b; }
+
+  /* Aske Nordahl: ridges in grey, a quiet label in the sky. */
+  #quietranges { background-image: url("https://images.unsplash.com/photo-1545717603-7eee1b49c4f3?w=1200&h=1200&fit=crop&q=85"); }
+  #quietranges .a { left: 40px; top: 40px; font: 500 15px/1.5 "Archivo"; letter-spacing: 0.04em; color: #1d1d1d; }
+  #quietranges .t { left: 40px; top: 62px; font: 400 15px/1.5 "Archivo"; letter-spacing: 0.04em; color: #4a4a4a; }
+
+  /* Solar Choir: a heavy wide name through the streaks of light. */
+  #golden { background-image: url("https://images.unsplash.com/photo-1495909617868-3fda03e184ef?w=1200&h=1200&fit=crop&q=85"); }
+  #golden .a { left: 0; right: 0; top: 46px; text-align: center; font: 800 54px/1 "Syne"; letter-spacing: -0.02em; color: #fff3d6; }
+  #golden .t { left: 0; right: 0; bottom: 36px; text-align: center; font: 500 14px/1 "Syne"; letter-spacing: 0.5em; text-transform: uppercase; color: #ffe2a0; }
+
+  /* Coastal Ghosts: an expanded grotesque over red and teal ink. */
+  #tangerine { background-image: url("https://images.unsplash.com/photo-1759269151264-9da95880620b?w=1200&h=1200&fit=crop&q=85"); }
+  #tangerine .t { left: 30px; right: 30px; bottom: 30px; font: 800 58px/0.9 "Archivo"; font-stretch: 125%; letter-spacing: -0.03em; text-transform: uppercase; color: #fff4ea; }
+  #tangerine .a { left: 32px; top: 32px; font: 700 14px/1 "Archivo"; font-stretch: 125%; letter-spacing: 0.16em; text-transform: uppercase; color: #fff4ea; }
+
+  /* Two playlists with photos of their own, as people give them: no type. */
+  #rainywindows { background-image: url("https://images.unsplash.com/photo-1761344175797-047f049c9b32?w=1200&q=85"); background-position: 50% 0; }
+  #coastal { background-image: url("https://images.unsplash.com/photo-1775145408460-a4e77d4c5488?w=1200&h=1200&fit=crop&q=85"); }
+</style>
+</head>
+<body>
+  <div class="cover" id="tidepool"><p class="a">Marisol Vey</p><p class="t">Tidepool<br>Hymns</p></div>
+  <div class="cover" id="afterglow"><p class="t">Afterglow<br>District</p><p class="a">Kestrel Lane</p></div>
+  <div class="cover" id="slowcoast"><p class="t">slow coast</p><p class="a">june arbor</p></div>
+  <div class="cover" id="goldleaf"><p class="a">NOOR HALLOWAY</p><p class="t">Gold Leaf</p></div>
+  <div class="cover" id="milemarker"><p class="a">The Dry Creek Social</p><p class="t">Mile Marker 61</p></div>
+  <div class="cover" id="hollowpines"><p class="a">Ilse Marwood</p><p class="t">Hollow Pines</p></div>
+  <div class="cover" id="coralhour"><p class="a">Teo Valcourt</p><p class="t">Coral Hour</p></div>
+  <div class="cover" id="bloomtheory"><p class="a">sugar<br>atlas</p><p class="t">bloom theory</p></div>
+  <div class="cover" id="monolith"><p class="a">HALVARD<br>MONOLITH CLUB</p><p class="t">MC 004<br>33⅓</p></div>
+  <div class="cover" id="lasttrain"><p class="t">Last Train<br>Home</p><p class="a">Mio &amp; the Midnight Line</p></div>
+  <div class="cover" id="waning"><p class="t">waning</p><p class="a">sleepwalker fm</p></div>
+  <div class="cover" id="palmcinema"><p class="a">Rosa Vallée</p><p class="t">Palm Cinema</p></div>
+  <div class="cover" id="shallowend"><p class="a">LIDO TWINS</p><p class="t">Shallow End</p></div>
+  <div class="cover" id="overpass"><p class="a">Cass Ortega</p><p class="t">Overpass</p></div>
+  <div class="cover" id="wildfire"><p class="a">EMBER &amp; VINE</p><p class="t">Wildfire Sermon</p></div>
+  <div class="cover" id="quietranges"><p class="a">Aske Nordahl</p><p class="t">Quiet Ranges</p></div>
+  <div class="cover" id="golden"><p class="a">SOLAR CHOIR</p><p class="t">Golden Interval</p></div>
+  <div class="cover" id="tangerine"><p class="a">Coastal Ghosts</p><p class="t">Tangerine<br>Static</p></div>
+  <div class="cover" id="rainywindows"></div>
+  <div class="cover" id="coastal"></div>
+  <script>
+    const key = new URLSearchParams(location.search).get("k");
+    (key ? [document.getElementById(key)] : [...document.querySelectorAll(".cover")]).forEach((el) => el?.classList.add("on"));
+  </script>
+</body>
+</html>

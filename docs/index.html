@@ -13,7 +13,7 @@
 <meta property="og:image" content="https://eduardr02.github.io/spotifine/now-playing.png">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%239ccfd8'/%3E%3Cstop offset='1' stop-color='%23ebbcba'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='24' height='24' rx='5' fill='url(%23g)'/%3E%3Cg transform='translate(1.8 1.6) scale(.85)' fill='none' stroke='%23080808' stroke-width='2.1' stroke-linejoin='round'%3E%3Cpath d='M9.3 17.6V6.1l9.4-2.1v11.7'/%3E%3Ccircle cx='6.8' cy='17.6' r='2.6' fill='%23080808' stroke='none'/%3E%3Ccircle cx='16.2' cy='15.7' r='2.6' fill='%23080808' stroke='none'/%3E%3C/g%3E%3C/svg%3E">
-<link rel="preload" as="image" href="now-playing.webp" type="image/webp" fetchpriority="high">
+<link rel="preload" as="image" href="demo-poster.webp" type="image/webp" fetchpriority="high">
 <style>
 /* The app's own design system (src/styles/app.css), trimmed to what this
    page wears: the same greys, the same four accents, the same glass. */
@@ -110,9 +110,10 @@ b { font-weight: var(--w-semi); color: var(--fg); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: var(--r1); }
 
 /* THE HAZE. In the app, the playing record's own picture, seen through a
-   light lens, lights the window. Here the record is the screenshot: the same
-   picture the hero shows, blurred into the light the page stands in. Still,
-   no scrim. Drawn once; nothing re-blurs it while the page scrolls. */
+   light lens, lights the window. Here the record is the demo as it opens:
+   the same picture the hero shows, blurred into the light the page stands
+   in. Still, no scrim. Drawn once; nothing re-blurs it while the page
+   scrolls. */
 .haze {
   position: fixed; inset: 0; z-index: -1;
   overflow: hidden; pointer-events: none;
@@ -120,7 +121,7 @@ b { font-weight: var(--w-semi); color: var(--fg); }
 }
 .haze::before {
   content: ""; position: absolute; inset: -14vmax;
-  background: url("now-playing.webp") 62% 40% / cover no-repeat;
+  background: url("demo-poster.webp") 62% 40% / cover no-repeat;
   filter: blur(72px) saturate(1.5) brightness(0.46);
   transform: translateZ(0);
 }
@@ -273,6 +274,57 @@ h1 {
 .showcase { padding-bottom: var(--s6); }
 .showcase .shot { margin: 0; }
 
+/* THE DEMO. On a desktop the picture comes alive: it is the app itself,
+   a 1440 by 810 window (docs/demo/, built from the app's own frontend)
+   scaled to the column, laid over its own poster and faded in once it has
+   lit its window, so the swap is not seen. The rim stays on top. */
+.shot .demo {
+  position: absolute; left: 0; top: 0; z-index: 1;
+  width: 1440px; height: 810px; border: 0;
+  transform-origin: 0 0; transform: scale(var(--k, 0.8333));
+  opacity: 0; pointer-events: none;
+  transition: opacity 700ms var(--ease);
+}
+.shot.live .demo { opacity: 1; pointer-events: auto; }
+.shot:has(.demo:focus-visible) { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+/* A wheel over the demo scrolls the page until the app is clicked into;
+   the first few times, it says so. */
+.demo-hint {
+  position: absolute; left: 50%; top: 50%; z-index: 3;
+  padding: 10px 18px; border-radius: var(--rf);
+  background: rgb(10 11 14 / 0.72);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+          backdrop-filter: blur(14px) saturate(1.4);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1), 0 10px 30px -10px rgba(0, 0, 0, 0.7);
+  font-size: 14px; white-space: nowrap;
+  transform: translate(-50%, -50%); pointer-events: none;
+  opacity: 0; transition: opacity var(--d2) var(--ease);
+}
+.demo-hint.shown { opacity: 1; }
+
+/* What the frame is, under it: quiet, and only where the demo runs. It is
+   laid out from the start and shown when the demo is ready, so nothing
+   moves when it appears. */
+.demo-note {
+  display: none;
+  align-items: baseline; justify-content: space-between; gap: var(--s5);
+  padding: var(--s4) var(--s2) 0;
+  color: var(--fg-2); font-size: 13.5px;
+  visibility: hidden; opacity: 0;
+  transition: opacity 700ms var(--ease), visibility 0s linear 700ms;
+}
+.demo-capable .demo-note { display: flex; }
+.demo-ready .demo-note { visibility: visible; opacity: 1; transition: opacity 700ms var(--ease); }
+.demo-note a {
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+  color: var(--accent); text-decoration: none;
+  background: linear-gradient(currentColor 0 0) 0 100% / 0 1px no-repeat;
+  transition: background-size var(--d2) var(--ease);
+}
+.demo-note a:hover { background-size: 100% 1px; }
+.demo-note svg { width: 14px; height: 14px; }
+
 /* ---------------------------------------------------- the two reasons */
 /* Looks and light, side by side once there is room: a figure, a label, a
    line, and a few sentences each. */
@@ -287,8 +339,8 @@ h1 {
 .point-figure { display: flex; align-items: baseline; gap: var(--s3); height: 64px; margin-bottom: var(--s5); }
 .point h2 { margin-top: var(--s2); font-size: clamp(24px, 5vw, 28px); }
 .point p { margin-top: var(--s3); color: var(--fg-1); max-width: 52ch; }
-/* The idea at the size of a tile: the screenshot's own Canvas, and a pane
-   of the app's glass laid over part of it, frosting what it covers. */
+/* The idea at the size of a tile: the demo's own Canvas, and a pane of the
+   app's glass laid over part of it, frosting what it covers. */
 .swatch {
   position: relative; isolation: isolate; overflow: hidden;
   width: 128px; height: 64px; border-radius: var(--r3);
@@ -296,7 +348,7 @@ h1 {
 }
 .swatch::before {
   content: ""; position: absolute; inset: -20px; z-index: -1;
-  background: url("now-playing.webp") 100% 42% / 310% auto no-repeat;
+  background: url("demo-poster.webp") 100% 42% / 310% auto no-repeat;
   filter: blur(2px) saturate(1.3);
 }
 .swatch::after {
@@ -528,11 +580,16 @@ h2 {
     </div>
   </section>
 
-  <section class="showcase wrap" aria-label="Screenshot">
-    <figure class="shot glass">
-      <img src="now-playing.webp" width="1600" height="900" fetchpriority="high"
+  <section class="showcase wrap" aria-label="Spotifine, live">
+    <figure class="shot glass" id="shot">
+      <img src="demo-poster.webp" width="1600" height="900" fetchpriority="high"
            alt="Spotifine playing a playlist, with the song's video Canvas in the Now Playing panel">
+      <p class="demo-hint" id="demo-hint" aria-hidden="true">Click into the app to scroll it</p>
     </figure>
+    <div class="demo-note">
+      <p>This is Spotifine itself, playing made-up music without sound. Play a song, scroll the playlist, or drag the panel's edge.</p>
+      <a href="demo/" target="_blank" rel="noopener">Open full window<svg aria-hidden="true"><use href="#i-out"/></svg></a>
+    </div>
   </section>
 
   <section class="sell wrap" aria-label="Why Spotifine">
@@ -638,11 +695,63 @@ h2 {
       <a href="https://github.com/EduardR02/spotifine">Source on GitHub</a>
       <a href="https://github.com/EduardR02/spotifine/releases">All releases</a>
       <a href="https://github.com/EduardR02/spotifine/blob/main/LICENSE">MIT license</a>
+      <a href="https://github.com/EduardR02/spotifine/blob/main/docs/demo/CREDITS.md">Demo credits</a>
     </nav>
   </div>
 </footer>
 
 <script>
+/* The live demo. On a desktop with a mouse the poster becomes the app itself
+   once the page has loaded: the frame loads out of sight and is shown when
+   it says it is ready. Phones, narrow windows and connections asking to
+   save data keep the poster. */
+(() => {
+  const capable = matchMedia("(min-width: 1024px) and (hover: hover) and (pointer: fine)").matches;
+  const connection = navigator.connection;
+  const frugal = !!connection && (connection.saveData || /2g$/.test(connection.effectiveType || ""));
+  if (!capable || frugal) return;
+  document.documentElement.classList.add("demo-capable");
+
+  const WIDTH = 1440;
+  const shot = document.getElementById("shot");
+  const hint = document.getElementById("demo-hint");
+  let frame = null;
+  let hints = 0;
+  let hintTimer = 0;
+
+  function start() {
+    frame = document.createElement("iframe");
+    frame.className = "demo";
+    frame.src = "demo/";
+    frame.title = "Spotifine demo";
+    shot.append(frame);
+    new ResizeObserver(() => shot.style.setProperty("--k", String(shot.clientWidth / WIDTH))).observe(shot);
+    // A demo that has not come up by now is let go; the poster stays.
+    setTimeout(() => { if (!shot.classList.contains("live")) frame.remove(); }, 20000);
+  }
+
+  addEventListener("message", (event) => {
+    if (!frame || event.source !== frame.contentWindow) return;
+    const data = event.data || {};
+    if (data.type === "spotifine-demo:ready") {
+      shot.classList.add("live");
+      document.documentElement.classList.add("demo-ready");
+    } else if (data.type === "spotifine-demo:wheel") {
+      // A mouse wheel's notch glides, a touchpad's stream follows the fingers.
+      scrollBy({ left: data.dx, top: data.dy, behavior: Math.abs(data.dy) >= 50 ? "smooth" : "instant" });
+      if (!hint.classList.contains("shown") && hints >= 3) return;
+      if (!hint.classList.contains("shown")) hints++;
+      hint.classList.add("shown");
+      clearTimeout(hintTimer);
+      hintTimer = setTimeout(() => hint.classList.remove("shown"), 1400);
+    }
+  });
+
+  const begin = () => ("requestIdleCallback" in window ? requestIdleCallback(start, { timeout: 2000 }) : setTimeout(start, 200));
+  if (document.readyState === "complete") begin();
+  else addEventListener("load", begin, { once: true });
+})();
+
 (() => {
   // Decorative playlist selection: native buttons also support Enter/Space.
   const features = document.querySelector(".extras ol");
