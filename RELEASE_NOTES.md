@@ -1,3 +1,9 @@
+## Lighter glass
+
+- The glass is cheap to run: its edge light is drawn once per song, scrolling runs on the GPU, and a song change only touches what it changes.
+- The volume level is a rod of tinted glass that takes the playing record's colour.
+- The download page has a live demo of the app.
+
 ## Glass, polished
 
 - The glass has real edges: every pane catches light along its rim and glows faintly in the playing record's colour just inside it.
