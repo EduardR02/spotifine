@@ -282,6 +282,10 @@ pub struct Engine {
     /// events still update transport state, but never create listening-history
     /// rows.
     preview_mode: bool,
+    /// A presentation run (`--presentation`): the stored listening history
+    /// and track edits are neither read nor written, the volume is not
+    /// saved, and Spotify hears no listening reports whatever is asked.
+    presentation: bool,
     /// Process-local owner of the installed editor preview. Zero means that
     /// no preview lease is active.
     preview_lease_id: u64,
@@ -580,9 +584,18 @@ impl Engine {
         normalisation: bool,
         audio_device: audio::SinkOpener,
         audio_device_present: audio::DevicePresence,
+        presentation: bool,
     ) -> Self {
-        let history_root = state_directory.clone();
-        let track_edits = TrackEditStore::load_or_empty(&state_directory);
+        // An empty root is a history that loads, records and stores nothing.
+        let (history_root, track_edits) = if presentation {
+            (std::path::PathBuf::new(), TrackEditStore::in_memory())
+        } else {
+            (state_directory.clone(), TrackEditStore::load_or_empty(&state_directory))
+        };
+        let mut spotify_listening = crate::spotify_listening::SpotifyListening::new();
+        if presentation {
+            spotify_listening.set_enabled(false);
+        }
         let random_state = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos() as u64)
@@ -632,6 +645,7 @@ impl Engine {
             loading_failed: false,
             current_needs_load: false,
             preview_mode: false,
+            presentation,
             preview_lease_id: 0,
             position_anchor: None,
             audible_speed: None,
@@ -650,7 +664,7 @@ impl Engine {
             shuffle_pool: Vec::new(),
             history: Vec::new(),
             listening_history: ListeningHistory::new(history_root),
-            spotify_listening: crate::spotify_listening::SpotifyListening::new(),
+            spotify_listening,
             random_state,
             generation: 0,
             player_generation: None,
@@ -679,7 +693,7 @@ impl Engine {
     /// Privacy changes invalidate active/queued audio identities and abort any
     /// waiting/in-flight report; re-enabling starts a new segment, never backfill.
     pub fn set_spotify_listening_enabled(&mut self, enabled: bool) -> bool {
-        let changed = self.spotify_listening.set_enabled(enabled);
+        let changed = self.spotify_listening.set_enabled(enabled && !self.presentation);
         if changed { self.bind_spotify_audio(); }
         changed
     }
@@ -950,7 +964,9 @@ impl Engine {
     /// by the work timer and by [`Engine::shutdown`].
     fn flush_pending_volume(&mut self) {
         if let Some(pending) = self.pending_volume.take() {
-            self.cache.save_volume(pending.volume);
+            if !self.presentation {
+                self.cache.save_volume(pending.volume);
+            }
         }
     }
 
@@ -5461,6 +5477,7 @@ mod tests {
                 false,
                 audio_device,
                 audio_device_present,
+                false,
             ),
             buffer,
         )
@@ -7079,6 +7096,66 @@ mod tests {
         let journal = std::fs::read_to_string(root.join("listening_history.jsonl")).unwrap();
         assert_eq!(journal.lines().filter(|line| !line.is_empty()).count(), 1);
         assert!(!root.join("listening_history_active.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_presentation_run_neither_shows_records_nor_stores_listening_or_edits() {
+        // The owner's own archive, written by an ordinary run.
+        let (mut engine, root) = history_playing_engine();
+        engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: track_uri(),
+            position_ms: 5_000,
+        });
+        listened(&mut engine);
+        engine.player_generation = Some(0);
+        assert!(engine.on_player_signal(PlayerSignal::Closed { generation: 0 }));
+        drop(engine);
+        let journal = root.join("listening_history.jsonl");
+        let archived = std::fs::read(&journal).expect("the ordinary run kept its play");
+
+        let (writer, _) = ProtocolWriter::capture();
+        let mut engine = Engine::new(
+            writer,
+            no_path_cache(),
+            PathBuf::new(),
+            PathBuf::new(),
+            root.clone(),
+            false,
+            device_present(),
+            device_always_present(),
+            true,
+        );
+        assert!(history_rows(&engine).is_empty(), "the stored history is not shown");
+        assert!(
+            !engine.set_spotify_listening_enabled(true),
+            "Spotify listening reports stay off whatever the setting asks"
+        );
+
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.state.queue[0].id = "0123456789ABCDEFGHIJKL".to_owned();
+        engine.play_request_id = Some(7);
+        engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: track_uri(),
+            position_ms: 5_000,
+        });
+        listened(&mut engine);
+        engine.player_generation = Some(0);
+        engine.on_player_signal(PlayerSignal::Closed { generation: 0 });
+        assert!(history_rows(&engine).is_empty(), "a presented play is not recorded");
+
+        engine
+            .save_track_edit("0123456789ABCDEFGHIJKL".to_owned(), 240_000, vec![range(1_000, 2_000)], None)
+            .expect("an edit works for the run");
+        assert!(engine.track_edit_status("0123456789ABCDEFGHIJKL", None).definition.is_some());
+        engine.shutdown();
+
+        assert_eq!(std::fs::read(&journal).unwrap(), archived, "the archive is untouched");
+        assert!(!root.join("listening_history_active.json").exists());
+        assert!(!root.join("track_edits.json").exists(), "the run's edit is not stored");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10526,6 +10603,7 @@ mod tests {
                     false,
                     device_present(),
                     device_always_present(),
+                    false,
                 ),
                 buffer,
             )
@@ -10578,6 +10656,7 @@ mod tests {
             false,
             device_present(),
             device_always_present(),
+            false,
         );
         assert!(engine.logout().expect("first logout"));
         assert!(!fixture.credentials_exist());

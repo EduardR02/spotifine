@@ -113,6 +113,19 @@ impl TrackEditStore {
             load_error: None,
         })
     }
+    /// An empty store that never touches the disk: a presentation run starts
+    /// without the stored edits and its own edits end with it.
+    pub fn in_memory() -> Self {
+        Self {
+            path: PathBuf::new(),
+            data: StoredEdits {
+                version: STORE_VERSION,
+                ..StoredEdits::default()
+            },
+            load_error: None,
+        }
+    }
+
     pub fn load_or_empty(state_directory: &Path) -> Self {
         match Self::load(state_directory) {
             Ok(store) => store,
@@ -323,6 +336,9 @@ impl TrackEditStore {
 
     fn persist(&self) -> Result<(), String> {
         self.ensure_writable()?;
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let parent = self
             .path
             .parent()
