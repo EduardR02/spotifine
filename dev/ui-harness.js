@@ -1378,9 +1378,45 @@ window.__TAURI_INTERNALS__ = {
   metadata: { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } },
   invoke: async (cmd, args = {}) => {
     calls.push({ cmd, args });
+    const presented = presenting ? presentationAnswer(cmd) : undefined;
+    if (presented !== undefined) return presented;
     return realMode ? realMode.invoke(cmd, args) : mock.invoke(cmd, args);
   },
 };
+
+/* `?presentation`: what the shell answers in a presentation run. The
+   configured name, the configured library in its order (someone else's
+   playlist, one of the account's own under the presented name, an album),
+   the configured artists, no podcasts, and the developer app as never set up.
+   Everything else is the fixture backend. */
+const presenting = new URLSearchParams(location.search).has("presentation");
+const PRESENTED_NAME = "Alex Rivera";
+function presentationAnswer(cmd) {
+  const library = [
+    { ...fixtures.playlists[3], uri: "spotify:playlist:p4" },
+    { ...fixtures.playlists[0], uri: "spotify:playlist:p1", owner: PRESENTED_NAME },
+    { id: "al0", uri: "spotify:album:al0", name: "Album 0", owner: "Artist 1", tracks_total: 8 },
+  ];
+  switch (cmd) {
+    case "get_presentation":
+      return PRESENTED_NAME;
+    case "get_state":
+      return {
+        playback: snapshot(), playlists: library,
+        playlist_tree: library.map(({ id }) => ({ kind: "playlist", id })),
+        settings: { ...clone(settings), spotify_listening_enabled: false, devices_enabled: false },
+        library_fresh: true, me_id: "eduard",
+      };
+    case "browse_followed_artists":
+      return [{ id: "ar1", uri: "spotify:artist:ar1", name: "Artist 1", cover_url: "" }];
+    case "browse_saved_shows":
+      return [];
+    case "personal_api_status":
+      return { client_id: "", connected: false, account_id: null, devices_authorized: false, authorization_pending: false, error: null };
+    default:
+      return undefined;
+  }
+}
 
 const settings = { animated_canvas: true, devices_enabled: true, spotify_listening_enabled: true };
 /** Per-track Canvas loops, set by setCanvasFixtures; null for the demo loop. */
@@ -1651,6 +1687,7 @@ state.libraryState.fresh = true;
 
 mount(App, { target: document.getElementById("app") });
 if (realMode) realMode.openScene();
+else if (presenting) state.navigate("library");
 else state.navigate("playlist", "p1");
 document.body.dataset.harnessReady = "true";
 

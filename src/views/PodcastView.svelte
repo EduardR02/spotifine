@@ -1,6 +1,6 @@
 <script>
   import { tick, untrack } from "svelte";
-  import { api, route, session, navigate, ui, playback, isPlayingSource, togglePlay, setPageTitle, watchCacheMarks } from "../lib/state.svelte.js";
+  import { api, route, session, navigate, ui, playback, isPlayingSource, togglePlay, setPageTitle, watchCacheMarks, isCached } from "../lib/state.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { detailArtSize } from "../lib/layout.js";
   import { spotifyLink } from "../lib/spotify-link.js";
@@ -466,7 +466,7 @@
                   <p class="ep-meta">
                     {#if date}<span>{date}</span><span class="ep-dot" aria-hidden="true"></span>{/if}
                     <span>{length(episode.track.duration_ms)}</span>
-                    {#if episode.track?.cached}
+                    {#if isCached(episode.track)}
                       <span class="t-cached" title="Downloaded — this plays from the local cache"><Icon name="cached" size={13} /><span class="sr-only">Downloaded</span></span>
                     {/if}
                     {#if unavailable(episode)}

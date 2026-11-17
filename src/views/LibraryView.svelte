@@ -9,8 +9,10 @@
     ui,
     ensurePersonalizedDiscovery,
     mergePersonalizedPlaylists,
+    presentation,
+    libraryKind,
   } from "../lib/state.svelte.js";
-  import { playPlaylistById, playLikedSongs, cardPlay } from "../lib/play.js";
+  import { playPlaylistById, playAlbumById, playLikedSongs, cardPlay } from "../lib/play.js";
   import { coverTone, cardTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import LikedMark from "../components/LikedMark.svelte";
@@ -110,7 +112,8 @@
   let firstCard = $state(0);
   let lastCard = $state(14);
   let focusedCard = $state("");
-  const libraryCards = $derived([{ id: "liked" }, ...remainingLibrary]);
+  // A presentation library is the configured items alone.
+  const libraryCards = $derived(presentation.name ? remainingLibrary : [{ id: "liked" }, ...remainingLibrary]);
   const cardIndex = $derived(new Map(libraryCards.map((card, index) => [card.id, index])));
   const gridRows = $derived(Math.ceil(libraryCards.length / gridGeometry.columns));
   const gridPitch = $derived(gridGeometry.height + gridGeometry.gap);
@@ -205,9 +208,12 @@
   const busy = $state({ id: "" });
   let error = $state("");
 
-  async function play(id) {
+  async function play(pl) {
+    const id = pl.id;
     error = "";
-    error = await cardPlay(busy, id, () => playPlaylistById(id), "Could not play this playlist.");
+    const album = libraryKind(pl) === "album";
+    error = await cardPlay(busy, id, () => (album ? playAlbumById(id) : playPlaylistById(id)),
+      album ? "Could not play this album." : "Could not play this playlist.");
   }
 
   async function playLiked() {
@@ -249,19 +255,19 @@
       <button
         class="card-open"
         aria-label={`Open ${pl.name}`}
-        onclick={() => navigate("playlist", pl.id)}
+        onclick={() => navigate(libraryKind(pl), pl.id)}
       ></button>
       <button
         class="card-play"
         aria-label={`Play ${pl.name}`}
         title={`Play ${pl.name}`}
         disabled={!!busy.id}
-        onclick={() => play(pl.id)}
+        onclick={() => play(pl)}
       >
         <Icon name={busy.id === pl.id ? "more" : "play"} size={15} />
       </button>
     </div>
-    <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
+    <button class="card-copy" onclick={() => navigate(libraryKind(pl), pl.id)}>
       <span class="card-name">{pl.name}</span>
       <span class="card-sub">{playlistSubtitle(pl)}</span>
     </button>
@@ -392,7 +398,7 @@
     <div class="section" style="margin-top:0">
       <div class="section-head"><h2 class="section-title">Your library</h2></div>
       <div class="grid">
-        {@render likedCard(false)}
+        {#if !presentation.name}{@render likedCard(false)}{/if}
       </div>
       <p class="sub" style="margin-top:var(--s5)">
         No playlists yet — anything you save in Spotify shows up here.

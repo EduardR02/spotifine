@@ -164,6 +164,19 @@ fn scopes_contain(scopes: &str, wanted: &str) -> bool {
 }
 
 fn status(session: &Session, settings: &AppSettings, active_account: Option<&str>) -> Status {
+    // A presentation run shows the developer app as never set up: its client
+    // ID and the account it was granted for are the account's, and with it
+    // unconnected the window offers no like, follow or device control.
+    if crate::presentation::active() {
+        return Status {
+            client_id: String::new(),
+            connected: false,
+            account_id: None,
+            devices_authorized: false,
+            authorization_pending: false,
+            error: None,
+        };
+    }
     let grant = session.grant.as_ref().filter(|grant| grant.client_id == settings.personal_client_id
         && active_account == Some(grant.account_id.as_str())
         && scopes_contain(&grant.scopes, LIBRARY_SCOPES));

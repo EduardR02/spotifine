@@ -347,6 +347,8 @@ impl AppState {
     /// `ready` is then an ordinary account switch, which the shell and the
     /// window already reset for.
     pub(crate) fn select_last_account(&mut self) -> bool {
+        // A presentation run shows no stored library, not even for a moment.
+        if crate::presentation::active() { return false; }
         let Some(account) = load_last_account(&self.data_dir) else { return false };
         self.select_library_account(&account);
         self.playback.auth_state = "authenticating".to_owned();
@@ -408,7 +410,9 @@ impl AppState {
         self.playlist_generations.clear();
         self.liked_walk_wanted = false;
         self.liked_walked_at = None;
-        if account.is_empty() { return true; }
+        // A presentation run's library is the configured one, built in memory
+        // (`presentation`): the account's stored namespace is never read.
+        if account.is_empty() || crate::presentation::active() { return true; }
         let dir = self.library_dir();
         self.library_import_pending = true;
         if let Err(error) = self.finish_library_import() {
@@ -672,15 +676,26 @@ static SETTINGS: LazyLock<Mutex<AppSettings>> = LazyLock::new(|| {
     Mutex::new(settings)
 });
 
+/// The settings this run follows. A presentation run holds two of them off
+/// whatever is saved: Spotify listening reports, which would report its
+/// plays, and Connect devices, whose names are the account's.
+fn effective(mut settings: AppSettings) -> AppSettings {
+    if crate::presentation::active() {
+        settings.spotify_listening_enabled = false;
+        settings.devices_enabled = false;
+    }
+    settings
+}
+
 pub fn load_app_settings() -> AppSettings {
-    SETTINGS.lock().clone()
+    effective(SETTINGS.lock().clone())
 }
 
 pub fn update_app_settings(change: impl FnOnce(&mut AppSettings)) -> Result<AppSettings, String> {
     let mut guard = SETTINGS.lock();
     let mut next = guard.clone();
     change(&mut next);
-    if next == *guard { return Ok(next); }
+    if next == *guard { return Ok(effective(next)); }
     let path = settings_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -688,7 +703,7 @@ pub fn update_app_settings(change: impl FnOnce(&mut AppSettings)) -> Result<AppS
     }
     write_json_atomic_result(path, &next)?;
     *guard = next.clone();
-    Ok(next)
+    Ok(effective(next))
 }
 
 fn playback_state_path(dir: &Path) -> PathBuf {
@@ -756,7 +771,10 @@ fn playhead_resolves(playhead: &PlayheadSnapshot, snapshot: &PlaybackSnapshot) -
     }
 }
 
+/// A presentation run starts with an empty queue: the stored one is what the
+/// account was last listening to.
 pub fn load_playback_snapshot() -> Option<PlaybackSnapshot> {
+    if crate::presentation::active() { return None; }
     load_playback_snapshot_from(&data_dir())
 }
 
@@ -806,6 +824,7 @@ pub fn save_playhead_snapshot(
 }
 
 pub fn clear_playback_snapshot() -> Result<(), String> {
+    if !persistent() { return Ok(()); }
     // The sidecar is cleared with the snapshot: a playhead left behind would
     // otherwise outlive the queue it belongs to and refine the next one.
     let dir = data_dir();
@@ -912,6 +931,7 @@ fn load_last_account(data_dir: &Path) -> Option<String> {
 }
 
 pub fn remember_last_account(data_dir: &Path, account: &str) -> Result<(), String> {
+    if !persistent() { return Ok(()); }
     let path = last_account_path(data_dir);
     if !account.is_empty() {
         return write_json_atomic_result(path, &LastAccount { account: account.to_owned() });
@@ -1031,6 +1051,7 @@ pub fn tracks_cache_bytes(playlists: &[PlaylistTracksEntry]) -> Option<Vec<u8>> 
 /// Writes bytes from [`tracks_cache_bytes`], with the same failure reporting
 /// as [`save_tracks_cache`]. A partial cache is discarded on its next read.
 pub fn write_tracks_cache_bytes(dir: &Path, bytes: &[u8]) {
+    if !persistent() { return; }
     let path = dir.join("playlist_tracks_cache.json");
     let result = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, bytes));
     if let Err(error) = result {
@@ -1486,8 +1507,17 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether this run may change what the app keeps on disk. A presentation
+/// run changes none of it: settings, the playback snapshot, the last account
+/// and every per-account library file stay as they were. Every write below
+/// asks here, so the guarantee holds for any caller.
+fn persistent() -> bool {
+    !crate::presentation::active()
+}
+
 /// Rebuildable caches are best-effort writes, not durable application state.
 fn write_json_cache<T: Serialize>(path: PathBuf, value: &T) {
+    if !persistent() { return; }
     let result = serde_json::to_vec(value)
         .map_err(|error| format!("could not serialize {}: {error}", path.display()))
         .and_then(|bytes| {
@@ -1522,6 +1552,7 @@ fn write_bytes_atomic_with(
     replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), String> {
     use std::io::Write as _;
+    if !persistent() { return Ok(()); }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
@@ -1796,6 +1827,78 @@ mod tests {
 
     fn state_line(auth_state: &str, username: &str) -> PlaybackState {
         PlaybackState { auth_state: auth_state.into(), username: username.into(), ..PlaybackState::default() }
+    }
+
+    /// Every file under `root` with its bytes, to compare before and after.
+    fn stored_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() { pending.push(path); } else { files.push((path.clone(), std::fs::read(&path).unwrap())); }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn a_presentation_run_neither_shows_nor_changes_the_accounts_stored_state() {
+        use crate::presentation::{tests::Installed, Item};
+        let root = std::env::temp_dir().join(format!("spotifine-presentation-{}-{}", std::process::id(), now_secs()));
+        library_fixture(&root, "owner", "owners-mix");
+        remember_last_account(&root, "owner").unwrap();
+        let queue = |id: &str| PlaybackSnapshot {
+            version: PLAYBACK_STATE_VERSION,
+            queue: vec![Track { duration_ms: 240_000, ..track(id) }],
+            current_index: Some(0),
+            position_ms: 0,
+            volume: 50,
+            shuffle: false,
+            repeat: "off".to_owned(),
+            track_speed: 1.0,
+            episode_speed: 1.0,
+        };
+        save_playback_snapshot_to(&root, &queue("last-listened")).unwrap();
+        let before = stored_files(&root);
+
+        let presenting = Installed::new("Alex Rivera", vec![Item::Playlist("configured".into())]);
+        let mut state = AppState::new(root.clone());
+        assert!(!state.select_last_account(), "no stored library is shown, not even at first paint");
+        assert!(state.playlists.is_empty() && state.me_id.is_empty());
+        assert!(load_playback_snapshot_from(&root).is_some(), "the queue is still on disk");
+        assert!(state.select_library_account("owner"));
+        assert!(state.playlists.is_empty(), "the account's library is not loaded");
+        assert!(state.playlist_tree.is_empty() && state.tracks_cache.is_empty() && state.memberships.is_empty());
+
+        // Everything an ordinary run would write as the configured library is
+        // opened, played and refreshed.
+        let configured = playlist("configured");
+        state.playlists = vec![configured.clone()];
+        let dir = state.library_dir();
+        save_playlist_list(&dir, &PlaylistListCache { version: 1, fetched_at: Some(20), me_id: "owner".into(),
+            playlists: vec![configured], playlist_tree: vec![LibraryNodeDetail::Playlist { id: "configured".into() }] });
+        let entry = PlaylistTracksEntry { id: "configured".into(), fetched_at: Some(20), revision: "r".into(),
+            tracks: vec![track("configured")], rows_complete: true, excluded_track_ids: Vec::new(), tracks_key: None };
+        save_tracks_cache(&dir, std::slice::from_ref(&entry));
+        write_tracks_cache_bytes(&dir, &tracks_cache_bytes(&[entry]).unwrap());
+        save_membership(&dir, &[membership("configured", "r", &["spotify:track:configured"])]);
+        remember_last_account(&root, "someone-else").unwrap();
+        remember_last_account(&root, "").unwrap();
+        save_playback_snapshot_to(&root, &queue("presented")).unwrap();
+        save_playhead_snapshot_to(&root, Some(0), 1_000, 7).unwrap();
+        let held = effective(AppSettings::default());
+        assert!(!held.spotify_listening_enabled && !held.devices_enabled, "listening reports and devices are held off");
+        assert_eq!(stored_files(&root), before, "not one stored byte changed");
+
+        // The same write in an ordinary run does land: the comparison above
+        // could have seen one.
+        drop(presenting);
+        assert!(effective(AppSettings::default()).spotify_listening_enabled);
+        remember_last_account(&root, "someone-else").unwrap();
+        assert_ne!(stored_files(&root), before);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

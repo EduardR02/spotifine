@@ -7,6 +7,7 @@ mod log;
 mod media_keys;
 mod personal_api;
 mod playback_router;
+mod presentation;
 mod types;
 
 use std::sync::Arc;
@@ -111,6 +112,112 @@ pub(crate) fn shutdown_for_exit(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     log::init(app::logs_dir());
+    // Before anything reads the account's state: a presentation run must
+    // never start as an ordinary one because its file was unusable.
+    match presentation::from_environment() {
+        Ok(Some(presentation)) => {
+            log::info(&format!("presentation mode: {} library items", presentation.library.len()));
+            presentation::install(Some(presentation));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            log::error(&format!("presentation mode could not start: {error}"));
+            eprintln!("Spotifine: presentation mode could not start: {error}");
+            std::process::exit(2);
+        }
+    }
+    let mut context = tauri::generate_context!();
+    if presentation::active() {
+        // A private webview: search memory, pins and every other stored
+        // preference start empty, and nothing the window stores outlives it.
+        for window in &mut context.config_mut().app.windows {
+            window.incognito = true;
+        }
+    }
+    let commands: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+        commands::check_for_update,
+        commands::play,
+        commands::set_window_visible,
+        commands::pause,
+        commands::next,
+        commands::previous,
+        commands::seek,
+        commands::set_volume,
+        commands::set_shuffle,
+        commands::set_repeat,
+        commands::set_playback_speed,
+        commands::play_queue,
+        commands::preview_track_edit,
+        commands::restore_preview,
+        commands::play_queue_index,
+        commands::add_queue,
+        commands::add_queue_batch,
+        commands::remove_queue,
+        commands::move_queue,
+        commands::get_history,
+        commands::clear_history,
+        commands::get_track_waveform,
+        commands::cancel_track_waveform,
+        commands::get_track_edit,
+        commands::save_track_edit,
+        commands::delete_track_edit,
+        commands::set_playlist_track_edit_enabled,
+        commands::set_playlist_track_excluded,
+        commands::search,
+        commands::browse_playlist,
+        commands::hydrate_library_covers,
+        commands::browse_radio,
+        commands::browse_playlist_recommendations,
+        commands::browse_track,
+        commands::browse_album,
+        commands::browse_artist,
+        commands::browse_artist_songwriter,
+        commands::browse_artist_catalogue,
+        commands::browse_liked_songs,
+        commands::browse_show,
+        commands::browse_episode,
+        commands::browse_profile,
+        commands::browse_track_credits,
+        commands::browse_canvas,
+        commands::browse_followed_artists,
+        commands::browse_saved_shows,
+        commands::create_playlist,
+        commands::rename_playlist,
+        commands::delete_playlist,
+        commands::follow_playlist,
+        commands::create_folder,
+        commands::rename_folder,
+        commands::delete_folder,
+        commands::move_library_item,
+        commands::add_playlist_tracks,
+        commands::remove_playlist_tracks,
+        commands::reorder_playlist_tracks,
+        commands::login,
+        commands::logout,
+        commands::set_normalisation,
+        commands::set_spotify_listening_enabled,
+        commands::personal_api_status,
+        commands::personal_api_configure,
+        commands::personal_api_authorize,
+        commands::personal_api_disconnect,
+        commands::personal_api_contains,
+        commands::personal_api_set_saved,
+        commands::personal_api_devices,
+        commands::select_output,
+        commands::get_state,
+        commands::get_cache_stats,
+        commands::clear_cache,
+        commands::set_audio_cache_limit,
+        commands::set_launch_at_login,
+        commands::set_start_minimized,
+        commands::set_animated_canvas,
+        commands::set_devices_enabled,
+        commands::enable_account_canvas,
+        commands::touch_playlist,
+        commands::touch_playlist_activity,
+        commands::get_track_playlists,
+        commands::get_presentation,
+    ];
     tauri::Builder::default()
         // This MUST be the first plugin: its second-process callback runs
         // before setup, so no duplicate state or playback engine is created.
@@ -121,89 +228,14 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(autostart::init())
-        .invoke_handler(tauri::generate_handler![
-            commands::check_for_update,
-            commands::play,
-            commands::set_window_visible,
-            commands::pause,
-            commands::next,
-            commands::previous,
-            commands::seek,
-            commands::set_volume,
-            commands::set_shuffle,
-            commands::set_repeat,
-            commands::set_playback_speed,
-            commands::play_queue,
-            commands::preview_track_edit,
-            commands::restore_preview,
-            commands::play_queue_index,
-            commands::add_queue,
-            commands::add_queue_batch,
-            commands::remove_queue,
-            commands::move_queue,
-            commands::get_history,
-            commands::clear_history,
-            commands::get_track_waveform,
-            commands::cancel_track_waveform,
-            commands::get_track_edit,
-            commands::save_track_edit,
-            commands::delete_track_edit,
-            commands::set_playlist_track_edit_enabled,
-            commands::set_playlist_track_excluded,
-            commands::search,
-            commands::browse_playlist,
-            commands::hydrate_library_covers,
-            commands::browse_radio,
-            commands::browse_playlist_recommendations,
-            commands::browse_track,
-            commands::browse_album,
-            commands::browse_artist,
-            commands::browse_artist_songwriter,
-            commands::browse_artist_catalogue,
-            commands::browse_liked_songs,
-            commands::browse_show,
-            commands::browse_episode,
-            commands::browse_profile,
-            commands::browse_track_credits,
-            commands::browse_canvas,
-            commands::browse_followed_artists,
-            commands::browse_saved_shows,
-            commands::create_playlist,
-            commands::rename_playlist,
-            commands::delete_playlist,
-            commands::follow_playlist,
-            commands::create_folder,
-            commands::rename_folder,
-            commands::delete_folder,
-            commands::move_library_item,
-            commands::add_playlist_tracks,
-            commands::remove_playlist_tracks,
-            commands::reorder_playlist_tracks,
-            commands::login,
-            commands::logout,
-            commands::set_normalisation,
-            commands::set_spotify_listening_enabled,
-            commands::personal_api_status,
-            commands::personal_api_configure,
-            commands::personal_api_authorize,
-            commands::personal_api_disconnect,
-            commands::personal_api_contains,
-            commands::personal_api_set_saved,
-            commands::personal_api_devices,
-            commands::select_output,
-            commands::get_state,
-            commands::get_cache_stats,
-            commands::clear_cache,
-            commands::set_audio_cache_limit,
-            commands::set_launch_at_login,
-            commands::set_start_minimized,
-            commands::set_animated_canvas,
-            commands::set_devices_enabled,
-            commands::enable_account_canvas,
-            commands::touch_playlist,
-            commands::touch_playlist_activity,
-            commands::get_track_playlists,
-        ])
+        // A presentation run refuses its writes here, before any command runs.
+        .invoke_handler(move |invoke| {
+            if presentation::refuses(invoke.message.command()) {
+                invoke.resolver.reject(presentation::REFUSAL);
+                return true;
+            }
+            commands(invoke)
+        })
         .setup(|app| {
             let mut startup_settings = load_app_settings();
             reconcile_autostart_preference(app.handle(), &mut startup_settings);
@@ -280,7 +312,7 @@ pub fn run() {
                 responder.respond(covers::serve_cover(request).await);
             });
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {

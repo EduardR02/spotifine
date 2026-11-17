@@ -10,7 +10,7 @@
 </script>
 
 <script>
-  import { addToLibrary, library, navigate, removeFromLibrary, session } from "../lib/state.svelte.js";
+  import { addToLibrary, library, libraryKind, navigate, presentation, removeFromLibrary, session } from "../lib/state.svelte.js";
   import { isPinned, togglePin } from "../lib/pins.svelte.js";
   import { spotifyLink } from "../lib/spotify-link.js";
   import CopyLinkItem from "./CopyLinkItem.svelte";
@@ -38,8 +38,11 @@
   const id = $derived(playlist?.id ?? "");
   const count = $derived(trackCount ?? playlist?.tracks_total ?? 0);
   const liked = $derived(id === "liked");
-  const editable = $derived(!liked && !!playlist?.owner_id && playlist.owner_id === session.username);
-  const inLibrary = $derived(!liked && library.some((entry) => entry.id === id));
+  /* A presentation offers nothing that would change the library: the link is
+     the whole menu. */
+  const writable = $derived(!presentation.name);
+  const editable = $derived(writable && !liked && !!playlist?.owner_id && playlist.owner_id === session.username);
+  const inLibrary = $derived(writable && !liked && library.some((entry) => entry.id === id));
   const pinnable = $derived(liked || inLibrary);
 
   /* Every item reads what it acts on before it closes the menu: in the rail
@@ -74,7 +77,7 @@
   }
 </script>
 
-{#if !liked && !inLibrary && id}
+{#if writable && !liked && !inLibrary && id}
   <button class="menu-item" role="menuitem" onclick={add}><Icon name="library-add" size={16} />Add to Your Library</button>
 {/if}
 {#if pinnable}
@@ -88,7 +91,7 @@
   <button class="menu-item" role="menuitem" disabled={!count} onclick={() => run("cleanup", onCleanup)}><Icon name="filter" size={16} />Remove songs by rules…</button>
 {/if}
 {#if !liked}
-  <CopyLinkItem link={spotifyLink("playlist", id)} {close} />
+  <CopyLinkItem link={spotifyLink(libraryKind(playlist), id)} {close} />
 {/if}
 {#if editable}
   <div class="menu-sep" role="separator"></div>

@@ -12,6 +12,7 @@
     settingsState,
     openAuthUrl,
     isLoggedOut,
+    presentation,
   } from "../lib/state.svelte.js";
   import Icon from "../components/Icon.svelte";
   import Cover from "../components/Cover.svelte";
@@ -278,11 +279,14 @@
               <div class="d">Spotify account</div>
             </div>
           </div>
-          <div class="set-ctl">
-            <button class="pill" onclick={() => api.logout().catch(() => {})}>
-              <Icon name="logout" size={14} />Log out
-            </button>
-          </div>
+          <!-- A presentation keeps the stored sign-in: it offers no Log out. -->
+          {#if !presentation.name}
+            <div class="set-ctl">
+              <button class="pill" onclick={() => api.logout().catch(() => {})}>
+                <Icon name="logout" size={14} />Log out
+              </button>
+            </div>
+          {/if}
         </div>
       {/if}
       {#if session.error}
