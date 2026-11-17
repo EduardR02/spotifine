@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "dev:demo": "vite --config demo/vite.config.js",
+    "build:demo": "vite build --config demo/vite.config.js",
     "test": "bun test",
     "build:engine": "cargo build --release -p renderer-engine",
     "preview": "vite preview",
