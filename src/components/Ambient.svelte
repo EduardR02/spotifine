@@ -148,22 +148,39 @@
 
   /* ---- The edges (lib/edges.js) --------------------------------------------
      Each layer holds its picture's gathered twin and lays it into four
-     strips per plane, as the frost lies under the planes. They are drawn
-     when the picture is shown, when a plane moves, and when a drag slides
-     the picture: never per frame otherwise. */
+     strips per plane, as the frost lies under the planes. A plane's strips
+     are drawn when the picture is shown and when that plane moves or
+     changes size: never per frame otherwise, and a plane that did not
+     change is not drawn again.
+
+     While the panel's edge is dragged they take the picture as it was drawn,
+     not as the drag slides it: a band a few pixels deep a little off the
+     colour under it, for the length of a drag, is not seen, where following
+     the slide redrew every strip of every plane on every frame. Only the
+     planes the drag resizes are drawn, and on release every strip is drawn
+     once where the picture now lies. */
   let planeBoxes = [];
 
-  function paintEdges(entry) {
+  function paintEdges(entry, force = false) {
     const holder = entry.el.children[2];
     const twin = entry.twin;
     holder.hidden = !twin;
     if (!twin) return;
-    const view = { w: window.innerWidth || 1, h: window.innerHeight || 1, dpr: window.devicePixelRatio || 1, slide: entry.shift };
+    const slid = dragEdge == null ? entry.shift : null;
+    const view = { w: window.innerWidth || 1, h: window.innerHeight || 1, dpr: window.devicePixelRatio || 1, slide: slid };
+    const at = `${slid ? `${slid.from},${slid.edge},${slid.stretch}` : ""}|${view.w}x${view.h}@${view.dpr}`;
+    const strips = planeBoxes.map((box) => stripsOf(box.w, box.h));
+    // A plane that gained or lost strips moves every later plane's canvases.
+    if (strips.reduce((n, s) => n + s.length, 0) !== holder.children.length) force = true;
+    entry.drawn ??= [];
     let i = 0;
-    for (const box of planeBoxes) {
-      for (const strip of stripsOf(box.w, box.h)) {
+    planeBoxes.forEach((box, p) => {
+      const key = `${box.x},${box.y},${box.w},${box.h},${box.r}|${at}`;
+      const same = !force && entry.drawn[p] === key;
+      for (const strip of strips[p]) {
         let canvas = holder.children[i++];
         if (!canvas) canvas = holder.appendChild(document.createElement("canvas"));
+        if (same) continue;
         const s = canvas.style;
         s.left = `${box.x + strip[0]}px`;
         s.top = `${box.y + strip[1]}px`;
@@ -171,12 +188,15 @@
         s.height = `${strip[3]}px`;
         drawStrip(canvas, twin, box, strip, view);
       }
-    }
+      entry.drawn[p] = key;
+    });
+    entry.drawn.length = planeBoxes.length;
     while (holder.children.length > i) holder.lastElementChild.remove();
   }
 
   function releaseEdges(entry) {
     entry.twin = null;
+    entry.drawn = null;
     entry.el.children[2].hidden = true;
   }
 
@@ -284,6 +304,8 @@
   $effect(() => watchShift((edge, cancel) => {
     dragEdge = edge;
     if (edge != null || cancel) for (const entry of stack) slide(entry, edge);
+    // Released or cancelled: the edges once, where the picture now lies.
+    if (edge == null) for (const entry of stack) paintEdges(entry, true);
   }));
 
   /** Slide a layer's pictures so their seam is at `edge`; null puts them
@@ -307,9 +329,7 @@
       c.style.transformOrigin = origin;
       c.style.transform = transform;
     }
-    /* The edges are drawn from the picture where it now lies, when the
-       planes are traced in this same frame (a drag moves them), or when
-       the picture is shown: once a frame at most. */
+    // The edges take it when the drag is released (paintEdges).
     entry.shift = { from, edge, stretch };
   }
 
