@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of entity URIs per extended-metadata POST.
+pub const METADATA_BATCH_SIZE: usize = 40;
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -166,6 +169,26 @@ pub struct Request {
     pub command: Command,
 }
 
+/// Proof of a successful playlist-row install, issued by the engine, never restored
+/// from disk. Revisions alone can overlap after an engine or account change.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct QueueReceipt {
+    pub install: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaylistRows<T> {
+    Rows(T),
+    Reuse(QueueReceipt),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PlaylistRowReply<T = QueueReceipt> {
+    pub receipt: Option<T>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
@@ -192,6 +215,14 @@ pub enum Command {
         /// paused before it landed installs in one step, never sounding.
         #[serde(default)]
         start_paused: bool,
+    },
+    /// Direct playlist selection. An empty output plays locally; a Spotify
+    /// device stages its canonical engine queue without loading local audio.
+    PlayPlaylistRow {
+        selection: PlaylistRows<Vec<TrackRef>>,
+        index: usize,
+        context: String,
+        output: String,
     },
     /// Installs a paused queue/playhead without asking librespot to load audio.
     /// Snapshot positions are in the compiled transport timeline and are
@@ -377,8 +408,9 @@ pub enum Command {
     },
     /// One audio podcast episode through metadata4.
     BrowseEpisode { id: String },
-    /// A show's metadata and its episode rows in source order.
+    /// The header and episode identities; no episode metadata requests.
     BrowseShow { id: String },
+    BrowseShowEpisodes { id: String, episode_ids: Vec<String> },
     /// User identity and public playlists from the private profile service.
     BrowseProfile {
         username: String,
@@ -1322,13 +1354,8 @@ pub struct EpisodeRef {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ShowBrowse {
-    pub id: String,
-    pub uri: String,
-    pub name: String,
-    pub publisher: String,
-    pub description: String,
-    pub cover_url: Option<String>,
-    pub episodes: Vec<EpisodeRef>,
+    pub show: ShowRef,
+    pub episode_ids: Vec<String>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PlaylistMembership {

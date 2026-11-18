@@ -20,6 +20,8 @@ let listenerId = 1;
 const callbacks = new Map();
 const callbackOnce = new Set();
 const listeners = new Map();
+const openShows = new Map();
+let nextShowRid = 1;
 
 function transformCallback(callback, once = false) {
   const id = callbackId++;
@@ -569,8 +571,36 @@ let emittedQueueRevision = 0;
 let emittedOrderRevision = 0;
 let queueIdentity = "";
 let heldOrder = [];
+let playlistInstall = null;
+
+/** The fixture and the real-account harness share this simulated authority.
+    Full installs supply their own row reader; receipt hits need no reader. */
+function playPlaylistRow({ selection, index, context }, installRows) {
+  if (selection.reuse) {
+    if (!playlistInstall || playlistInstall.receipt.install !== selection.reuse.install ||
+        selection.reuse.revision !== queueRevision || playlistInstall.rows !== playback.queue ||
+        playlistInstall.context !== context || playlistInstall.username !== playback.username ||
+        playlistInstall.output !== playback.output_device_id) return null;
+  } else {
+    playback.queue = installRows(selection.rows, context);
+    queueIdentity = null;
+  }
+  if (!playback.queue[index]) throw new Error("queue index is out of range");
+  setCurrent(index);
+  redrawShuffleBag();
+  playback.playing = true;
+  playback.preview = false;
+  playQueueLog.push({ automaticStart: false, requestedIndex: index, startedIndex: index });
+  emitState(!!selection.reuse);
+  if (!selection.reuse) {
+    playlistInstall = { rows: playback.queue, context, username: playback.username, output: playback.output_device_id,
+      receipt: { install: crypto.randomUUID(), revision: queueRevision } };
+  }
+  return { receipt: playlistInstall.receipt, queue_revision: queueRevision };
+}
 
 function refreshQueueEdits() {
+  playlistInstall = null;
   playback.queue = playback.queue.map((entry) => {
     const track = findTrack(entry.uri);
     const edit = track && effectiveEdit(track);
@@ -769,23 +799,26 @@ function upcomingIndices() {
   return out;
 }
 
-function snapshot() {
-  const identity = JSON.stringify(playback.queue);
-  if (identity !== queueIdentity) {
-    queueIdentity = identity;
-    queueRevision += 1;
+function snapshot(rowsRetained = false) {
+  if (!rowsRetained) {
+    const identity = JSON.stringify(playback.queue);
+    if (identity !== queueIdentity) {
+      queueIdentity = identity;
+      queueRevision += 1;
+    }
   }
   const upcoming = upcomingIndices();
   if (upcoming.length !== heldOrder.length || upcoming.some((row, index) => row !== heldOrder[index])) {
     heldOrder = upcoming;
     orderRevision += 1;
   }
-  return { ...clone(playback), context: playback.queue[playback.current_index]?.context ?? "",
+  return { ...clone(rowsRetained ? { ...playback, queue: undefined } : playback),
+    context: playback.queue[playback.current_index]?.context ?? "",
     queue_revision: queueRevision, order_revision: orderRevision, upcoming };
 }
 
-function emitState() {
-  const state = snapshot();
+function emitState(rowsRetained = false) {
+  const state = snapshot(rowsRetained && emittedQueueRevision === queueRevision);
   if (queueRevision === emittedQueueRevision) delete state.queue;
   if (orderRevision === emittedOrderRevision) delete state.upcoming;
   emittedQueueRevision = queueRevision;
@@ -920,8 +953,27 @@ const mock = {
           shows: [{ ...clone(fixtures.show), episodes: undefined }],
           episodes: [clone(fixtures.episode)],
         };
-      case "browse_show":
-        return clone(fixtures.show);
+      case "browse_show": {
+        const { episodes, ...header } = fixtures.show;
+        const rid = nextShowRid++;
+        openShows.set(rid, fixtures.show);
+        return { ...clone(header), episode_count: episodes.length, rid };
+      }
+      case "show_episode_index":
+        return openShows.get(args.rid).episodes.map(e => [e.track.name, e.published_at, !e.track.unavailable]);
+      case "search_show_episodes":
+        return openShows.get(args.rid).episodes.flatMap((e, i) =>
+          [e.track.name, e.description].some(s => (s ?? "").toLowerCase().includes(args.query)) ? [i] : []);
+      case "show_episode_rows":
+        return { episodes: args.indices.map(i => clone(openShows.get(args.rid).episodes[i])) };
+      case "play_show_episodes": {
+        const show = openShows.get(args.rid);
+        return mock.invoke("play_queue", { queue: args.indices.map(i => show.episodes[i].track),
+          index: args.index, context: `show:${show.id}` });
+      }
+      case "close_show":
+        openShows.delete(args.rid);
+        return null;
       case "browse_episode":
         return clone(fixtures.show.episodes.find((episode) => episode.track.id === args.id) ?? fixtures.episode);
       case "browse_profile":
@@ -981,6 +1033,7 @@ const mock = {
           emit("playback-action-error", outputFailure);
           throw new Error(outputFailure);
         }
+        playlistInstall = null;
         playback.output_device_id = device?.id ?? "";
         playback.output_device_name = device?.name ?? "";
         if (!device) playback.playing = false;
@@ -1169,6 +1222,7 @@ const mock = {
         return null;
       }
       case "preview_track_edit": {
+        playlistInstall = null;
         const track = findTrack(args.trackId ?? args.track_id);
         if (track) {
           playback.preview = true;
@@ -1261,6 +1315,8 @@ const mock = {
         applyKindSpeed();
         emitState();
         return null;
+      case "play_playlist_row":
+        return playPlaylistRow(args, (rows, context) => queueWithEdits(rows.map(trackFromQueueItem), context));
       case "play_queue": {
         const input = args.queue ?? args.tracks ?? args.uris;
         if (Array.isArray(input)) playback.queue = queueWithEdits(input.map(trackFromQueueItem), args.context ?? "");
@@ -1316,6 +1372,7 @@ const mock = {
       }
       case "move_queue":
       case "reorder_queue": {
+        playlistInstall = null;
         const from = Number(args.from ?? args.fromIndex);
         const to = Number(args.to ?? args.toIndex);
         if (Number.isInteger(from) && Number.isInteger(to) && playback.queue[from] && to >= 0 && to < playback.queue.length) {
@@ -1345,6 +1402,7 @@ const mock = {
         return null;
       case "logout":
       case "sign_out":
+        playlistInstall = null;
         playback.auth_state = "logged_out";
         playback.username = "";
         playback.playing = false;
@@ -1664,6 +1722,7 @@ if (new URLSearchParams(location.search).has("real")) {
     setCurrent,
     clone,
     redrawShuffleBag,
+    playPlaylistRow,
     spliceIntoShuffleBag,
     upcomingIndices,
     shuffleBag: {

@@ -563,20 +563,12 @@ fn decode_audio(
     Ok(envelope.finish())
 }
 
-#[derive(Clone, Copy)]
-struct Peak {
-    min: i16,
-    max: i16,
-    occupied: bool,
-}
-
 struct Envelope {
-    peaks: Vec<Peak>,
-    target_frames: u64,
-    frames: u64,
-    bin_index: usize,
+    payload: Vec<u8>,
+    payload_len: usize,
+    remaining_frames: u64,
     bin_phase: u64,
-    bin_phase_step: u64,
+    partial: Option<(i16, i16)>,
 }
 
 impl Envelope {
@@ -591,21 +583,12 @@ impl Envelope {
         if u64::try_from(artifact_len).map_or(true, |length| length > MAX_ARTIFACT_BYTES) {
             return Err("waveform exceeds the 16 MiB artifact limit".to_owned());
         }
-        let bin_phase_step = u64::from(INTERVAL_MS).saturating_mul(1_000);
         Ok(Self {
-            peaks: vec![
-                Peak {
-                    min: 0,
-                    max: 0,
-                    occupied: false
-                };
-                bin_count
-            ],
-            target_frames: u64::from(duration_ms).saturating_mul(SAMPLE_RATE) / 1_000,
-            frames: 0,
-            bin_index: 0,
+            payload: Vec::with_capacity(payload_len),
+            payload_len,
+            remaining_frames: u64::from(duration_ms) * SAMPLE_RATE / 1_000,
             bin_phase: 0,
-            bin_phase_step,
+            partial: None,
         })
     }
 
@@ -613,50 +596,136 @@ impl Envelope {
         if samples.len() % CHANNELS != 0 {
             return Err("decoded stereo packet ended with a partial frame".to_owned());
         }
-        for frame in samples.chunks_exact(CHANNELS) {
-            if self.is_full() {
-                break;
-            }
-            debug_assert!(self.bin_index < self.peaks.len());
-            let bin = self.bin_index;
-            let low = quantize(frame[0].min(frame[1]));
-            let high = quantize(frame[0].max(frame[1]));
-            let peak = &mut self.peaks[bin];
-            if peak.occupied {
-                peak.min = peak.min.min(low);
-                peak.max = peak.max.max(high);
-            } else {
-                peak.min = low;
-                peak.max = high;
-                peak.occupied = true;
-            }
-            self.frames += 1;
-            self.bin_phase += self.bin_phase_step;
-            if self.bin_phase >= SAMPLE_RATE {
-                self.bin_phase -= SAMPLE_RATE;
-                self.bin_index += 1;
-            }
+        let frames = self.remaining_frames.min((samples.len() / CHANNELS) as u64);
+        self.remaining_frames -= frames;
+        let samples = &samples[..frames as usize * CHANNELS];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: the AVX2 packet loop is guarded once per decoder packet.
+            unsafe { self.push_bins_avx2(samples) };
+            return Ok(());
         }
+        self.push_bins(samples, scalar_extrema);
         Ok(())
     }
 
-    fn is_full(&self) -> bool {
-        self.frames >= self.target_frames
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn push_bins_avx2(&mut self, samples: &[f64]) {
+        self.push_bins(samples, |span| {
+            // SAFETY: this whole loop runs with AVX2 enabled.
+            unsafe { avx2_extrema(span) }
+        });
     }
 
-    fn finish(self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(self.peaks.len() * 4);
-        for peak in self.peaks {
-            let (min, max) = if peak.occupied {
-                (peak.min, peak.max)
+    #[inline(always)]
+    fn push_bins(&mut self, mut samples: &[f64], extrema: impl Fn(&[f64]) -> (i16, i16)) {
+        const BIN_PHASE: u64 = SAMPLE_RATE * INTERVAL_MS as u64;
+        while !samples.is_empty() {
+            // Starting at phase zero, the first bin holds 45 frames; the
+            // residual 900 then makes the next bin hold 44, not another 45.
+            let until_boundary = (BIN_PHASE - self.bin_phase).div_ceil(1_000) as usize;
+            let frames = until_boundary.min(samples.len() / CHANNELS);
+            let (span, rest) = samples.split_at(frames * CHANNELS);
+            let (mut low, mut high) = extrema(span);
+            if let Some((previous_low, previous_high)) = self.partial.take() {
+                low = low.min(previous_low);
+                high = high.max(previous_high);
+            }
+            self.bin_phase += frames as u64 * 1_000;
+            if self.bin_phase >= BIN_PHASE {
+                self.bin_phase -= BIN_PHASE;
+                self.append_peak(low, high);
             } else {
-                (0, 0)
-            };
-            payload.extend_from_slice(&min.to_le_bytes());
-            payload.extend_from_slice(&max.to_le_bytes());
+                self.partial = Some((low, high));
+            }
+            samples = rest;
         }
-        payload
     }
+
+    fn append_peak(&mut self, low: i16, high: i16) {
+        let [l0, l1] = low.to_le_bytes();
+        let [h0, h1] = high.to_le_bytes();
+        self.payload.extend_from_slice(&[l0, l1, h0, h1]);
+    }
+
+    fn is_full(&self) -> bool {
+        self.remaining_frames == 0
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if let Some((low, high)) = self.partial {
+            self.append_peak(low, high);
+        }
+        self.payload.resize(self.payload_len, 0);
+        self.payload
+    }
+}
+
+// On finite PCM the quantizer is monotone: reducing both channels before
+// rounding yields the same two i16s as quantizing each frame's min and max.
+fn scalar_extrema(samples: &[f64]) -> (i16, i16) {
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for &sample in samples {
+        if !sample.is_finite() {
+            return nonfinite_extrema(samples);
+        }
+        low = low.min(sample);
+        high = high.max(sample);
+    }
+    (quantize(low), quantize(high))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn avx2_extrema(samples: &[f64]) -> (i16, i16) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let mut lows = _mm256_set1_pd(f64::INFINITY);
+    let mut highs = _mm256_set1_pd(f64::NEG_INFINITY);
+    let exponent = _mm256_set1_epi64x(0x7ff0_0000_0000_0000);
+    let mut nonfinite = _mm256_setzero_si256();
+    let mut groups = samples.chunks_exact(4);
+    for group in &mut groups {
+        // SAFETY: every chunk has four f64s; alignment is not required.
+        let x = unsafe { _mm256_loadu_pd(group.as_ptr()) };
+        lows = _mm256_min_pd(lows, x);
+        highs = _mm256_max_pd(highs, x);
+        let bits = _mm256_and_si256(_mm256_castpd_si256(x), exponent);
+        nonfinite = _mm256_or_si256(nonfinite, _mm256_cmpeq_epi64(bits, exponent));
+    }
+    let tail = groups.remainder();
+    if _mm256_testz_si256(nonfinite, nonfinite) == 0 || tail.iter().any(|x| !x.is_finite()) {
+        return nonfinite_extrema(samples);
+    }
+    // No NaNs remain: reduce the two 128-bit halves, then the two lanes.
+    let lo = _mm_min_pd(_mm256_castpd256_pd128(lows), _mm256_extractf128_pd::<1>(lows));
+    let hi = _mm_max_pd(_mm256_castpd256_pd128(highs), _mm256_extractf128_pd::<1>(highs));
+    let mut low = _mm_cvtsd_f64(_mm_min_sd(lo, _mm_unpackhi_pd(lo, lo)));
+    let mut high = _mm_cvtsd_f64(_mm_max_sd(hi, _mm_unpackhi_pd(hi, hi)));
+    for &sample in tail {
+        low = low.min(sample);
+        high = high.max(sample);
+    }
+    (quantize(low), quantize(high))
+}
+
+// Nonfinite input breaks monotonicity: stereo min/max first ignore a lone
+// NaN, then the quantizer maps any remaining NaN or infinity to zero.
+#[cold]
+fn nonfinite_extrema(samples: &[f64]) -> (i16, i16) {
+    let mut low = i16::MAX;
+    let mut high = i16::MIN;
+    for frame in samples.chunks_exact(CHANNELS) {
+        low = low.min(quantize(frame[0].min(frame[1])));
+        high = high.max(quantize(frame[0].max(frame[1])));
+    }
+    (low, high)
 }
 
 fn quantize(sample: f64) -> i16 {
@@ -1021,6 +1090,173 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    // The original per-frame algorithm, independent of the grouped bin walker.
+    fn reference_envelope<'a>(
+        duration_ms: u32,
+        packets: impl IntoIterator<Item = &'a [f64]>,
+    ) -> Vec<u8> {
+        let mut peaks = vec![None::<(i16, i16)>; bin_count(duration_ms)];
+        let mut remaining = u64::from(duration_ms) * SAMPLE_RATE / 1_000;
+        let mut bin = 0;
+        let mut phase = 0;
+        'packets: for packet in packets {
+            for frame in packet.chunks_exact(CHANNELS) {
+                if remaining == 0 {
+                    break 'packets;
+                }
+                let low = quantize(frame[0].min(frame[1]));
+                let high = quantize(frame[0].max(frame[1]));
+                peaks[bin] = Some(match peaks[bin] {
+                    Some((old_low, old_high)) => (old_low.min(low), old_high.max(high)),
+                    None => (low, high),
+                });
+                remaining -= 1;
+                phase += u64::from(INTERVAL_MS) * 1_000;
+                if phase >= SAMPLE_RATE {
+                    phase -= SAMPLE_RATE;
+                    bin += 1;
+                }
+            }
+        }
+        let mut payload = Vec::with_capacity(peaks.len() * 4);
+        for peak in peaks {
+            let (low, high) = peak.unwrap_or_default();
+            payload.extend_from_slice(&low.to_le_bytes());
+            payload.extend_from_slice(&high.to_le_bytes());
+        }
+        payload
+    }
+
+    fn packet_envelope<'a>(
+        duration_ms: u32,
+        packets: impl IntoIterator<Item = &'a [f64]>,
+    ) -> Vec<u8> {
+        let mut envelope = Envelope::new(duration_ms).unwrap();
+        for packet in packets {
+            envelope.push_interleaved_stereo(packet).unwrap();
+            if envelope.is_full() {
+                break;
+            }
+        }
+        envelope.finish()
+    }
+
+    #[test]
+    fn envelope_matches_frame_reference_across_packet_splits() {
+        let half_lsb = 0.5 / f64::from(i16::MAX);
+        let pairs = [
+            [f64::NAN, 0.375], [-0.375, f64::NAN], [f64::NAN, f64::NAN],
+            [0.75, f64::INFINITY], [f64::NEG_INFINITY, -0.75],
+            [f64::INFINITY, f64::INFINITY], [f64::NEG_INFINITY, f64::INFINITY],
+            [-0.0, 0.0], [-half_lsb, half_lsb], [-0.5, 0.5],
+            [-1.0, -1.0], [-1.25, 1.25], [1.0, 1.0],
+        ];
+        let mut samples = Vec::new();
+        for bin in 0..3 * pairs.len() {
+            let end = ((bin + 1) * SAMPLE_RATE as usize).div_ceil(1_000);
+            let frames = end - samples.len() / CHANNELS;
+            for frame in 0..frames {
+                // Uniform pathological bins expose even inverted quantized
+                // peaks. Also isolate bad values in the SIMD body and tail.
+                let use_edge = match bin / pairs.len() {
+                    0 => true,
+                    1 => frame == bin % frames,
+                    _ => frame + 1 == frames,
+                };
+                let pair = if use_edge {
+                    pairs[bin % pairs.len()]
+                } else {
+                    let x = (bin * 50 + frame) as f64 / 2_000.0;
+                    [x, x * 0.7]
+                };
+                samples.extend_from_slice(&pair);
+            }
+        }
+        samples.truncate(samples.len() - 13 * CHANNELS);
+        // Exercise the portable reducer even when packet dispatch selects AVX2.
+        for span in samples.chunks(23 * CHANNELS) {
+            assert_eq!(scalar_extrema(span), peak(&reference_envelope(1, [span]), 0));
+        }
+        for schedule in [&[1][..], &[1, 43, 7, 45, 2, 127, 11], &[1_024]] {
+            let mut packets = vec![&samples[..0]];
+            let mut rest = samples.as_slice();
+            for &frames in schedule.iter().cycle() {
+                if rest.is_empty() {
+                    break;
+                }
+                let (packet, tail) = rest.split_at(rest.len().min(frames * CHANNELS));
+                packets.push(packet);
+                rest = tail;
+            }
+            for duration in [0, 1, 10, 37, 43] {
+                let expected = reference_envelope(duration, packets.iter().copied());
+                let actual = packet_envelope(duration, packets.iter().copied());
+                assert_eq!(actual, expected, "duration={duration}, schedule={schedule:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn envelope_rejects_partial_frames_even_after_filling() {
+        let mut envelope = Envelope::new(1).unwrap();
+        assert!(envelope.push_interleaved_stereo(&[0.25]).is_err());
+        envelope.push_interleaved_stereo(&[0.5; 88]).unwrap();
+        assert!(envelope.is_full());
+        assert!(envelope.push_interleaved_stereo(&[0.75]).is_err());
+        assert_eq!(peak(&envelope.finish(), 0), (16_384, 16_384));
+    }
+
+    #[test]
+    #[ignore = "release-mode cold waveform envelope benchmark"]
+    fn benchmark_waveform_envelope() {
+        use std::{hint::black_box, time::Instant};
+
+        const MS: u32 = 210_000;
+        const PACKET_FRAMES: usize = 1_024;
+        let frames = (u64::from(MS) * SAMPLE_RATE / 1_000) as usize;
+        let packet_count = frames.div_ceil(PACKET_FRAMES);
+        // Decoder output is consumed packet-by-packet while hot. Cycle a small
+        // PCM working set rather than timing reads of a track-sized cold array.
+        let mut seed = 527_946_763_u32;
+        let pcm: Vec<_> = (0..16 * PACKET_FRAMES * CHANNELS)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                0.975 * f64::from(seed as i32) / f64::from(i32::MAX)
+            })
+            .collect();
+        let run = |optimized| {
+            let packets = black_box(pcm.as_slice())
+                .chunks_exact(PACKET_FRAMES * CHANNELS)
+                .cycle()
+                .take(packet_count);
+            if optimized {
+                packet_envelope(MS, packets)
+            } else {
+                reference_envelope(MS, packets)
+            }
+        };
+        assert!(run(true) == run(false), "benchmark output differs");
+        let mut times = [[Duration::ZERO; 9]; 2];
+        for trial in 0..times[0].len() {
+            for k in 0..2 {
+                let path = (k + trial) % 2;
+                let start = Instant::now();
+                let payload = black_box(run(path != 0));
+                times[path][trial] = start.elapsed();
+                drop(payload);
+            }
+        }
+        for series in &mut times {
+            series.sort_unstable();
+        }
+        eprintln!(
+            "210 s stereo PCM, envelope only: per-frame {:?}, grouped {:?} (medians)",
+            times[0][4], times[1][4]
+        );
     }
 
     fn peak(payload: &[u8], index: usize) -> (i16, i16) {

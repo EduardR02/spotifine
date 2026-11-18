@@ -68,16 +68,11 @@ use renderer_engine::protocol::{
     AlbumRef, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity,
     Canvas, CreditArtist, CreditRole, EpisodeRef, LibraryNode, PlaylistRead, PlaylistRecommendations, PlaylistRef, PlaylistUnchanged,
     RadioBrowse, ShowBrowse, ShowRef, SongwriterPlaylist, TrackCredits, TrackRef,
-    UserProfile, sanitize_playlist_description,
+    UserProfile, sanitize_playlist_description, METADATA_BATCH_SIZE,
 };
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
 const COVER_BASE: &str = "https://i.scdn.co/image/";
-
-/// Entity URIs per extended-metadata POST. The endpoint answers batches of
-/// this size comfortably; larger playlists are split into several POSTs so a
-/// 1000-track playlist is ~25 requests instead of 1000.
-const METADATA_BATCH_SIZE: usize = 40;
 
 /// Mercury metadata requests do not have spclient's transport recovery.
 /// Keep their bounded retry schedule separate from spclient operations.
@@ -1267,38 +1262,29 @@ pub async fn show_browse(session: &Session, id: &str) -> Result<ShowBrowse, Stri
     if show.is_audiobook {
         return Err("Audiobooks are not podcast shows".to_owned());
     }
-    let header = show_ref(&show);
+    let mut seen = HashSet::with_capacity(show.episodes.len());
+    Ok(ShowBrowse {
+        show: show_ref(&show),
+        episode_ids: show.episodes.iter().filter(|uri| seen.insert(*uri)).map(id_of).collect(),
+    })
+}
+
+pub async fn show_episodes(session: &Session, id: &str, ids: &[String]) -> Result<Vec<EpisodeRef>, String> {
+    let uris: Vec<_> = ids.iter().map(|id| podcast_uri("episode", id)).collect::<Result<_, _>>()?;
     let policy = AvailabilityPolicy::for_session(session);
-    let resolved = fetch_extended(
+    let mut episodes = fetch_extended(
         session,
-        show.episodes.iter(),
+        uris.iter(),
         ExtensionKind::EPISODE_V4,
         |uri, payload| parse_episode_payload(uri, payload, &policy),
     )
     .await?;
-    let mut by_uri: HashMap<String, EpisodeRef> = resolved
-        .into_iter()
-        .map(|episode| (episode.track.uri.clone(), episode))
-        .collect();
-    let episodes = show
-        .episodes
-        .iter()
-        .filter_map(|uri| by_uri.remove(&uri_of(uri)))
-        .map(|mut episode| {
-            episode.show_id = header.id.clone();
-            episode.track.album_id = header.id.clone();
-            episode
-        })
-        .collect();
-    Ok(ShowBrowse {
-        id: header.id,
-        uri: header.uri,
-        name: header.name,
-        publisher: header.publisher,
-        description: header.description,
-        cover_url: header.cover_url,
-        episodes,
-    })
+    // fetch_extended already emits each resolved URI once, in source order.
+    for episode in &mut episodes {
+        episode.show_id = id.to_owned();
+        episode.track.album_id = id.to_owned();
+    }
+    Ok(episodes)
 }
 
 

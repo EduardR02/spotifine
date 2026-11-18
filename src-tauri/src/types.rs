@@ -15,7 +15,7 @@ use renderer_engine::protocol::{
     ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist, CreditRole, EpisodeRef,
     HistoryItem as EngineHistoryItem, HistoryPage as EngineHistoryPage, LibraryItem, LibraryNode,
     LikedSongsPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse,
-    SearchBrowse, SearchTopRef, ShowBrowse, ShowRef, SongwriterPlaylist as EngineSongwriterPlaylist,
+    SearchBrowse, SearchTopRef, ShowRef, SongwriterPlaylist as EngineSongwriterPlaylist,
     TrackCredits, TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform, UserProfile,
 };
 
@@ -876,30 +876,16 @@ impl From<EpisodeRef> for EpisodeDetail {
     }
 }
 
-/// A show's metadata plus its source-ordered episodes.
+/// A header can paint before any episode metadata has been resolved.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ShowDetail {
     #[serde(flatten)]
     pub show: Show,
-    pub episodes: Vec<EpisodeDetail>,
+    pub episode_count: usize,
+    pub rid: u32,
 }
 
-impl From<ShowBrowse> for ShowDetail {
-    fn from(browse: ShowBrowse) -> Self {
-        Self {
-            show: Show {
-                id: browse.id,
-                uri: browse.uri,
-                name: browse.name,
-                publisher: browse.publisher,
-                description: browse.description,
-                cover_url: browse.cover_url.unwrap_or_default(),
-            },
-            episodes: browse.episodes.into_iter().map(EpisodeDetail::from).collect(),
-        }
-    }
-}
 
 /// Spotify username is the navigation identity; name is only the display label.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -1535,26 +1521,14 @@ mod tests {
                 ..TrackRef::default()
             },
         };
-        let show = ShowDetail::from(ShowBrowse {
-            id: "show".into(),
-            uri: "spotify:show:show".into(),
-            name: "The Show".into(),
-            publisher: "Publisher".into(),
-            description: "About the show".into(),
-            cover_url: Some("show-cover".into()),
-            episodes: vec![episode],
-        });
-        let json = serde_json::to_value(show).unwrap();
-        assert_eq!(json["name"], "The Show");
-        assert_eq!(json["publisher"], "Publisher");
-        assert_eq!(json["cover_url"], "show-cover");
-        assert_eq!(json["episodes"][0]["track"]["uri"], "spotify:episode:ep");
-        assert_eq!(json["episodes"][0]["show_name"], "The Show");
-        assert_eq!(json["episodes"][0]["published_at"], 1_726_000_000_i64);
-        assert_eq!(json["episodes"][0]["track"]["duration_ms"], 83_000);
-        assert_eq!(json["episodes"][0]["track"]["unavailable"], true);
-        assert_eq!(json["episodes"][0]["track"]["unavailable_reason"], "Region restricted");
-        assert_eq!(json["episodes"][0]["track"]["context"], "show:show");
+        let json = serde_json::to_value(EpisodeDetail::from(episode)).unwrap();
+        assert_eq!(json["track"]["uri"], "spotify:episode:ep");
+        assert_eq!(json["show_name"], "The Show");
+        assert_eq!(json["published_at"], 1_726_000_000_i64);
+        assert_eq!(json["track"]["duration_ms"], 83_000);
+        assert_eq!(json["track"]["unavailable"], true);
+        assert_eq!(json["track"]["unavailable_reason"], "Region restricted");
+        assert_eq!(json["track"]["context"], "show:show");
     }
 
     #[test]

@@ -1,48 +1,104 @@
 import { expect, test } from "bun:test";
-import { filterEpisodes, orderEpisodes, indexEpisodeSearch } from "./episodes.js";
+import { createEpisodeWindow, orderEpisodes } from "./episodes.js";
 
-const episodes = [
-  { track: { id: "old", name: "Episode 2" }, description: "A quiet morning", published_at: 100 },
-  { track: { id: "unknown", name: "Episode 10" }, description: "Night sounds", published_at: null },
-  { track: { id: "new", name: "Episode 3" }, description: "CITY walks", published_at: 300 },
-  { track: { id: "same-date", name: "Episode 4" }, description: "City lights", published_at: 300 },
-  { track: { id: "invalid", name: "Episode 11" }, published_at: NaN },
+const index = [
+  ["Épisode 2", 100, false],
+  ["Episode 10", null, true],
+  ["Episode 3", 300, true],
+  ["Episode 4", 300, false],
+  ["Episode 11", NaN, true],
+  ["Episode 2", null, true],
 ];
-const ids = (rows) => rows.map((row) => row.track.id);
-const searchIndex = indexEpisodeSearch(episodes);
 
-test("publication order retains date ties, puts unknown dates last, and never reorders the browse result", () => {
-  expect(ids(orderEpisodes(episodes))).toEqual(["new", "same-date", "old", "unknown", "invalid"]);
-  expect(ids(orderEpisodes(episodes, "oldest"))).toEqual(["old", "new", "same-date", "unknown", "invalid"]);
-  expect(ids(episodes)).toEqual(["old", "unknown", "new", "same-date", "invalid"]);
+test("publication order is stable; unknown dates are last in either direction", () => {
+  expect(orderEpisodes(index)).toEqual([2, 3, 0, 1, 4, 5]);
+  expect(orderEpisodes(index, "oldest")).toEqual([0, 2, 3, 1, 4, 5]);
+  expect(index[0][0]).toBe("Épisode 2");
 });
 
-test("title order compares episode numbers naturally", () => {
-  expect(ids(orderEpisodes(episodes, "title"))).toEqual(["old", "new", "same-date", "unknown", "invalid"]);
+test("title order compares numbers naturally and retains source order for collator ties", () => {
+  expect(orderEpisodes(index, "title")).toEqual([0, 5, 2, 3, 1, 4]);
 });
 
-test("literal case-insensitive search covers titles and descriptions without changing the selected order", () => {
-  const ordered = orderEpisodes(episodes, "oldest");
-  expect(ids(filterEpisodes(ordered, "  city  ", searchIndex))).toEqual(["new", "same-date"]);
-  expect(ids(filterEpisodes(ordered, "EPISODE 10", searchIndex))).toEqual(["unknown"]);
-  expect(filterEpisodes(ordered, "   ", searchIndex)).toBe(ordered);
-  expect(filterEpisodes(ordered, "[city]", searchIndex)).toEqual([]);
+function fixture() {
+  const requests = [];
+  let view;
+  const owner = createEpisodeWindow((positions) => {
+    const request = Promise.withResolvers();
+    requests.push({ ...request, positions });
+    return request.promise;
+  }, (next) => { view = next; });
+  const arrive = async (i, cached = false) => {
+    const { positions, resolve } = requests[i];
+    resolve({ episodes: positions.map((position) => ({ track: { id: String(position), cached } })) });
+    await Promise.resolve();
+  };
+  return { owner, requests, arrive, view: () => view };
+}
+
+test("scrolling retains overlapping rows and requests only missing positions from the latest window", async () => {
+  const { owner, requests, arrive, view } = fixture();
+  owner.show([9, 1, 7]);
+  await arrive(0);
+  const retained = view().rows.get(7);
+  owner.show([7, 1, 3]);
+  owner.show([7, 3, 5]);
+  owner.show([7, 3, 6]);
+  expect(view().rows.get(7)).toBe(retained);
+  expect(requests.map((r) => r.positions)).toEqual([[9, 1, 7], [3]]);
+  await arrive(1);
+  expect(requests[2].positions).toEqual([6]);
+  await arrive(2);
+  expect([...view().rows.keys()]).toEqual([7, 3, 6]);
+  expect(view().rows.get(7)).toBe(retained);
 });
 
-test("search finds episodes outside the rendered window and handles missing text", () => {
-  const complete = Array.from({ length: 400 }, (_, index) => ({
-    track: { id: String(index), name: `Episode ${index}` }, published_at: index,
-    description: index === 399 ? "A hidden needle in the archive" : undefined,
-  }));
-  expect(ids(filterEpisodes(orderEpisodes(complete, "oldest"), "NEEDLE", indexEpisodeSearch(complete)))).toEqual(["399"]);
-  const missing = [{ track: { id: "missing" } }];
-  expect(filterEpisodes(missing, "needle", indexEpisodeSearch(missing))).toEqual([]);
-  expect(filterEpisodes([], "needle", indexEpisodeSearch([]))).toEqual([]);
+test("live cache marks survive late rows, evictions and cache resets", async () => {
+  const { owner, arrive, view } = fixture();
+  owner.show([0, 2]);
+  owner.mark(new Set(["2"]), true);
+  await arrive(0);
+  expect(view().rows.get(2).track.cached).toBe(true);
+  owner.mark(null, false);
+  expect(view().rows.get(2).track.cached).toBe(false);
+  owner.show([80]);
+  owner.mark(new Set(["0", "80"]), true);
+  owner.mark(new Set(["0"]), false);
+  await arrive(1);
+  expect(view().rows.get(80).track.cached).toBe(true);
+  owner.show([0, 2]);
+  await arrive(2, true);
+  expect([...view().rows.values()].map((e) => e.track.cached)).toEqual([false, false]);
 });
 
-test("replacing browse data updates normalized search rather than retaining previous episode text", () => {
-  const changed = [{ ...episodes[0], track: { id: "old", name: "A new title" }, description: "Changed description" }];
-  const index = indexEpisodeSearch(changed);
-  expect(ids(filterEpisodes(changed, "new title", index))).toEqual(["old"]);
-  expect(filterEpisodes(changed, "quiet morning", index)).toEqual([]);
+test("a stale failure does not poison the new viewport; retry keeps successful overlap", async () => {
+  const { owner, requests, arrive, view } = fixture();
+  owner.show([0]);
+  await arrive(0);
+  const retained = view().rows.get(0);
+  owner.show([0, 1]);
+  owner.show([0, 2]);
+  requests[1].reject(new Error("old viewport"));
+  await Promise.resolve();
+  expect(view().error).toBe("");
+  requests[2].reject(new Error("offline"));
+  await Promise.resolve();
+  expect(view().error).toContain("offline");
+  owner.retry();
+  expect(view().rows.get(0)).toBe(retained);
+  expect(requests[3].positions).toEqual([2]);
+  await arrive(3);
+  expect(view().error).toBe("");
+});
+
+test("a response after the view is disposed cannot publish or launch another fetch", async () => {
+  const { owner, requests, arrive, view } = fixture();
+  owner.show([0, 1]);
+  owner.show([2, 3]);
+  const last = view();
+  owner.dispose();
+  await arrive(0);
+  expect(view()).toBe(last);
+  expect(view().rows.size).toBe(0);
+  expect(requests).toHaveLength(1);
 });

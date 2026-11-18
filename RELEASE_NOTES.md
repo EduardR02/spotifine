@@ -1,3 +1,11 @@
+## Playback and browsing performance
+
+- On AVX2-equipped PCs, stereo playback at 48 kHz uses less CPU. The 44.1→48 kHz filter produces the same samples with the same look-ahead, including at seeks, loops and gapless track boundaries.
+- Uncached track waveforms take less CPU to generate. The peak data and the drawing are unchanged.
+- The glass submits its shaders together on first use. Artwork, frost and edge lighting render as before.
+- A podcast’s header opens before its episode catalogue finishes loading. Only rows near the viewport are transferred in full; search and playback still cover the entire selected order.
+- Playing another row in the same playlist no longer resends an unchanged queue. Sorting, editing or changing output cannot reuse the wrong queue.
+
 ## Lighter glass
 
 - The glass is cheap to run: its edge light is drawn once per song, scrolling runs on the GPU, and a song change only touches what it changes.

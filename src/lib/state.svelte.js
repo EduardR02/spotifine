@@ -354,6 +354,7 @@ export function isPlayingSource(context) {
 let playingRequestGeneration = 0;
 let playingAuthorityGeneration = 0;
 let seekRequestGeneration = 0;
+let queueEditGeneration = 0;
 let seekAuthorityGeneration = 0;
 let volumeRequestGeneration = 0;
 let volumeAuthorityGeneration = 0;
@@ -433,6 +434,48 @@ function contextTracks(tracks, context) {
   const rows = tracks ?? [];
   if (!rows.some((track) => track?.context && track.context !== source)) return rows;
   return rows.map((track) => contextTrack(track, source));
+}
+
+/** A playlist page's immutable, sorted row projection. A new snapshot or
+    order gets a new instance; a Find filter only remaps the clicked index.
+    The native receipt belongs to this instance, not to the playlist ID. */
+export class PlaylistRowQueue {
+  #held = $state.raw(null);
+
+  constructor(rows, context) {
+    this.rows = rows;
+    this.context = context;
+    this.epoch = sessionEpoch();
+  }
+
+  get installed() {
+    return this.#held !== null && this.epoch === sessionEpoch() &&
+      this.#held.session === dataReadGeneration && this.#held.output === playback.output_device_id &&
+      this.#held.queue_revision === playback.queue_revision;
+  }
+
+  async play(index) {
+    if (this.epoch !== sessionEpoch() || !this.rows[index]) return false;
+    const choice = beginPlayback();
+    const session = dataReadGeneration;
+    const output = playback.output_device_id;
+    const edits = queueEditGeneration, playing = playingRequestGeneration, seek = seekRequestGeneration;
+    const ownsChoice = () => choice === lazyQueue.generation && this.epoch === sessionEpoch() &&
+      session === dataReadGeneration && output === playback.output_device_id;
+    const send = (selection) => invoke("play_playlist_row", { selection, index, context: this.context });
+    let answer;
+    // The state event may lag the install reply. Only the engine decides
+    // whether its issued receipt still names this installation and revision.
+    if (this.#held && this.#held.session === session && this.#held.output === output) {
+      answer = await send({ reuse: this.#held.receipt });
+      if (!answer && (!ownsChoice() || edits !== queueEditGeneration ||
+        playing !== playingRequestGeneration || seek !== seekRequestGeneration)) return false;
+    }
+    if (!answer) answer = await send({ rows: contextTracks(this.rows, this.context) });
+    if (!answer?.receipt) throw new Error("Playlist playback did not acknowledge its queue.");
+    if (ownsChoice()) this.#held = { ...answer, session, output };
+    return true;
+  }
 }
 
 function contextForQueueSource(source) {
@@ -575,7 +618,7 @@ export function maybeBackfillLazyQueue() {
 
 /** `authPending` covers the invoke that binds the OAuth callback port; the
     Log in buttons disable on it so one click cannot become two flows. */
-export const session = $state({ username: null, error: null, authPending: false });
+export const session = $state({ username: null, error: null, authPending: false, accountEpoch: 0 });
 
 /* ---------------- Presentation mode ----------------
    A run started with SPOTIFINE_PRESENTATION, for recording the app against a
@@ -1375,7 +1418,7 @@ function observeSearchSession(payload) {
       !!previous.username &&
       username !== previous.username;
     if (actualLogout || accountTransition) {
-      searchSessionEpoch += 1;
+      session.accountEpoch = ++searchSessionEpoch;
       playbackIdentityGeneration += 1;
       resetSearchForSession();
       resetPersonalizedDiscoveryForSession();
@@ -2904,10 +2947,12 @@ export const api = {
     return invoke("play_queue_index", { index });
   },
   addQueue: (track, context = "") => {
+    queueEditGeneration++;
     const source = String(context ?? "").trim();
     return invoke("add_queue", { track: contextTrack(track, source), context: source });
   },
   addQueueBatch: (tracks, context = "") => {
+    queueEditGeneration++;
     const source = String(context ?? "").trim();
     return invoke("add_queue_batch", {
       tracks: contextTracks(tracks, source),
@@ -2917,8 +2962,8 @@ export const api = {
   /* Edits of the queue, not choices of what plays: a catalogue queue's tail
      only ever appends, so removing or moving a row leaves its source and
      cursor, and a start or a skip still on its way, as they were. */
-  removeQueue: (index) => invoke("remove_queue", { index }),
-  moveQueue: (from, to) => invoke("move_queue", { from, to }),
+  removeQueue: (index) => { queueEditGeneration++; return invoke("remove_queue", { index }); },
+  moveQueue: (from, to) => { queueEditGeneration++; return invoke("move_queue", { from, to }); },
   /**
    * One window of the listening archive. The filter and the order travel with
    * the request because the engine holds the archive and the view holds only
@@ -3024,7 +3069,16 @@ export const api = {
     if (wrote) canvasLookups.forget();
     return wrote;
   }),
-  browseShow: (id) => cacheMarkedRead("browse_show", { id }),
+  // Route cleanup owns this handle, even when the header arrives late.
+  browseShow: (id) => invoke("browse_show", { id }),
+  showEpisodeIndex: (rid) => sessionInvoke("show_episode_index", { rid }),
+  showEpisodeRows: (rid, indices) => cacheMarkedRead("show_episode_rows", { rid, indices }),
+  searchShowEpisodes: (rid, query) => sessionInvoke("search_show_episodes", { rid, query }),
+  closeShow: (rid) => invoke("close_show", { rid }),
+  playShowEpisodes: (rid, indices, index) => {
+    beginPlayback();
+    return invoke("play_show_episodes", { rid, indices, index });
+  },
   browseEpisode: (id) => cacheMarkedRead("browse_episode", { id }),
   browseProfile: (username) => sessionInvoke("browse_profile", { username }),
   /**

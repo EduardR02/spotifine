@@ -511,15 +511,20 @@ export function createGlHaze() {
       gl.attachShader(p, fs);
       gl.linkProgram(p);
       gl.deleteShader(fs);
+      programs[name] = { p, uniforms: {} };
+    }
+    gl.deleteShader(vs);
+
+    // A status query may block until compilation and linking finish. Give the
+    // driver every independent program before asking it for the first result.
+    for (const [name, { p, uniforms }] of Object.entries(programs)) {
       if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(`haze ${name}: ${gl.getProgramInfoLog(p)}`);
-      const uniforms = {};
-      for (let i = 0; i < gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); i++) {
+      const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+      for (let i = 0; i < count; i++) {
         const info = gl.getActiveUniform(p, i);
         uniforms[info.name] = { loc: gl.getUniformLocation(p, info.name), type: info.type };
       }
-      programs[name] = { p, uniforms };
     }
-    gl.deleteShader(vs);
     fbo = gl.createFramebuffer();
   }
 
@@ -527,7 +532,6 @@ export function createGlHaze() {
     const s = gl.createShader(type);
     gl.shaderSource(s, source);
     gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(`haze shader: ${gl.getShaderInfoLog(s)}`);
     return s;
   }
 

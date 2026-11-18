@@ -477,6 +477,11 @@ async fn run(
                                     browse::show_browse(&session, &id).await
                                 });
                             }
+                            Command::BrowseShowEpisodes { id, episode_ids } => {
+                                spawn_browse(&engine, request_id, "browse_show_episodes", move |session| async move {
+                                    browse::show_episodes(&session, &id, &episode_ids).await
+                                });
+                            }
                             Command::BrowseProfile { username, known_playlists } => {
                                 spawn_browse(&engine, request_id, "browse_profile", move |session| async move {
                                     browse::user_profile_browse(&session, &username, &known_playlists).await
@@ -616,8 +621,14 @@ async fn run(
                                 });
                             }
                             command => {
+                                let playlist_row = matches!(command, Command::PlayPlaylistRow { .. });
                                 let result = engine.process_command(command, &auth_sender).await;
-                                engine.send_response(&request_id, &result)?;
+                                if playlist_row {
+                                    let reply = result.as_ref().map(|&changed| engine.playlist_row_reply(changed)).map_err(Clone::clone);
+                                    engine.writer().send_browse(&request_id, "play_playlist_row", &reply)?;
+                                } else {
+                                    engine.send_response(&request_id, &result)?;
+                                }
                                 if matches!(result, Ok(true)) {
                                     engine.emit_state()?;
                                 }

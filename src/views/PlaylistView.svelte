@@ -22,6 +22,7 @@
     api,
     playback,
     isPlayingSource,
+    PlaylistRowQueue,
     navigate,
     route,
     promotePlaylist,
@@ -241,6 +242,29 @@
   });
   const shownTracks = $derived(found ? found.rows : sortedTracks);
   const shownTrackKeys = $derived(found ? found.keys : sortedTrackKeys);
+  const playlistId = $derived(pl?.id);
+  const playlistRevision = $derived(pl?.snapshot_id);
+  const rowQueue = $derived.by(() => {
+    // A new server revision can share a cached rows array; a metadata-only
+    // refresh with unchanged rows/revision should not revoke the receipt.
+    playlistRevision;
+    return new PlaylistRowQueue(sortedTracks, `playlist:${playlistId ?? ""}`);
+  });
+  const playingRow = $derived.by(() => {
+    if (!isPlayingSource(rowQueue.context)) return -1;
+    let at = playback.current_index;
+    if (!rowQueue.installed) {
+      // Without proof of the projection (e.g. after a local reorder), a URI
+      // alone can identify a unique song, never a particular duplicate.
+      at = -1;
+      for (let i = 0; i < sortedTracks.length; i++) {
+        if (sortedTracks[i].uri !== playback.current_uri) continue;
+        if (at !== -1) return -1;
+        at = i;
+      }
+    }
+    return found ? found.at.indexOf(at) : at;
+  });
 
   /**
    * Ascending, then descending, then off.
@@ -695,8 +719,11 @@
     const sourceId = pl?.id;
     const epoch = sessionEpoch();
     // Navigation cannot retarget a successful play; an account change fences it.
-    return api.playQueue(queue, index, `playlist:${sourceId ?? ""}`, options).then(() => {
-      if (!sourceId || epoch !== sessionEpoch()) return;
+    const command = options?.automaticStart
+      ? api.playQueue(queue, index, `playlist:${sourceId ?? ""}`, options)
+      : rowQueue.play(index);
+    return command.then((played) => {
+      if (played === false || !sourceId || epoch !== sessionEpoch()) return;
       promotePlaylist(sourceId, { played: true });
       api.touchPlaylist(sourceId).catch(() => {});
     });
@@ -1073,7 +1100,7 @@
         <TrackList
           tracks={shownTracks}
           trackKeys={shownTrackKeys}
-          queueOrder={!found}
+          projectedCurrent={playingRow}
           {playFrom}
           playlistId={editable ? pl.id : null}
           queueContext={`playlist:${pl?.id ?? ""}`}

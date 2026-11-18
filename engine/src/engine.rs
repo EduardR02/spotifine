@@ -23,7 +23,7 @@ use crate::history::ListeningHistory;
 use crate::spotify_listening::LoadId;
 use crate::io::ProtocolWriter;
 use renderer_engine::protocol::{
-    AuthState, Command, LoopRange, PositionEvent,
+    AuthState, Command, LoopRange, PlaylistRowReply, PlaylistRows, PositionEvent, QueueReceipt,
     RepeatMode, Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
     TrackRef, VolumeEvent,
 };
@@ -234,6 +234,10 @@ pub struct Engine {
     /// writer that forgets it leaves both rendering rows the engine no longer
     /// has.
     rows_revision: u64,
+    /// The only projection that can restart these rows without supplying them.
+    /// Bound to its source and output; edit definitions and session changes
+    /// revoke it too, because a fresh install would resolve those again.
+    playlist_install: Option<(QueueReceipt, String, String)>,
     /// The generation [`Engine::emit_state`] last published rows under. `None`
     /// until the first state of this process (and after `status`, which asks
     /// for everything again).
@@ -628,6 +632,7 @@ impl Engine {
             session: None,
             play_request_id: None,
             rows_revision: initial_revision(),
+            playlist_install: None,
             emitted_rows_revision: None,
             order_revision: initial_revision(),
             emitted_order_revision: None,
@@ -757,11 +762,13 @@ impl Engine {
         cuts: Vec<TimeRange>,
         loop_range: Option<LoopRange>,
     ) -> Result<TrackEditDefinition, String> {
+        self.playlist_install = None;
         self.track_edits
             .save_definition(track_id, duration_ms, cuts, loop_range)
     }
 
     pub fn delete_track_edit(&mut self, track_id: &str) -> Result<(), String> {
+        self.playlist_install = None;
         self.track_edits.delete_definition(track_id)
     }
 
@@ -771,6 +778,7 @@ impl Engine {
         track_id: &str,
         enabled: bool,
     ) -> Result<(), String> {
+        self.playlist_install = None;
         self.track_edits.set_enabled(playlist_id, track_id, enabled)
     }
     pub fn playlist_excluded_track_ids(&self, playlist_id: &str) -> Result<Vec<String>, String> {
@@ -814,6 +822,7 @@ impl Engine {
     /// move. The play order indexes the rows, so it moves with them.
     fn rows_changed(&mut self) {
         self.rows_revision = self.rows_revision.wrapping_add(1);
+        self.playlist_install = None;
         self.order_changed();
     }
 
@@ -1299,7 +1308,7 @@ impl Engine {
     fn runs_during_reconnect(&self, command: &Command) -> bool {
         (self.auth_running || self.awaiting_transport_retry)
             && matches!(command, Command::Play | Command::Pause
-                | Command::PlayQueue { .. } | Command::PlayQueueIndex { .. }
+                | Command::PlayQueue { .. } | Command::PlayPlaylistRow { .. } | Command::PlayQueueIndex { .. }
                 | Command::RestoreQueue { .. } | Command::SetQueueCursor { .. })
     }
 
@@ -1476,7 +1485,7 @@ impl Engine {
     fn runs_without_output_device(&self, command: &Command) -> bool {
         self.state.ready
             && self.audio_unavailable.is_some()
-            && matches!(
+            && (matches!(command, Command::PlayPlaylistRow { output, .. } if !output.is_empty()) || matches!(
                 command,
                 Command::Play
                     | Command::Pause
@@ -1487,7 +1496,7 @@ impl Engine {
                     | Command::SetPlaybackSpeeds { .. }
                     | Command::RestoreQueue { .. }
                     | Command::SetQueueCursor { .. }
-            )
+            ))
     }
 
     /// Clears the last error, unless the machine has no output device: nothing
@@ -1570,6 +1579,7 @@ impl Engine {
     /// task spawn so the two teardown modes remain an explicit state
     /// transition and can be tested without connecting to Spotify.
     fn begin_cached_authentication(&mut self, preserve_active_playback: bool) -> u64 {
+        self.playlist_install = None;
         self.cancel_cache_evictions();
         if !preserve_active_playback {
             self.finalize_listening(false);
@@ -1772,6 +1782,7 @@ impl Engine {
                         // live: a machine with no output device can browse,
                         // search and edit playlists, and the player is the only
                         // thing it cannot have yet.
+                        self.playlist_install = None;
                         self.session = Some(connected.session);
                         self.spotify_listening.set_session(self.session.as_ref().expect("installed session").clone());
                         self.next_reconnect = None;
@@ -2151,6 +2162,12 @@ impl Engine {
                 return Ok(false);
             }
         }
+        if let Command::PlayPlaylistRow { selection: PlaylistRows::Reuse(receipt), context, output, .. } = &command {
+            if !self.playlist_install.as_ref().is_some_and(|(held, source, device)|
+                held == receipt && receipt.revision == self.rows_revision && source == context && device == output) {
+                return Ok(false); // a cache miss is not a failed playback attempt
+            }
+        }
         // A machine with no output device, or a session being rebuilt, can
         // still be *told* what to do: see [`Engine::runs_without_output_device`]
         // and [`Engine::runs_during_reconnect`]. Everything else needs a player
@@ -2164,14 +2181,14 @@ impl Engine {
         // its decryption key; the key service rate-limits bursts and
         // playback dies). Only PlayQueue/Next/Previous are paced; other
         // commands may wait a tick — no press is dropped.
-        if matches!(
+        if (matches!(&command, Command::PlayPlaylistRow { output, .. } if output.is_empty()) || matches!(
             &command,
             Command::PlayQueue { .. }
                 | Command::PreviewTrackEdit { .. }
                 | Command::PlayQueueIndex { .. }
                 | Command::Next
                 | Command::Previous
-        ) && self.state.ready {
+        )) && self.state.ready {
             self.pace_track_change().await;
         }
         match command {
@@ -2196,6 +2213,7 @@ impl Engine {
             | Command::BrowseTrack { .. }
             | Command::BrowseEpisode { .. }
             | Command::BrowseShow { .. }
+            | Command::BrowseShowEpisodes { .. }
             | Command::BrowseProfile { .. }
             | Command::BrowseAlbum { .. }
             | Command::BrowseArtist { .. }
@@ -2227,6 +2245,27 @@ impl Engine {
             | Command::EditAddPlaylistTracks { .. }
             | Command::EditRemovePlaylistTracks { .. }
             | Command::EditReorderPlaylistTracks { .. } => unreachable!(),
+            Command::PlayPlaylistRow { selection, index, context, output } => {
+                let queue = match selection {
+                    PlaylistRows::Rows(mut rows) => {
+                        fill_queue_context(&mut rows, &context);
+                        self.resolve_queue_edits(&mut rows);
+                        Some(rows)
+                    }
+                    PlaylistRows::Reuse(_) => None,
+                };
+                let installing = queue.is_some();
+                let changed = if output.is_empty() {
+                    self.play_resolved_queue(queue, index, 0, PositionSpace::Transport, false, 0, false, true)?
+                } else {
+                    self.restore_resolved_queue(queue, index, 0, false, false)?
+                };
+                if installing {
+                    let receipt = QueueReceipt { install: uuid::Uuid::new_v4().to_string(), revision: self.rows_revision };
+                    self.playlist_install = Some((receipt, context, output));
+                }
+                Ok(changed)
+            }
             Command::PlayQueue {
                 queue,
                 index,
@@ -2293,6 +2332,10 @@ impl Engine {
             Command::RemoveQueue { index } => self.remove_queue(index),
             Command::MoveQueue { from, to } => self.move_queue(from, to),
         }
+    }
+
+    pub fn playlist_row_reply(&self, changed: bool) -> PlaylistRowReply<&QueueReceipt> {
+        PlaylistRowReply { receipt: self.playlist_install.as_ref().filter(|_| changed).map(|install| &install.0) }
     }
 
     pub fn send_response(
@@ -2984,7 +3027,7 @@ impl Engine {
         Ok(())
     }
 
-    fn install_empty_or_unavailable_queue(&mut self, queue: Vec<TrackRef>) -> Result<bool, String> {
+    fn install_empty_or_unavailable_queue(&mut self, queue: Option<Vec<TrackRef>>) -> Result<bool, String> {
         self.finalize_listening(false);
         crate::audio::pause_output();
         if let Some(player) = &self.player {
@@ -2993,8 +3036,8 @@ impl Engine {
             self.player()?;
         }
         self.invalidate_audio_signals();
-        self.state.queue = queue;
-        self.rows_changed();
+        if queue.is_none() { self.order_changed(); }
+        self.install_rows(queue);
         self.state.current_index = None;
         self.state.position_ms = 0;
         self.state.duration_ms = 0;
@@ -3035,7 +3078,7 @@ impl Engine {
         fill_queue_context(&mut queue, &context);
         self.resolve_queue_edits(&mut queue);
         self.play_resolved_queue(
-            queue,
+            Some(queue),
             index,
             position_ms,
             PositionSpace::Transport,
@@ -3065,7 +3108,7 @@ impl Engine {
         }
         let track = with_preview_edit(track, cuts, loop_range)?;
         self.play_resolved_queue(
-            vec![track],
+            Some(vec![track]),
             0,
             position_ms,
             PositionSpace::Source,
@@ -3076,16 +3119,23 @@ impl Engine {
         )
     }
 
+    /// None restarts the already validated, revision-checked rows in place.
+    fn install_rows(&mut self, queue: Option<Vec<TrackRef>>) {
+        if let Some(rows) = queue {
+            self.state.queue = rows;
+            self.rows_changed();
+        }
+    }
+
     /// Automatic shuffle starts draw their current row from the same filtered
     /// Fisher–Yates bag as the rest of playback, rather than fixing it first.
     fn install_queue_start(
         &mut self,
-        queue: Vec<TrackRef>,
+        queue: Option<Vec<TrackRef>>,
         current: Option<usize>,
         automatic_start: bool,
     ) -> Option<usize> {
-        self.state.queue = queue;
-        self.rows_changed();
+        self.install_rows(queue);
         let draw_first = automatic_start && self.state.shuffle;
         self.state.current_index = if draw_first { None } else { current };
         self.rebuild_shuffle_pool();
@@ -3100,7 +3150,7 @@ impl Engine {
     /// persisted edit store.
     fn play_resolved_queue(
         &mut self,
-        queue: Vec<TrackRef>,
+        queue: Option<Vec<TrackRef>>,
         index: usize,
         position_ms: u32,
         position_space: PositionSpace,
@@ -3109,11 +3159,11 @@ impl Engine {
         automatic_start: bool,
         start_playing: bool,
     ) -> Result<bool, String> {
-        Self::validate_queue(&queue, index)?;
+        let rows = self.checked_rows(&queue, index)?;
         let candidate = if automatic_start {
-            first_automatic_wrapping(&queue, index, &self.track_edits)
+            first_automatic_wrapping(rows, index, &self.track_edits)
         } else {
-            first_available_from(&queue, index)
+            first_available_from(rows, index)
         };
         let Some(playable_index) = candidate else {
             // Do not tear down an installed preview queue when a replacement
@@ -3163,6 +3213,17 @@ impl Engine {
         Ok(true)
     }
 
+    fn checked_rows<'a>(&'a self, rows: &'a Option<Vec<TrackRef>>, index: usize) -> Result<&'a [TrackRef], String> {
+        if let Some(rows) = rows {
+            Self::validate_queue(rows, index)?;
+            Ok(rows)
+        } else if index < self.state.queue.len() {
+            Ok(&self.state.queue)
+        } else {
+            Err(format!("queue index {index} is out of range"))
+        }
+    }
+
     /// Installs a validated queue and frozen playhead without touching the
     /// audio loader. This is the only startup path: there is no paused load
     /// whose decoder/output setup could produce an audible blip.
@@ -3194,23 +3255,32 @@ impl Engine {
         // queue install re-resolves against the store; this one must too, or a
         // restart replays an edit the store no longer holds.
         self.resolve_queue_edits(&mut queue);
+        self.restore_resolved_queue(Some(queue), index, position_ms, resume_playing, automatic_start)
+    }
+
+    fn restore_resolved_queue(
+        &mut self,
+        queue: Option<Vec<TrackRef>>,
+        index: usize,
+        position_ms: u32,
+        resume_playing: bool,
+        automatic_start: bool,
+    ) -> Result<bool, String> {
         // Validate every input before stopping the current player or changing
         // any engine-owned queue/playhead state. A malformed stale snapshot
         // therefore cannot damage a live preview either.
-        Self::validate_queue(&queue, index)?;
+        let rows = self.checked_rows(&queue, index)?;
+        let playable_index = if automatic_start {
+            first_automatic_wrapping(rows, index, &self.track_edits)
+        } else {
+            first_available_wrapping(rows, index)
+        };
 
         self.leave_preview_mode();
         if let Some(player) = &self.player {
             player.stop();
         }
         self.invalidate_audio_signals();
-        let playable_index = if queue.is_empty() {
-            None
-        } else if automatic_start {
-            first_automatic_wrapping(&queue, index, &self.track_edits)
-        } else {
-            first_available_wrapping(&queue, index)
-        };
         let playable_index = self.install_queue_start(queue, playable_index, automatic_start);
         self.state.duration_ms = playable_index
             .map(|current| self.state.queue[current].duration_ms)
@@ -6140,6 +6210,63 @@ mod tests {
         engine.player = Some(player);
         engine.session = Some(session);
         (engine, probe)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn playlist_row_receipt_restarts_exact_occurrences_without_reinstalling_rows() {
+        use renderer_engine::protocol::PlaylistRows;
+        let (mut engine, _probe) = engine_with_player();
+        engine.track_edits = TrackEditStore::in_memory();
+        engine.state.shuffle = true;
+        let (auth, _) = mpsc::unbounded_channel();
+        let cmd = |selection, index, context: &str, output: &str| Command::PlayPlaylistRow {
+            selection, index, context: context.into(), output: output.into(),
+        };
+        let source = "playlist:p";
+        let mut rows = two_track_state().queue;
+        rows.push(rows[0].clone());
+        rows[2].name = "second occurrence".into();
+        assert_eq!(engine.process_command(cmd(PlaylistRows::Rows(rows), 0, source, ""), &auth).await, Ok(true));
+        let receipt = engine.playlist_row_reply(true).receipt.unwrap().clone();
+        let rows_ptr = engine.state.queue.as_ptr();
+        engine.history.push(1);
+        engine.shuffle_pool.clear();
+        for (context, output) in [("playlist:other", ""), (source, "phone")] {
+            assert_eq!(engine.process_command(cmd(PlaylistRows::Reuse(receipt.clone()), 2, context, output), &auth).await, Ok(false));
+            assert_eq!(engine.state.current_index, Some(0));
+            assert_eq!(engine.history, [1]);
+        }
+        let (mut respawn, _) = test_engine();
+        respawn.rows_revision = receipt.revision;
+        assert_eq!(respawn.process_command(cmd(PlaylistRows::Reuse(receipt.clone()), 2, source, ""), &auth).await, Ok(false));
+        assert_eq!(engine.process_command(cmd(PlaylistRows::Reuse(receipt.clone()), 2, source, ""), &auth).await, Ok(true));
+        assert_eq!(engine.state.current_index, Some(2));
+        assert_eq!(engine.state.queue[2].name, "second occurrence");
+        assert!(engine.state.playing && engine.history.is_empty());
+        engine.shuffle_pool.sort_unstable();
+        assert_eq!(engine.shuffle_pool, [0, 1]);
+        assert_eq!(engine.state.queue.as_ptr(), rows_ptr);
+        assert_eq!(engine.rows_revision, receipt.revision);
+
+        // New edit definitions must be resolved on the next full install, even
+        // though the frozen queue and its published rows revision did not move.
+        engine.delete_track_edit("0123456789ABCDEFGHIJKL").unwrap();
+        assert_eq!(engine.process_command(cmd(PlaylistRows::Reuse(receipt.clone()), 1, source, ""), &auth).await, Ok(false));
+        let rows = engine.state.queue.clone();
+        assert_eq!(engine.process_command(cmd(PlaylistRows::Rows(rows), 1, source, ""), &auth).await, Ok(true));
+        let replacement = engine.playlist_row_reply(true).receipt.unwrap().clone();
+        assert_ne!(receipt.install, replacement.install);
+        engine.move_queue(0, 1).unwrap();
+        let at = engine.state.current_index;
+        assert_eq!(engine.process_command(cmd(PlaylistRows::Reuse(replacement), 0, source, ""), &auth).await, Ok(false));
+        assert_eq!(engine.state.current_index, at);
+        let rows = engine.state.queue.clone();
+        assert_eq!(engine.process_command(cmd(PlaylistRows::Rows(rows), 1, source, ""), &auth).await, Ok(true));
+        let same_account = engine.playlist_row_reply(true).receipt.unwrap().clone();
+        engine.begin_cached_authentication(false);
+        assert_eq!(engine.rows_revision, same_account.revision);
+        assert_eq!(engine.process_command(cmd(PlaylistRows::Reuse(same_account), 0, source, ""), &auth).await, Ok(false));
+        engine.shutdown();
     }
 
     /// A start the user paused before it landed installs and loads its row in

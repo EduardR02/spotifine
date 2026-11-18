@@ -32,6 +32,10 @@
 //!   rather than managed.
 //! - **No downstream resampling.** The native callback receives device-rate
 //!   samples and only converts representation and channel layout.
+//!
+//! On AVX2 x86-64, 44.1 → 48 kHz stereo evaluates independent output samples
+//! in parallel. This changes neither the tap reduction order nor the streaming
+//! window: any output that doesn't fit a batch is emitted individually.
 
 use std::f64::consts::PI;
 
@@ -73,8 +77,7 @@ const MAX_PHASES: usize = 4096;
 
 /// Streaming resampler for one fixed rate pair.
 pub struct Resampler {
-    /// Polyphase bank, `table_phases * TAPS` coefficients, oldest tap first.
-    phases: Vec<f32>,
+    bank: FilterBank,
     /// Phases actually stored: `min(phase_count, MAX_PHASES)`.
     table_phases: usize,
     /// Input frames advanced per output frame, as `step` over `phase_count`.
@@ -88,6 +91,13 @@ pub struct Resampler {
     cursor: usize,
     /// Fractional part of that position, over `phase_count`.
     phase: usize,
+}
+
+enum FilterBank {
+    /// `table_phases * TAPS` coefficients, oldest tap first.
+    Scalar(Vec<f32>),
+    #[cfg(target_arch = "x86_64")]
+    Stereo48k(&'static stereo_48k::Bank),
 }
 
 impl Resampler {
@@ -112,8 +122,19 @@ impl Resampler {
         // buys.
         let cutoff = 0.5 * f64::from(input_rate.min(output_rate)) / f64::from(input_rate);
 
+        #[cfg(target_arch = "x86_64")]
+        let bank = if (input_rate, output_rate, channels) == (44_100, 48_000, 2)
+            && is_x86_feature_detected!("avx2")
+        {
+            FilterBank::Stereo48k(&stereo_48k::BANK)
+        } else {
+            FilterBank::Scalar(build_bank(table_phases, cutoff))
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let bank = FilterBank::Scalar(build_bank(table_phases, cutoff));
+
         let mut resampler = Resampler {
-            phases: build_bank(table_phases, cutoff),
+            bank,
             table_phases,
             step,
             phase_count,
@@ -151,6 +172,24 @@ impl Resampler {
         out.reserve(self.output_capacity(input.len()));
         self.history.extend_from_slice(input);
 
+        self.emit_available(out);
+
+        // Everything before the current left context is spent.
+        let spent = self.cursor - CENTER;
+        self.history.drain(..spent * self.channels);
+        self.cursor = CENTER;
+    }
+
+    fn emit_available(&mut self, out: &mut Vec<f32>) {
+        let phases = match &self.bank {
+            FilterBank::Scalar(phases) => phases,
+            #[cfg(target_arch = "x86_64")]
+            FilterBank::Stereo48k(bank) => {
+                // SAFETY: new only selects this bank for AVX2 stereo, step 147/160.
+                unsafe { bank.emit(&self.history, &mut self.cursor, &mut self.phase, out) };
+                return;
+            }
+        };
         let frames = self.history.len() / self.channels;
         while self.cursor + TAPS - CENTER <= frames {
             let base = (self.cursor - CENTER) * self.channels;
@@ -160,7 +199,7 @@ impl Resampler {
             } else {
                 self.phase * self.table_phases / self.phase_count
             };
-            let coefficients = &self.phases[index * TAPS..(index + 1) * TAPS];
+            let coefficients = &phases[index * TAPS..(index + 1) * TAPS];
 
             for channel in 0..self.channels {
                 let mut sum = 0.0f32;
@@ -174,11 +213,6 @@ impl Resampler {
             self.cursor += advanced / self.phase_count;
             self.phase = advanced % self.phase_count;
         }
-
-        // Everything before the current left context is spent.
-        let spent = self.cursor - CENTER;
-        self.history.drain(..spent * self.channels);
-        self.cursor = CENTER;
     }
 
     /// Emit the remaining input frames using silence as EOF look-ahead.
@@ -269,6 +303,147 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+#[cfg(target_arch = "x86_64")]
+mod stereo_48k {
+    use std::{arch::x86_64::*, sync::LazyLock};
+
+    use super::{CENTER, TAPS};
+
+    const STEP: usize = 147;
+    const PHASES: usize = 160;
+    const BATCH: usize = 16;
+
+    pub(super) struct Bank {
+        pub(super) phases: Vec<f32>,
+        tiles: Box<[Tile]>,
+    }
+
+    pub(super) static BANK: LazyLock<Bank> = LazyLock::new(|| {
+        let phases = super::build_bank(PHASES, 0.5); // exact cutoff for upsampling
+        // A batch advances the phase by a multiple of 16. Only ten starting
+        // phases need tiles, shared across streams (~82 KiB altogether).
+        let tiles = (0..PHASES).step_by(BATCH).map(|p| Tile::new(p, &phases)).collect();
+        Bank { phases, tiles }
+    });
+
+    // Each of four vectors covers four consecutive stereo outputs. Their
+    // source positions usually advance by one, but may repeat once in those
+    // four frames. Shift the coefficients for the lagging lanes by one tap:
+    // the inner loop can then read consecutive samples without any gathers.
+    #[repr(C, align(32))]
+    struct Tile {
+        coeff: [[[f32; 8]; 4]; TAPS + 1],
+        offset: [usize; 4],
+        lag_mask: [[i32; 8]; 4],
+    }
+
+    impl Tile {
+        fn new(phase: usize, phases: &[f32]) -> Self {
+            let mut tile = Self {
+                coeff: [[[0.0; 8]; 4]; TAPS + 1],
+                offset: [0; 4],
+                lag_mask: [[0; 8]; 4],
+            };
+            for group in 0..4 {
+                let start = phase + group * 4 * STEP;
+                let base = start / PHASES;
+                tile.offset[group] = base * 2;
+                for frame in 0..4 {
+                    let position = start + frame * STEP;
+                    let lag = base + frame - position / PHASES;
+                    debug_assert!(lag <= 1);
+                    let lanes = frame * 2..frame * 2 + 2;
+                    tile.lag_mask[group][lanes.clone()].fill(-(lag as i32));
+                    let index = position % PHASES * TAPS;
+                    for (tap, &coefficient) in phases[index..index + TAPS].iter().enumerate() {
+                        tile.coeff[tap + 1 - lag][group][lanes.clone()].fill(coefficient);
+                    }
+                }
+            }
+            tile
+        }
+    }
+
+    impl Bank {
+        #[target_feature(enable = "avx2")]
+        pub(super) unsafe fn emit(
+            &self,
+            history: &[f32],
+            cursor: &mut usize,
+            phase: &mut usize,
+            out: &mut Vec<f32>,
+        ) {
+            let frames = history.len() / 2;
+            while *cursor + TAPS - CENTER <= frames {
+                let base = *cursor - CENTER;
+                let advance = if *phase % BATCH == 0 && frames - base >= TAPS + BATCH - 1 {
+                    let tile = &self.tiles[*phase / BATCH];
+                    out.reserve(BATCH * 2); // finish() may supply padding via history, not input
+                    // SAFETY: there are TAPS + BATCH - 1 complete stereo frames.
+                    // Group g starts at most 4*g frames later (STEP < PHASES),
+                    // so even the widest load at tap TAPS-1 stays in history.
+                    // reserve() guarantees room for exactly four 8-float stores.
+                    unsafe {
+                        tile.write(history.as_ptr().add(base * 2), out.as_mut_ptr().add(out.len()));
+                        out.set_len(out.len() + BATCH * 2);
+                    }
+                    STEP * BATCH
+                } else {
+                    // Unaligned prefix and short suffix, including startup and EOF.
+                    // Never save a ready frame for a future SIMD batch.
+                    let window = &history[base * 2..(base + TAPS) * 2];
+                    let index = *phase * TAPS;
+                    let mut pair = [0.0; 2];
+                    for (sample, &c) in window.chunks_exact(2).zip(&self.phases[index..index + TAPS]) {
+                        pair[0] += sample[0] * c;
+                        pair[1] += sample[1] * c;
+                    }
+                    out.extend_from_slice(&pair);
+                    STEP
+                };
+                let advanced = *phase + advance;
+                *cursor += advanced / PHASES;
+                *phase = advanced % PHASES;
+            }
+        }
+    }
+
+    impl Tile {
+        #[target_feature(enable = "avx2")]
+        unsafe fn write(&self, src: *const f32, dst: *mut f32) {
+            let mut sum = [_mm256_setzero_ps(); 4];
+            let mut lag = [_mm256_setzero_ps(); 4];
+            let previous = _mm256_setr_epi32(0, 1, 0, 1, 2, 3, 4, 5);
+            // SAFETY: emit checked the input and output spans. Each coefficient
+            // vector is 32-byte aligned; sample loads/stores may be unaligned.
+            unsafe {
+                for group in 0..4 {
+                    lag[group] = _mm256_castsi256_ps(_mm256_loadu_si256(self.lag_mask[group].as_ptr().cast()));
+                    let x = _mm256_permutevar8x32_ps(_mm256_loadu_ps(src.add(self.offset[group])), previous);
+                    let c = _mm256_load_ps(self.coeff[0][group].as_ptr());
+                    // Only lagging lanes start here; others start the loop at +0.
+                    sum[group] = _mm256_and_ps(lag[group], _mm256_add_ps(sum[group], _mm256_mul_ps(x, c)));
+                }
+                for tap in 0..TAPS - 1 {
+                    for (group, acc) in sum.iter_mut().enumerate() {
+                        let x = _mm256_loadu_ps(src.add(self.offset[group] + tap * 2));
+                        let c = _mm256_load_ps(self.coeff[tap + 1][group].as_ptr());
+                        *acc = _mm256_add_ps(*acc, _mm256_mul_ps(x, c));
+                    }
+                }
+                for group in 0..4 {
+                    let x = _mm256_loadu_ps(src.add(self.offset[group] + (TAPS - 1) * 2));
+                    let c = _mm256_load_ps(self.coeff[TAPS][group].as_ptr());
+                    let last = _mm256_add_ps(sum[group], _mm256_mul_ps(x, c));
+                    // Lagging lanes already accumulated their last tap. Every
+                    // retained lane did 64 separate multiply/adds, oldest first.
+                    _mm256_storeu_ps(dst.add(group * 8), _mm256_blendv_ps(last, sum[group], lag[group]));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +451,158 @@ mod tests {
     const IN_RATE: u32 = 44_100;
     const OUT_RATE: u32 = 48_000;
     const CHANNELS: u16 = 2;
+
+    /// Keep the original, general convolution as a separately selected oracle.
+    fn scalar_48k() -> Resampler {
+        let mut r = Resampler::new(IN_RATE, OUT_RATE, CHANNELS).unwrap();
+        r.bank = FilterBank::Scalar(build_bank(160, 0.5));
+        r
+    }
+
+    fn stereo_noise(frames: usize) -> Vec<f32> {
+        let mut seed = 527_946_763u32;
+        (0..frames * 2).map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as i32 as f32) / i32::MAX as f32
+        }).collect()
+    }
+
+    fn assert_bits(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (n, (a, b)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "different bits at sample {n}: {a} != {b}");
+        }
+    }
+
+    fn assert_state(actual: &Resampler, expected: &Resampler) {
+        assert_eq!((actual.cursor, actual.phase), (expected.cursor, expected.phase));
+        assert_bits(&actual.history, &expected.history);
+    }
+
+    fn compare_stream(
+        actual: &mut Resampler, scalar: &mut Resampler, input: &[f32], packets: &[usize], eof: bool,
+    ) {
+        // Nonempty destinations exercise append semantics, including the SIMD stores.
+        let (mut output, mut reference) = (vec![19.75], vec![19.75]);
+        let mut frame = 0;
+        for &packet in packets.iter().cycle() {
+            let next = (frame + packet).min(input.len() / 2);
+            let samples = &input[frame * 2..next * 2];
+            let before = output.len();
+            actual.process(samples, &mut output);
+            scalar.process(samples, &mut reference);
+            // floor(p * 147 / 160) + 32 must be strictly less than the input
+            // received. Check that deadline after *each* call, not just at EOF.
+            let ready = next.saturating_sub(32);
+            assert_eq!(output.len(), 1 + 2 * (ready * 160).div_ceil(147), "at input frame {next}");
+            assert_bits(&output[before..], &reference[before..]);
+            assert_state(actual, scalar);
+            frame = next;
+            if frame == input.len() / 2 {
+                break;
+            }
+        }
+        if eof {
+            for _ in 0..2 {
+                let before = output.len();
+                actual.finish(&mut output);
+                scalar.finish(&mut reference);
+                assert_eq!(output.len(), 1 + 2 * (frame * 160).div_ceil(147));
+                assert_bits(&output[before..], &reference[before..]);
+                assert_state(actual, scalar);
+            }
+        } else {
+            actual.reset(); // seek with nonzero phase and live history
+            scalar.reset();
+            assert_state(actual, scalar);
+        }
+        assert_eq!(output[0], 19.75);
+    }
+
+    #[test]
+    fn stereo_dispatch_preserves_bits_and_every_frame_deadline() {
+        let mut actual = Resampler::new(IN_RATE, OUT_RATE, CHANNELS).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(matches!(actual.bank, FilterBank::Stereo48k(_)), is_x86_feature_detected!("avx2"));
+        let mut scalar = scalar_48k();
+        let noise = stereo_noise(4_097);
+        let mut impulses = vec![0.0; noise.len()];
+        for boundary in [1, 16, 32, 33, 47, 64, 147, 160, 1024, 4096] {
+            for n in [boundary - 1, boundary] {
+                impulses[n * 2 + n % 2] = if n % 2 == 0 { 1.0 } else { -0.5 };
+            }
+        }
+        for schedule in [&[1][..], &[0, 1, 31, 0, 2, 15, 16, 17, 160, 409], &[1024], &[4097]] {
+            compare_stream(&mut actual, &mut scalar, &noise, schedule, false);
+            compare_stream(&mut actual, &mut scalar, &impulses, schedule, true);
+            compare_stream(&mut actual, &mut scalar, &noise, schedule, true);
+        }
+        for frames in [0, 1, 31, 32, 33, 34, 46, 47, 48, 49, 64, 147, 160] {
+            compare_stream(&mut actual, &mut scalar, &noise[..frames * 2], &[0, 17], true);
+        }
+    }
+
+    #[test]
+    fn other_rates_and_channel_layouts_keep_the_general_filter() {
+        for (input, output, channels) in [(44_100, 48_000, 1), (44_100, 48_000, 6),
+            (48_000, 44_100, 2), (44_100, 96_000, 2), (88_200, 96_000, 2)] {
+            assert!(matches!(Resampler::new(input, output, channels).unwrap().bank, FilterBank::Scalar(_)));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "release-only throughput measurement"]
+    fn benchmark_stereo_packets() {
+        use std::{hint::black_box, time::Instant};
+
+        assert!(!cfg!(debug_assertions), "run with --release");
+        assert!(is_x86_feature_detected!("avx2"), "requires AVX2 for the comparison");
+        let source = stereo_noise(16_384);
+        for packet in [1, 16, 1024] {
+            let measure = |r: &mut Resampler| {
+                let mut out = Vec::new();
+                let samples = packet * 2;
+                r.process(&source[..samples], &mut out); // warm production buffers
+                r.reset();
+                let iterations = 32 * IN_RATE as usize / packet;
+                let mut emitted = 0;
+                let start = Instant::now();
+                for n in 0..iterations {
+                    let offset = n % (source.len() / samples) * samples;
+                    out.clear();
+                    r.process(black_box(&source[offset..offset + samples]), &mut out);
+                    emitted += out.len();
+                    black_box(out.as_slice());
+                }
+                out.clear();
+                r.finish(&mut out);
+                emitted += out.len();
+                black_box(out.as_slice());
+                let elapsed = start.elapsed();
+                assert_eq!(emitted, 2 * (iterations * packet * 160).div_ceil(147));
+                elapsed.as_secs_f64() * 1000.0 * f64::from(OUT_RATE) * 2.0 / emitted as f64
+            };
+            let mut actual = Resampler::new(IN_RATE, OUT_RATE, CHANNELS).unwrap();
+            let mut scalar = scalar_48k();
+            let (mut baseline, mut dispatched) = ([0.0; 11], [0.0; 11]);
+            for n in 0..baseline.len() {
+                if n % 2 == 0 {
+                    baseline[n] = measure(&mut scalar);
+                    dispatched[n] = measure(&mut actual);
+                } else {
+                    dispatched[n] = measure(&mut actual);
+                    baseline[n] = measure(&mut scalar);
+                }
+            }
+            baseline.sort_by(f64::total_cmp);
+            dispatched.sort_by(f64::total_cmp);
+            let (old, new) = (baseline[5], dispatched[5]);
+            eprintln!("{packet:4} frames/packet: scalar {old:.3}, dispatched {new:.3} ms/output-second ({:.2}x)", old / new);
+        }
+    }
 
     #[test]
     fn eof_flush_emits_every_remaining_frame_once_and_resets_history() {
@@ -400,8 +727,13 @@ mod tests {
     #[test]
     fn every_phase_has_unity_gain() {
         let resampler = Resampler::new(IN_RATE, OUT_RATE, CHANNELS).expect("rates differ");
+        let phases = match &resampler.bank {
+            FilterBank::Scalar(phases) => phases,
+            #[cfg(target_arch = "x86_64")]
+            FilterBank::Stereo48k(bank) => &bank.phases,
+        };
         for phase in 0..resampler.table_phases {
-            let sum: f32 = resampler.phases[phase * TAPS..(phase + 1) * TAPS]
+            let sum: f32 = phases[phase * TAPS..(phase + 1) * TAPS]
                 .iter()
                 .sum();
             assert!(

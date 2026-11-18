@@ -621,6 +621,64 @@ export async function playlistInteractionRegressions() {
     navigate("library");
     await settle();
     results.push("Known local exact-duplicate reorder preserves focus; fresh ambiguous duplicates invalidate focus");
+    // Drive the real row, Find and sort handlers, intercepting only playback
+    // IPC so this component test never changes the harness player's queue.
+    const receiptPlaylist = `ui-row-receipt-${crypto.randomUUID()}`;
+    detail.playlist = playlist(receiptPlaylist, localRows);
+    component = mount(PlaylistView, { target: host });
+    await frames();
+    host.querySelector(".tl").scrollIntoView({ block: "start" });
+    await frames();
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    const requests = [];
+    let installedRows, receipt;
+    window.__TAURI_INTERNALS__.invoke = async (name, args) => {
+      if (name !== "play_playlist_row") return invoke(name, args);
+      requests.push(args);
+      if (args.selection.rows) {
+        installedRows = args.selection.rows;
+        receipt = { install: `install-${requests.length}`, revision: 8000 + requests.length };
+      } else if (args.selection.reuse.install !== receipt?.install) return null;
+      applyPlayback({ queue: installedRows, queue_revision: receipt.revision, current_index: args.index,
+        current_uri: installedRows[args.index].uri, context: args.context, playing: true });
+      return { receipt, queue_revision: receipt.revision };
+    };
+    const playRow = async (i) => {
+      // A just-finished drag deliberately suppresses row dblclick, but the
+      // explicit Play button is independent of the release gesture.
+      host.querySelector(`.tl-row[data-i="${i}"] .go`).click();
+      await settle();
+    };
+    try {
+      await playRow(0);
+      const initial = requests[0];
+      check(initial?.index === 0 && initial.context === `playlist:${receiptPlaylist}` &&
+        initial.selection.rows?.map(t => t.name).join("|") === localRows.map(t => t.name).join("|"),
+        "first row installs all displayed occurrences in order");
+      host.querySelector('[title="Find in this playlist"]').click();
+      await settle();
+      const find = host.querySelector(".track-find input");
+      find.value = "A2";
+      find.dispatchEvent(new Event("input", { bubbles: true }));
+      await settle();
+      await playRow(0);
+      check(requests[1]?.selection.reuse && requests[1].index === 1 && playback.current_index === 1,
+        "finding the other duplicate plays its whole-list occurrence, not the active song's toggle");
+      host.querySelector('[aria-label="Clear and close"]').click();
+      await settle();
+      host.querySelector(".tl-head .tl-sort-btn").click();
+      await settle();
+      await playRow(2);
+      check(requests[2]?.selection.rows?.[2]?.name === localRows[0].name && requests[2].index === 2,
+        "reversing exact duplicates installs that reversed projection");
+      await playRow(1);
+      check(requests[3]?.selection.reuse && requests[3].index === 1, "repeat in the sorted projection omits the rows");
+      results.push("Playlist queue receipts across filtered duplicates and a changed sort");
+    } finally {
+      window.__TAURI_INTERNALS__.invoke = invoke;
+      await dropComponent();
+      applyPlayback({ ...accountState.playback, queue_revision: 0, order_revision: 0 });
+    }
     detail.playlist = playlist("ui-skip-source", rows.slice(0, 4));
     const skips = [];
     api.setPlaylistTrackExcluded = (id, trackId, excluded) => new Promise((resolve, reject) => skips.push({ id, trackId, excluded, resolve, reject }));

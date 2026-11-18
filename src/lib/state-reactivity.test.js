@@ -359,6 +359,78 @@ async function withDeferredCommands(run) {
   }
 }
 
+test("playlist row receipts reuse only the acknowledged projection, with exact duplicate indices", async () => {
+  await withDeferredCommands(async (pending) => {
+    const rows = [row("dup"), row("middle"), row("dup", { added_at: 123 })];
+    const source = "playlist:p";
+    const list = new state.PlaylistRowQueue(rows, source);
+    const ack = (install, revision) => ({ receipt: { install, revision }, queue_revision: revision });
+    const first = list.play(2);
+    expect(pending[0].args).toEqual({ selection: { rows }, index: 2, context: source });
+    pending[0].resolve(ack("first", 17));
+    await first;
+    // Repeat before the first state event arrives: only the native authority
+    // can confirm the receipt is still valid. No row scan or rows on the wire.
+    Object.defineProperty(rows, "some", { value() { throw new Error("scanned an acknowledged projection"); }, configurable: true });
+    const second = list.play(0);
+    expect(pending[1].args).toEqual({ selection: { reuse: ack("first", 17).receipt }, index: 0, context: source });
+    pending[1].resolve(ack("first", 17));
+    await second;
+    delete rows.some;
+    state.applyPlayback({ queue: rows, queue_revision: 17 });
+    expect(list.installed).toBe(true);
+
+    const sortedRows = [rows[2], rows[1], rows[0]];
+    const sorted = new state.PlaylistRowQueue(sortedRows, source);
+    const reordered = sorted.play(0);
+    expect(pending[2].args.selection.rows).toBe(sortedRows);
+    pending[2].resolve(ack("sorted", 18));
+    await reordered;
+    // Queue edited natively while the client still shows 17.
+    const stale = sorted.play(2);
+    pending[3].resolve(null);
+    await settle();
+    expect(pending[4].args).toEqual({ selection: { rows: sortedRows }, index: 2, context: source });
+    pending[4].resolve(ack("replacement", 20));
+    expect(await stale).toBe(true);
+    state.applyPlayback({ queue: sortedRows, queue_revision: 20 });
+    expect(sorted.installed).toBe(true);
+    expect(list.installed).toBe(false);
+  });
+});
+
+test("stale playlist row replies cannot resend across another choice, an edit, or an account transition", async () => {
+  await withDeferredCommands(async (pending) => {
+    const rows = [row("one"), row("two")];
+    const list = new state.PlaylistRowQueue(rows, "playlist:p");
+    const ack = (install) => ({ receipt: { install, revision: 9 }, queue_revision: 9 });
+    const older = list.play(0);
+    const newer = list.play(1);
+    pending[1].resolve(ack("new"));
+    await newer;
+    pending[0].resolve(ack("old"));
+    await older;
+    for (const action of [() => state.api.playQueueIndex(1), () => state.api.removeQueue(0)]) {
+      const start = pending.length;
+      const stale = list.play(0);
+      expect(pending[start].args.selection).toEqual({ reuse: ack("new").receipt });
+      const mutation = action();
+      pending[start + 1].resolve(null);
+      await mutation;
+      pending[start].resolve(null);
+      expect(await stale).toBe(false);
+      expect(pending).toHaveLength(start + 2);
+    }
+    const stale = list.play(0);
+    const request = pending.at(-1);
+    state.applySession({ auth_state: "ready", username: "other-account" });
+    request.resolve(null);
+    expect(await stale).toBe(false);
+    expect(await list.play(1)).toBe(false);
+    expect(pending.at(-1)).toBe(request);
+  });
+});
+
 test("a delayed catalogue shuffle reply cannot issue a play over a newer playlist", async () => {
   await withDeferredCommands(async (pending) => {
     state.playback.shuffle = true;

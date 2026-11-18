@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use renderer_engine::protocol::MAX_REQUEST_BYTES;
+use renderer_engine::protocol::{MAX_REQUEST_BYTES, PlaylistRowReply, PlaylistRows, QueueReceipt};
 use serde::de::value::{CowStrDeserializer, MapAccessDeserializer};
 use serde::de::{DeserializeSeed, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -202,7 +202,7 @@ trait CachedClaims {
 
 struct PendingRequest {
     sender: oneshot::Sender<EngineReply>,
-    cache_generation: u64,
+    cache_generation: Option<u64>,
     account_generation: u64,
     resets_cache_marks: bool,
 }
@@ -834,9 +834,7 @@ mod claims {
     impl CachedClaims for EpisodeRef {
         fn claims(&mut self, visit: Visit) { visit(&mut self.track) }
     }
-    impl CachedClaims for ShowBrowse {
-        fn claims(&mut self, visit: Visit) { self.episodes.claims(visit) }
-    }
+    impl CachedClaims for ShowBrowse {}
     impl CachedClaims for PlaylistBrowse {
         fn claims(&mut self, visit: Visit) { self.tracks.claims(visit) }
     }
@@ -894,6 +892,7 @@ mod claims {
     impl CachedClaims for PlaylistRef {}
     impl CachedClaims for PlaylistMembership {}
     impl CachedClaims for QueueMetadata {}
+    impl CachedClaims for PlaylistRowReply {}
     impl CachedClaims for LikedUrisPage {}
     impl CachedClaims for TrackCredits {}
     impl CachedClaims for Canvas {}
@@ -1390,7 +1389,9 @@ impl EngineClient {
             }
             self.pending.lock().insert(request_id.clone(), PendingRequest {
                 sender,
-                cache_generation: self.cache_generation(),
+                // A playlist-row reply contains only a receipt, never a
+                // download claim. Don't copy a cache-invalidation set for it.
+                cache_generation: (kind != "play_playlist_row").then(|| self.cache_generation()),
                 account_generation: self.account_generation.load(Ordering::Acquire),
                 resets_cache_marks: kind == "clear_audio_cache",
             });
@@ -1586,6 +1587,22 @@ impl EngineClient {
             self.clear_preview_restore_pending();
         }
         result
+    }
+
+    pub async fn play_playlist_row(
+        &self, selection: &PlaylistRows<Vec<Track>>, index: usize, context: &str, output: &str,
+    ) -> Result<Option<QueueReceipt>, String> {
+        #[derive(Serialize)]
+        struct Selection<'a> {
+            selection: &'a PlaylistRows<Vec<Track>>,
+            index: usize,
+            context: &'a str,
+            output: &'a str,
+        }
+        let reply = self.request("play_playlist_row", Selection { selection, index, context, output }).await?;
+        let answer: PlaylistRowReply = parse_data(reply, "play_playlist_row")?;
+        if answer.receipt.is_some() { self.clear_preview_restore_pending(); }
+        Ok(answer.receipt)
     }
 
     pub async fn preview_track_edit(
@@ -1886,6 +1903,13 @@ impl EngineClient {
     ) -> Result<renderer_engine::protocol::ShowBrowse, String> {
         let reply = self.request("browse_show", json!({"id": id})).await?;
         parse_data(reply, "browse_show")
+    }
+
+    pub async fn browse_show_episodes(
+        &self, id: &str, episode_ids: &[String],
+    ) -> Result<Vec<renderer_engine::protocol::EpisodeRef>, String> {
+        let reply = self.request("browse_show_episodes", json!({ "id": id, "episode_ids": episode_ids })).await?;
+        parse_data(reply, "browse_show_episodes")
     }
 
     pub async fn browse_episode(
@@ -2664,8 +2688,8 @@ impl EngineClient {
             }
             // Judged now, applied by the typed parse: the claims are read
             // there, once, instead of rewritten here in a parsed tree.
-            if reply.data.is_some() {
-                reply.fence.stale = request.cache_generation != self.cache_generation();
+            if let Some(generation) = request.cache_generation.filter(|_| reply.data.is_some()) {
+                reply.fence.stale = generation != self.cache_generation();
                 let base = self.delta_base.lock();
                 if !reply.fence.stale && !base.invalidated_ids.is_empty() {
                     reply.fence.invalidated.clone_from(&base.invalidated_ids);
@@ -3133,7 +3157,7 @@ fn request_line(request_id: &str, kind: &str, args: impl Serialize) -> Result<St
 fn oversized_request_error(kind: &str, bytes: usize) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     let what = match kind {
-        "play_queue" | "restore_queue" => "This queue is",
+        "play_queue" | "play_playlist_row" | "restore_queue" => "This queue is",
         "add_queue_batch" => "These tracks are",
         _ => "This request is",
     };
@@ -5376,6 +5400,42 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         for dropped in [r#"{"type":"state","queue":7}"#, r#"{"type":"volume","volume":300}"#,
             r#"{"type":"position"}"#, "not json", "[1,2]", "\"text\"", r#"{"type":"state"} trailing"#] {
             assert_eq!(parse_line(dropped), None, "{dropped}");
+        }
+    }
+
+    #[tokio::test]
+    async fn playlist_row_wire_installs_the_projection_and_can_decline_the_compact_restart() {
+        let client = client_with_last_state(PlaybackState::default());
+        let (sender, input) = mpsc::sync_channel(1);
+        *client.stdin.lock() = Some(EngineInput { generation: 1, sender });
+        let receipt = QueueReceipt { install: "one".into(), revision: 23 };
+        let rows = vec![Track { id: "dup".into(), name: "first".into(), ..Track::default() },
+            Track { id: "dup".into(), name: "second".into(), ..Track::default() }];
+        for selection in [PlaylistRows::Rows(rows), PlaylistRows::Reuse(receipt.clone())] {
+            let sending = client.play_playlist_row(&selection, 1, "playlist:p", "");
+            tokio::pin!(sending);
+            assert!(futures_poll_once(sending.as_mut()).await.is_none());
+            let line = input.try_recv().unwrap();
+            let request: renderer_engine::protocol::Request = serde_json::from_str(&line.line).unwrap();
+            let renderer_engine::protocol::Command::PlayPlaylistRow { selection, index, context, output } = request.command
+                else { panic!("expected playlist row command") };
+            assert_eq!((index, context.as_str(), output.as_str()), (1, "playlist:p", ""));
+            let answer = match selection {
+                PlaylistRows::Rows(rows) => {
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(rows[index].name, "second");
+                    Some(receipt.clone())
+                }
+                PlaylistRows::Reuse(proof) => {
+                    assert_eq!(proof, receipt);
+                    assert!(!line.line.contains("\"rows\""));
+                    None
+                }
+            };
+            line.written.send(Ok(())).unwrap();
+            client.deliver(&request.request_id, EngineReply { ok: true, data: Some(test_data(json!({ "receipt": answer }))),
+                ..EngineReply::default() });
+            assert_eq!(sending.await.unwrap(), answer);
         }
     }
 

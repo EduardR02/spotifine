@@ -48,6 +48,10 @@ export const READ_COMMANDS = new Set([
   // Engine: the collection service's saved podcasts, read-only.
   "browse_saved_shows",
   "browse_show",
+  "show_episode_index",
+  "show_episode_rows",
+  "search_show_episodes",
+  "close_show", // the bridge can release only a show it opened itself
   "browse_episode",
   "browse_profile",
   // Native-bound personal reads only, never prewarmed. Contains answers only

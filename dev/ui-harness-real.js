@@ -179,10 +179,28 @@ export async function createRealMode(h) {
     throw new Error(answer.source === "live" ? answer.error : `${cmd} is unavailable from the live app or its cache: ${answer.error || "no real data"}. Start the native app; no fixture data is used in real mode.`);
   }
 
+  const showIds = new Map();
   async function invoke(cmd, args = {}) {
     switch (cmd) {
+      case "browse_show": {
+        const header = await forward(cmd, args);
+        showIds.set(header.rid, header.id);
+        return header;
+      }
+      case "close_show":
+        showIds.delete(args.rid);
+        return forward(cmd, args);
+      case "play_show_episodes": {
+        // Only metadata is read from the native app. Playback stays local.
+        const { episodes } = await forward("show_episode_rows", { rid: args.rid, indices: args.indices });
+        return invoke("play_queue", { queue: episodes.map(e => e.track), index: args.index,
+          context: `show:${showIds.get(args.rid)}` });
+      }
       case "get_state":
         return { playback: h.snapshot(), playlists: clone(library), playlist_tree: clone(tree), settings: clone(settings), me_id: meId };
+      case "play_playlist_row":
+        return h.playPlaylistRow(args, (rows, context) =>
+          rows.map((track) => ({ ...clone(track), context: track.context || context })));
       case "play_queue": {
         playback.queue = Array.isArray(args.queue)
           ? args.queue.map((track) => ({ ...clone(track), context: track.context || args.context || "" }))

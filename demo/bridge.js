@@ -182,8 +182,10 @@ function emitState() {
   schedule();
 }
 
+let playlistInstall = null;
 function queueChanged() {
   engine.queueRevision += 1;
+  playlistInstall = null;
 }
 
 /* The track's end, and the gapless fetch-ahead thirty seconds before it,
@@ -237,6 +239,21 @@ function skip(step) {
     else load((engine.index + 1) % engine.queue.length);
   }
   engine.playing = true;
+}
+
+function startQueue(index, automaticStart) {
+  let start = Number(index) || 0;
+  if (engine.shuffle) {
+    engine.index = start;
+    reshuffle();
+  }
+  if (automaticStart) {
+    if (engine.shuffle) start = engine.bag.find(eligible) ?? start;
+    else start = engine.queue.findIndex((_, i) => i >= start && eligible(i));
+  }
+  engine.playing = !!engine.queue[start];
+  if (engine.playing) load(start);
+  emitState();
 }
 
 /* ---- Commands ------------------------------------------------------- */
@@ -329,24 +346,20 @@ const commands = {
   play_queue: ({ queue, index, context, automaticStart }) => {
     engine.queue = (queue ?? []).map((row) => ({ ...row, context: row.context || context || "" }));
     queueChanged();
-    if (engine.shuffle) {
-      engine.index = Number(index) || 0;
-      reshuffle();
-    }
-    let start = Number(index) || 0;
-    if (automaticStart) {
-      if (engine.shuffle) start = engine.bag.find(eligible) ?? start;
-      else start = engine.queue.findIndex((_, i) => i >= start && eligible(i));
-    }
-    if (start < 0 || !engine.queue[start]) {
-      engine.playing = false;
-      emitState();
-      return null;
-    }
-    load(start);
-    engine.playing = true;
-    emitState();
+    startQueue(index, automaticStart);
     return null;
+  },
+  play_playlist_row: ({ selection, index, context }) => {
+    if (selection.reuse) {
+      if (!playlistInstall || playlistInstall.context !== context ||
+        selection.reuse.install !== playlistInstall.receipt.install ||
+        selection.reuse.revision !== engine.queueRevision) return null;
+      startQueue(index, false);
+    } else {
+      commands.play_queue({ queue: selection.rows, index, context });
+      playlistInstall = { context, receipt: { install: crypto.randomUUID(), revision: engine.queueRevision } };
+    }
+    return { receipt: playlistInstall.receipt, queue_revision: engine.queueRevision };
   },
   play_queue_index: ({ index }) => {
     if (!engine.queue[index]) return null;

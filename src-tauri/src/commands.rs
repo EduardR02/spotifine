@@ -146,6 +146,14 @@ pub async fn play_queue(
 }
 
 #[tauri::command]
+pub async fn play_playlist_row(
+    app: AppHandle, router: State<'_, Arc<PlaybackRouter>>,
+    selection: renderer_engine::protocol::PlaylistRows<Vec<Track>>, index: usize, context: String,
+) -> Result<Option<crate::playback_router::PlayedPlaylistRow>, String> {
+    router.play_playlist_row(&app, selection, index, context).await
+}
+
+#[tauri::command]
 pub async fn preview_track_edit(
     app: AppHandle,
     router: State<'_, Arc<PlaybackRouter>>,
@@ -489,9 +497,117 @@ pub async fn browse_liked_songs(
     ))
 }
 
+/// One immutable browse result, owned by the webview that opened the show.
+/// Row numbers only have meaning within this resource, never across accounts
+/// or reopens. The renderer owns its locale-sensitive ordering, not the rows.
+struct OpenShow {
+    id: String,
+    generation: u64,
+    episode_ids: Vec<String>,
+    rows: tokio::sync::OnceCell<Vec<EpisodeDetail>>,
+    search: std::sync::OnceLock<Vec<(String, String)>>,
+}
+
+impl tauri::Resource for OpenShow {}
+
+fn open_show(webview: &tauri::Webview, rid: u32) -> Result<Arc<OpenShow>, String> {
+    let page = webview.resources_table().get::<OpenShow>(rid).map_err(|e| e.to_string())?;
+    webview.state::<Mutex<AppState>>().lock().check_account_generation(page.generation)?;
+    Ok(page)
+}
+
+impl OpenShow {
+    fn ready(&self) -> Result<&[EpisodeDetail], String> {
+        self.rows.get().map(Vec::as_slice).ok_or_else(|| "Episode index is not ready".to_owned())
+    }
+
+    fn row(&self, at: usize) -> Result<&EpisodeDetail, String> {
+        self.ready()?.get(at).ok_or_else(|| "Episode no longer exists in this show".to_owned())
+    }
+
+    fn matching(&self, query: &str) -> Result<Vec<usize>, String> {
+        let rows = self.ready()?;
+        let index = self.search.get_or_init(|| rows.iter()
+            .map(|e| (e.track.name.to_lowercase(), e.description.to_lowercase())).collect());
+        Ok(index.iter().enumerate().filter_map(|(i, (name, description))|
+            (name.contains(query) || description.contains(query)).then_some(i)).collect())
+    }
+
+    fn queue(&self, indices: Vec<usize>, index: usize) -> Result<PlaybackAction, String> {
+        if index >= indices.len() { return Err("Episode selection is outside the queue".into()); }
+        let queue = indices.into_iter().map(|i| {
+            let track = &self.row(i)?.track;
+            if track.unavailable { return Err("The selected episode is unavailable".to_owned()); }
+            Ok(track.clone())
+        }).collect::<Result<_, _>>()?;
+        Ok(PlaybackAction::Queue(queue, index, format!("show:{}", self.id), false, false))
+    }
+}
+
+// Serialize borrowed rows directly rather than cloning their artwork, title
+// and descriptions to satisfy the command's owned return lifetime.
+fn show_json(value: &impl serde::Serialize) -> Result<tauri::ipc::Response, String> {
+    serde_json::to_string(value).map(tauri::ipc::Response::new).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
-pub async fn browse_show(client: State<'_, Arc<EngineClient>>, id: String) -> Result<ShowDetail, String> {
-    client.browse_show(&id).await.map(ShowDetail::from)
+pub async fn browse_show(webview: tauri::Webview, client: State<'_, Arc<EngineClient>>, id: String) -> Result<ShowDetail, String> {
+    let generation = library_account_generation(webview.app_handle());
+    let header = client.browse_show(&id).await?;
+    webview.state::<Mutex<AppState>>().lock().check_account_generation(generation)?;
+    let episode_count = header.episode_ids.len();
+    let rid = webview.resources_table().add(OpenShow {
+        id, generation, episode_ids: header.episode_ids, rows: Default::default(), search: Default::default(),
+    });
+    Ok(ShowDetail { show: header.show.into(), episode_count, rid })
+}
+
+#[tauri::command]
+pub async fn show_episode_index(webview: tauri::Webview, client: State<'_, Arc<EngineClient>>, rid: u32) -> Result<tauri::ipc::Response, String> {
+    let page = open_show(&webview, rid)?;
+    let rows = page.rows.get_or_try_init(|| async {
+        let mut rows = Vec::with_capacity(page.episode_ids.len());
+        // Each command owns one network batch. Leaving the page stops the
+        // walk before the next batch, rather than running through the archive.
+        for ids in page.episode_ids.chunks(renderer_engine::protocol::METADATA_BATCH_SIZE) {
+            open_show(&webview, rid)?;
+            rows.extend(client.browse_show_episodes(&page.id, ids).await?.into_iter().map(EpisodeDetail::from));
+        }
+        Ok::<_, String>(rows)
+    }).await?;
+    open_show(&webview, rid)?;
+    use serde::Serializer;
+    let mut bytes = Vec::new();
+    serde_json::Serializer::new(&mut bytes)
+        .collect_seq(rows.iter().map(|e| (&e.track.name, e.published_at, !e.track.unavailable)))
+        .map_err(|e| e.to_string())?;
+    let json = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(json))
+}
+
+#[tauri::command]
+pub async fn search_show_episodes(webview: tauri::Webview, rid: u32, query: String) -> Result<Vec<usize>, String> {
+    open_show(&webview, rid)?.matching(&query)
+}
+
+#[tauri::command]
+pub async fn show_episode_rows(webview: tauri::Webview, rid: u32, indices: Vec<usize>) -> Result<tauri::ipc::Response, String> {
+    let page = open_show(&webview, rid)?;
+    #[derive(serde::Serialize)]
+    struct Window<'a> { episodes: Vec<&'a EpisodeDetail> }
+    let episodes = indices.into_iter().map(|i| page.row(i)).collect::<Result<_, _>>()?;
+    show_json(&Window { episodes })
+}
+
+#[tauri::command]
+pub async fn play_show_episodes(webview: tauri::Webview, router: State<'_, Arc<PlaybackRouter>>, rid: u32, indices: Vec<usize>, index: usize) -> Result<(), String> {
+    let action = open_show(&webview, rid)?.queue(indices, index)?;
+    router.run(webview.app_handle(), action).await
+}
+
+#[tauri::command]
+pub async fn close_show(webview: tauri::Webview, rid: u32) -> Result<(), String> {
+    webview.resources_table().take::<OpenShow>(rid).map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2722,6 +2838,28 @@ fn adopt_unchanged_playlist(
 mod tests {
     use super::*;
     use crate::types::PlaybackState;
+
+    #[test]
+    fn podcast_search_and_play_use_source_positions_not_window_offsets() {
+        let mut rows: Vec<_> = (0..150).map(|i| EpisodeDetail {
+            track: Track { id: i.to_string(), unavailable: i == 31, ..Default::default() },
+            ..Default::default()
+        }).collect();
+        rows[5].track.name = "CAFÉ".into();
+        rows[103].description = "A late café conversation".into();
+        let show = OpenShow {
+            id: "test".into(), generation: 1, episode_ids: vec![],
+            rows: tokio::sync::OnceCell::new_with(Some(rows)), search: Default::default(),
+        };
+        assert_eq!(show.matching("café").unwrap(), [5, 103]);
+        let PlaybackAction::Queue(tracks, index, context, false, false) = show.queue(vec![103, 5], 1).unwrap()
+            else { panic!("a click must start the supplied queue") };
+        assert_eq!(tracks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["103", "5"]);
+        assert_eq!((index, context.as_str()), (1, "show:test"));
+        assert!(show.queue(vec![103, 31], 1).is_err());
+        assert!(show.queue(vec![5], 1).is_err());
+        assert!(show.queue(vec![150], 0).is_err());
+    }
 
     struct CacheFixture {
         root: std::path::PathBuf,

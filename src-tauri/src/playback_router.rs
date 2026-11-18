@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use reqwest::Method;
-use renderer_engine::protocol::ConnectDevice;
+use renderer_engine::protocol::{ConnectDevice, PlaylistRows, QueueReceipt};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
@@ -54,6 +54,14 @@ const FOREIGN_QUEUE: &str = "This queue belongs to the Spotify app on that devic
 const MOVED_AWAY: &str = "Spotify playback moved away from the selected device; reselect a device or This computer";
 const RELEASED: &str = "The selected output was released";
 const DEVICES_OFF: &str = "Spotify devices are turned off in Settings";
+
+#[derive(Serialize)]
+pub struct PlayedPlaylistRow {
+    pub receipt: QueueReceipt,
+    /// The revision shown on the selected output. Remote revisions also
+    /// distinguish a device's foreign queue, so aren't engine revisions.
+    pub queue_revision: u64,
+}
 
 pub enum Action {
     Play, Pause, Next, Previous, Seek(u32), Volume(u8), Shuffle(bool), Repeat(String), Speed(f32),
@@ -97,6 +105,8 @@ pub(crate) trait Host: Sync {
     fn exclusions(&self, context: &str) -> impl Future<Output = Result<Vec<String>, String>> + Send;
     fn pause_engine(&self) -> impl Future<Output = Result<(), String>> + Send;
     fn local(&self, action: Action) -> impl Future<Output = Result<(), String>> + Send;
+    fn playlist_row(&self, selection: &PlaylistRows<Vec<Track>>, index: usize, context: &str, output: &str)
+        -> impl Future<Output = Result<Option<QueueReceipt>, String>> + Send;
     fn local_state(&self) -> PlaybackState;
     /// Shows the engine's own state, rows included.
     fn publish_local(&self);
@@ -472,6 +482,12 @@ impl PlaybackRouter {
         self.core.run(&self.host(app), action).await
     }
 
+    pub async fn play_playlist_row(
+        &self, app: &AppHandle, selection: PlaylistRows<Vec<Track>>, index: usize, context: String,
+    ) -> Result<Option<PlayedPlaylistRow>, String> {
+        self.core.play_playlist_row(&self.host(app), &selection, index, &context).await
+    }
+
     /// Re-read the engine's authoritative order after eligibility metadata
     /// changes. A failed Spotify write is reported here and retried from a
     /// stale window; it never makes the saved change look failed.
@@ -832,8 +848,7 @@ impl Core {
         if let Err(error) = self.return_local(host).await { self.report_error(host, &error); }
     }
 
-    async fn run<H: Host>(&self, host: &H, action: Action) -> Result<(), String> {
-        let _operation = self.operation.lock().await;
+    async fn prepare_operation<H: Host>(&self, host: &H) -> Result<(), String> {
         let recovery = self.remote.lock().as_ref()
             .filter(|remote| remote.engine_recovery).map(|remote| remote.recovery_ready);
         if let Some(ready) = recovery {
@@ -844,12 +859,23 @@ impl Core {
                 return Err(error);
             }
         }
+        Ok(())
+    }
+
+    async fn run<H: Host>(&self, host: &H, action: Action) -> Result<(), String> {
+        let _operation = self.operation.lock().await;
+        self.prepare_operation(host).await?;
         let kind = self.remote.lock().as_ref().map(Remote::kind);
         let result = match kind {
             None => host.local(action).await,
             Some(kind) => self.run_remote(host, kind, action).await,
         };
-        if let Err(error) = &result { self.report_error(host, error); }
+        self.finish_operation(host, kind, &result);
+        result
+    }
+
+    fn finish_operation<H: Host, T>(&self, host: &H, kind: Option<Kind>, result: &Result<T, String>) {
+        if let Err(error) = result { self.report_error(host, error); }
         else if kind.is_some() {
             let recovered = self.remote.lock().as_mut().is_some_and(|remote| {
                 let unapplied = remote.start_intent.is_some() || remote.repeat_dirty || remote.pause_dirty
@@ -861,6 +887,50 @@ impl Core {
             if recovered { self.publish_transport(host); }
         }
         if kind.is_some() { self.changed.notify_one(); }
+    }
+
+    async fn play_playlist_row<H: Host>(
+        &self, host: &H, selection: &PlaylistRows<Vec<Track>>, index: usize, context: &str,
+    ) -> Result<Option<PlayedPlaylistRow>, String> {
+        let _operation = self.operation.lock().await;
+        self.prepare_operation(host).await?;
+        let target = {
+            let guard = self.remote.lock();
+            if let Some(remote) = guard.as_ref() {
+                // The phone may now own a different queue even when the paused
+                // engine still holds precisely the rows the last click sent.
+                if let PlaylistRows::Reuse(receipt) = selection {
+                    if remote.kind() == Kind::Foreign || receipt.revision != remote.engine_revision
+                        || !remote.state.queue.get(index).is_some_and(remote_playable) {
+                        return Ok(None);
+                    }
+                }
+                Some((remote.kind(), remote.state.output_device_id.clone()))
+            } else { None }
+        };
+        let result = async {
+            if target.is_some() {
+                if let PlaylistRows::Rows(rows) = selection {
+                    validate_remote_track(rows.get(index).ok_or("queue index is out of range")?)?;
+                }
+            }
+            let output = target.as_ref().map_or("", |(_, id)| id.as_str());
+            let Some(receipt) = host.playlist_row(selection, index, context, output).await? else { return Ok(None); };
+            let queue_revision = if target.is_some() {
+                let view = host.engine(None).await?;
+                if !view.state.as_ref().is_some_and(|state| state.queue_revision == receipt.revision) {
+                    if matches!(selection, PlaylistRows::Reuse(_)) { return Ok(None); }
+                    return Err("The engine queue changed before the Spotify device could start".into());
+                }
+                self.start_installed_queue(host, view, false).await?;
+                self.remote.lock().as_ref().ok_or(RELEASED)?.state.queue_revision
+            } else { receipt.revision };
+            Ok(Some(PlayedPlaylistRow { receipt, queue_revision }))
+        }.await;
+        // A miss did not act on the output, clear an error or wake its watcher.
+        if !matches!(result, Ok(None)) {
+            self.finish_operation(host, target.map(|(kind, _)| kind), &result);
+        }
         result
     }
 
@@ -1124,6 +1194,10 @@ impl Core {
         } else { index };
         validate_remote_track(&queue[index])?;
         let view = host.engine(Some(EngineOp::Restore { queue: &queue, index, position_ms: 0, context: &context, automatic })).await?;
+        self.start_installed_queue(host, view, paused).await
+    }
+
+    async fn start_installed_queue<H: Host>(&self, host: &H, view: EngineView, paused: bool) -> Result<(), String> {
         let current = {
             let mut guard = self.remote.lock();
             let remote = guard.as_mut().ok_or(RELEASED)?;
@@ -1951,6 +2025,10 @@ impl Host for AppHost<'_> {
     async fn pause_engine(&self) -> Result<(), String> { self.client.pause().await }
 
     async fn local(&self, action: Action) -> Result<(), String> { run_local(self.client, action).await }
+    async fn playlist_row(&self, selection: &PlaylistRows<Vec<Track>>, index: usize, context: &str, output: &str)
+        -> Result<Option<QueueReceipt>, String> {
+        self.client.play_playlist_row(selection, index, context, output).await
+    }
 
     fn local_state(&self) -> PlaybackState {
         let managed = self.app.state::<Mutex<AppState>>();
@@ -2119,7 +2197,7 @@ mod tests {
                 current_uri: self.current.map(|row| self.rows[row].uri.clone()).unwrap_or_default(), duration_ms: 100_000, volume: self.volume, ..PlaybackState::default() }
         }
         fn apply(&mut self, op: Option<EngineOp<'_>>) -> EngineView {
-            let Some(op) = op else { return EngineView { state: None, upcoming: self.upcoming() }; };
+            let Some(op) = op else { return EngineView { state: Some(self.state()), upcoming: self.upcoming() }; };
             match op {
                 EngineOp::Cursor { index, position_ms } => {
                     self.ops.push(format!("cursor {index} {position_ms}"));
@@ -2197,6 +2275,19 @@ mod tests {
         async fn exclusions(&self, _context: &str) -> Result<Vec<String>, String> { Ok(self.engine.lock().excluded.iter().cloned().collect()) }
         async fn pause_engine(&self) -> Result<(), String> { self.engine.lock().playing = false; Ok(()) }
         async fn local(&self, _action: Action) -> Result<(), String> { Ok(()) }
+        async fn playlist_row(&self, selection: &PlaylistRows<Vec<Track>>, index: usize, _: &str, output: &str)
+            -> Result<Option<QueueReceipt>, String> {
+            let mut engine = self.engine.lock();
+            match selection {
+                PlaylistRows::Rows(rows) => { engine.rows = rows.clone(); engine.revision += 1; }
+                PlaylistRows::Reuse(receipt) if receipt.revision != engine.revision || receipt.install != output => return Ok(None),
+                PlaylistRows::Reuse(_) => {}
+            }
+            engine.current = Some(index);
+            engine.position_ms = 0;
+            engine.playing = output.is_empty();
+            Ok(Some(QueueReceipt { revision: engine.revision, install: output.into() }))
+        }
         fn local_state(&self) -> PlaybackState { self.engine.lock().state() }
         fn publish_local(&self) { *self.local_shown.lock() += 1; }
         fn emit<S: Serialize + Clone>(&self, event: &str, payload: S) {
@@ -2948,6 +3039,10 @@ mod tests {
             async fn exclusions(&self, context: &str) -> Result<Vec<String>, String> { self.base.exclusions(context).await }
             async fn pause_engine(&self) -> Result<(), String> { self.base.pause_engine().await }
             async fn local(&self, action: Action) -> Result<(), String> { self.base.local(action).await }
+            async fn playlist_row(&self, selection: &PlaylistRows<Vec<Track>>, index: usize, context: &str, output: &str)
+                -> Result<Option<QueueReceipt>, String> {
+                self.base.playlist_row(selection, index, context, output).await
+            }
             fn local_state(&self) -> PlaybackState { self.base.local_state() }
             fn publish_local(&self) { self.base.publish_local(); }
             fn emit<S: Serialize + Clone>(&self, event: &str, payload: S) { self.base.emit(event, payload); }
@@ -3028,6 +3123,22 @@ mod tests {
         assert!(!host.engine.lock().playing);
         assert!(next_read(&core).is_some());
         assert!(host.spotify.lock().writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn playlist_row_restarts_the_remote_window_and_refuses_a_foreign_queue() {
+        let (core, host) = owned(3).await;
+        let rows = PlaylistRows::Rows(vec![track("dup"), track("other"), track("dup")]);
+        let first = core.play_playlist_row(&host, &rows, 0, "playlist:p").await.unwrap().unwrap();
+        let reuse = PlaylistRows::Reuse(first.receipt);
+        let second = core.play_playlist_row(&host, &reuse, 2, "playlist:p").await.unwrap().unwrap();
+        assert_eq!(first.queue_revision, second.queue_revision);
+        assert_eq!(host.engine.lock().current, Some(2));
+        assert!(!host.engine.lock().playing);
+        assert_eq!(core.snapshot().unwrap().current_index, Some(2));
+        remote(&core, |remote| remote.mode = Mode::Foreign);
+        assert!(core.play_playlist_row(&host, &reuse, 1, "playlist:p").await.unwrap().is_none());
+        assert_eq!(host.engine.lock().current, Some(2));
     }
 
     /// The router owns the phone, which plays `t0` of a queue of `rows`.

@@ -88,7 +88,7 @@ test("negative marks reach already kept catalogue and recommendation pages", asy
 
 for (const [name, read, payload, row] of [
   ["catalogue", () => api.browseArtistCatalogue("late"), () => ({ releases: [{ tracks: [track("a")] }] }), (p) => p.releases[0].tracks[0]],
-  ["podcast", () => api.browseShow("late"), () => ({ episodes: [{ track: track("a") }] }), (p) => p.episodes[0].track],
+  ["podcast", () => api.showEpisodeRows(7, [0]), () => ({ episodes: [{ track: track("a") }] }), (p) => p.episodes[0].track],
   ["history", () => api.getHistory(), () => ({ entries: [{ track: track("a") }] }), (p) => p.entries[0].track],
 ]) {
   test(`reset fences a late ${name} response`, async () => {

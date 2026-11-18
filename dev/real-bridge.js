@@ -36,7 +36,7 @@ export const CDP_PORT = Number(process.env.REAL_APP_CDP_PORT) || 9341;
 /** The page Tauri serves the app from: http://tauri.localhost on Windows. */
 const TAURI_PAGE = /^(https?:\/\/tauri\.localhost|tauri:\/\/localhost)/;
 
-const LIVE_TIMEOUT_MS = { get_track_waveform: 120_000 };
+const LIVE_TIMEOUT_MS = { get_track_waveform: 120_000, show_episode_index: 120_000 };
 const DEFAULT_LIVE_TIMEOUT_MS = 30_000;
 /** After a failed connection, answer from storage for this long before
     trying the port again, so a closed app costs one refused connect per
@@ -423,6 +423,48 @@ export function createBridge({ cacheDir, port = CDP_PORT, diskDir = appDataDir()
   const page = new CdpPage(port);
   const cache = new AnswerCache(cacheDir);
   const disk = new AppDisk(diskDir);
+  // A native resource id belongs to one live webview. Never persist it or
+  // forward a caller-supplied id into the owner's resource table.
+  const shows = new Map();
+  let nextShow = 1;
+
+  async function showCommand(cmd, args) {
+    if (cmd === "browse_show") {
+      let snapshot, native, source = "live";
+      try {
+        const answer = await page.invoke(cmd, { id: args.id });
+        if (!answer.ok) return [200, { ...answer, source }];
+        const { rid, ...header } = answer.value;
+        native = rid;
+        snapshot = { header, capture: crypto.randomUUID() };
+        cache.write("show_header", { id: args.id }, snapshot);
+      } catch (error) {
+        snapshot = cache.read("show_header", { id: args.id })?.value;
+        if (!snapshot) return [404, { ok: false, source: "none", error: error.message }];
+        source = "cache";
+      }
+      const rid = nextShow++;
+      shows.set(rid, { id: args.id, native, capture: snapshot.capture });
+      return [200, { ok: true, source, value: { ...snapshot.header, rid } }];
+    }
+    const { rid, ...params } = args;
+    const handle = shows.get(rid);
+    if (!handle) return [404, { ok: false, source: "none", error: "Show is closed" }];
+    if (cmd === "close_show") {
+      shows.delete(rid);
+      if (handle.native != null) await page.invoke(cmd, { rid: handle.native });
+      return [200, { ok: true, source: "local", value: null }];
+    }
+    const key = { ...params, id: handle.id };
+    if (handle.native != null) {
+      const answer = await page.invoke(cmd, { ...params, rid: handle.native });
+      if (answer.ok) cache.write(cmd, key, { capture: handle.capture, value: answer.value });
+      return [200, { ...answer, source: "live" }];
+    }
+    const cached = cache.read(cmd, key)?.value;
+    return cached?.capture === handle.capture ? [200, { ok: true, source: "cache", value: cached.value }]
+      : [404, { ok: false, source: "none", error: "This show window was not captured; open the live app." }];
+  }
 
   function stored(cmd, args) {
     const cached = cache.read(cmd, args);
@@ -438,6 +480,9 @@ export function createBridge({ cacheDir, port = CDP_PORT, diskDir = appDataDir()
   async function invoke({ cmd, args = {}, mode = "live", maxAgeMs = 6 * 3600_000 }) {
     if (typeof cmd !== "string" || !READ_COMMANDS.has(cmd)) {
       return [403, { ok: false, source: "refused", error: `${cmd} is not on the read-only allowlist (dev/real-commands.js)` }];
+    }
+    if (["browse_show", "show_episode_index", "show_episode_rows", "search_show_episodes", "close_show"].includes(cmd)) {
+      return showCommand(cmd, args);
     }
     if (mode === "fill") {
       const cached = cache.read(cmd, args);

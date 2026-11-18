@@ -10,7 +10,7 @@
   import CopyLinkItem from "../components/CopyLinkItem.svelte";
   import Menu from "../components/Menu.svelte";
   import { rowWindow } from "../lib/virtual.js";
-  import { filterEpisodes, orderEpisodes, indexEpisodeSearch } from "../lib/episodes.js";
+  import { createEpisodeWindow, orderEpisodes } from "../lib/episodes.js";
   import { applyCacheMarks } from "../lib/cache-marks.js";
 
   /**
@@ -19,8 +19,8 @@
    * like track rows (the art plays, the title opens, the rest waits for the
    * pointer), rather than a column of filled buttons.
    */
-  let response = $state(null);
-  const data = $derived(response?.kind === route.name && response.id === route.id ? response.value : null);
+  let response = $state.raw(null);
+  const data = $derived(response?.kind === route.name && response.id === route.id && response.epoch === session.accountEpoch ? response.value : null);
   const isShow = $derived(route.name === "show");
   const record = $derived(isShow ? data : data?.track);
   let error = $state("");
@@ -43,13 +43,47 @@
   ];
   let sortOpen = $state(false);
   let sortButton = $state(null);
-  // browseShow eagerly resolves the show's metadata-listed episodes. Only the
-  // DOM is windowed below; search, ordering and playback use the whole result.
-  const allEpisodes = $derived(isShow ? data?.episodes ?? [] : []);
-  const episodeSearch = $derived(indexEpisodeSearch(allEpisodes));
-  const orderedEpisodes = $derived(orderEpisodes(allEpisodes, sort));
-  const episodes = $derived(filterEpisodes(orderedEpisodes, query, episodeSearch));
-  const filtering = $derived(query.trim().length > 0);
+  const rid = $derived(isShow ? data?.rid : null);
+  let episodeIndex = $state.raw(null);
+  const episodeCount = $derived(episodeIndex?.length ?? data?.episode_count ?? 0);
+  let indexError = $state("");
+  let indexRetry = $state(0);
+  let searchRetry = $state(0);
+  let searchResult = $state.raw(null);
+  const term = $derived(query.trim().toLowerCase());
+  const answer = $derived(searchResult?.rid === rid && searchResult?.term === term ? searchResult : null);
+  const ordered = $derived(episodeIndex ? orderEpisodes(episodeIndex, sort) : []);
+  const episodes = $derived(!term ? ordered : answer?.matches ? ordered.filter((position) => answer.matches.has(position)) : []);
+  let rowOwner = $state.raw(null);
+  let details = $state.raw(null);
+  let rowMenu = $state.raw(null);
+
+  $effect(() => {
+    const handle = rid;
+    indexRetry;
+    episodeIndex = null;
+    indexError = "";
+    if (handle == null) return;
+    let active = true;
+    api.showEpisodeIndex(handle).then((index) => {
+      if (active) episodeIndex = index;
+    }).catch((reason) => { if (active) indexError = String(reason); });
+    return () => { active = false; };
+  });
+  $effect(() => {
+    const handle = rid;
+    const needle = term;
+    searchRetry;
+    searchResult = null;
+    if (!episodeIndex || handle == null || !needle) return;
+    let active = true;
+    api.searchShowEpisodes(handle, needle).then((positions) => {
+      if (active) searchResult = { rid: handle, term: needle, matches: new Set(positions) };
+    }).catch((reason) => {
+      if (active) searchResult = { rid: handle, term: needle, error: String(reason) };
+    });
+    return () => { active = false; };
+  });
 
   /* ---------------- Windowed episode rows ----------------
      A show can carry hundreds of episodes; only the rows near the viewport
@@ -59,11 +93,14 @@
   let pageElement = $state(null);
   let listElement = $state(null);
   let firstRow = $state(0);
-  let lastRow = $state(12);
-  let focusedEpisode = $state("");
-  const focusedRow = $derived(focusedEpisode ? episodes.findIndex((episode) => episode.track.id === focusedEpisode) : -1);
+  let lastRow = $state(0);
+  let focusedEpisode = $state(null);
+  const focusedRow = $derived.by(() => {
+    const position = rowMenu?.position ?? focusedEpisode;
+    return position == null ? -1 : episodes.indexOf(position);
+  });
   let currentFirst = 0;
-  let currentLast = 12;
+  let currentLast = 0;
   const renderedRows = $derived.by(() => {
     const indices = [];
     const focusFirst = Math.max(0, focusedRow - 1);
@@ -77,6 +114,11 @@
     }
     return indices;
   });
+  $effect(() => {
+    const owner = rowOwner;
+    const positions = renderedRows.map((i) => episodes[i]);
+    owner?.show(listElement ? positions : []);
+  });
   function measureRows(scroller) {
     if (!listElement) return;
     const { first, last } = rowWindow(listElement, scroller, ROW_H, 6, episodes.length);
@@ -88,10 +130,10 @@
   }
   function retainFocus(event) {
     const row = event.target.closest("[data-episode-index]");
-    if (row) focusedEpisode = row.dataset.episodeId;
+    if (row) focusedEpisode = Number(row.dataset.episodePosition);
   }
   function releaseFocus(event) {
-    if (!listElement?.contains(event.relatedTarget)) focusedEpisode = "";
+    if (!listElement?.contains(event.relatedTarget)) focusedEpisode = null;
   }
   $effect(() => {
     const list = listElement;
@@ -165,14 +207,18 @@
     const kind = route.name;
     const id = route.id;
     const account = session.username;
-    const attempt = retry;
-    generation++;
-    focusedEpisode = "";
+    const epoch = session.accountEpoch;
+    retry;
+    focusedEpisode = null;
+    rowMenu = null;
+    sortOpen = false;
     query = "";
     sort = "recent";
     currentFirst = firstRow = 0;
-    currentLast = lastRow = 12;
+    currentLast = lastRow = 0;
     response = null;
+    rowOwner = null;
+    details = null;
     error = "";
     playError = "";
     expanded = false;
@@ -182,15 +228,39 @@
       return;
     }
     let active = true;
+    let ownedRid = null;
+    let owner = null;
+    const close = () => {
+      if (ownedRid != null) {
+        api.closeShow(ownedRid).catch(() => {});
+        ownedRid = null;
+      }
+    };
     busy = true;
     const load = kind === "show" ? api.browseShow(id) : api.browseEpisode(id);
     load.then((value) => {
-      if (!(kind === "show" ? value?.id && Array.isArray(value.episodes) : value?.track?.id)) throw new Error("Spotify returned incomplete podcast details.");
-      if (active) response = { kind, id, value };
-    })
-      .catch((reason) => { if (active) error = String(reason); })
-      .finally(() => { if (active) busy = false; });
-    return () => { active = false; };
+      if (kind === "show") ownedRid = value?.rid;
+      if (!active || epoch !== session.accountEpoch || route.name !== kind || route.id !== id || session.username !== account) {
+        close();
+        return;
+      }
+      if (!(kind === "show" ? value?.id && ownedRid != null : value?.track?.id)) throw new Error("Spotify returned incomplete podcast details.");
+      if (kind === "show") {
+        const handle = ownedRid;
+        owner = createEpisodeWindow((positions) => api.showEpisodeRows(handle, positions), (next) => { details = next; });
+        rowOwner = owner;
+      }
+      response = { kind, id, epoch, value };
+    }).catch((reason) => {
+      close();
+      if (active) error = String(reason);
+    }).finally(() => { if (active) busy = false; });
+    return () => {
+      active = false;
+      generation++;
+      owner?.dispose();
+      close();
+    };
   });
   $effect(() => {
     if (record?.name) untrack(() => setPageTitle(record.name));
@@ -198,33 +268,33 @@
 
   /* ---------------- Playback ---------------- */
   const playingUri = $derived(playback.current_uri);
-  const playableEpisodes = $derived(episodes.filter((episode) => !unavailable(episode)));
+  const playableEpisodes = $derived(episodes.filter((position) => episodeIndex[position][2]));
   const source = $derived(isShow ? `show:${data?.id ?? ""}` : `episode:${data?.track?.id ?? ""}`);
   const playingHere = $derived(isShow ? isPlayingSource(source) : !!record?.uri && record.uri === playingUri);
 
   $effect(() => watchCacheMarks((ids, cached) => {
-    if (isShow) {
-      for (const episode of allEpisodes) {
-        if (episode.track) applyCacheMarks([episode.track], ids, cached);
-      }
-    } else if (record) applyCacheMarks([record], ids, cached);
+    if (isShow) rowOwner?.mark(ids, cached);
+    else if (record) applyCacheMarks([record], ids, cached);
   }));
 
-  async function startEpisodeQueue(episode) {
-    if (unavailable(episode)) return;
+  async function startEpisodeQueue(position) {
     const started = generation;
     playError = "";
     try {
-      const available = isShow ? playableEpisodes : [episode];
-      await api.playQueue(available.map((item) => item.track), available.indexOf(episode), source);
+      if (isShow) {
+        const selected = playableEpisodes.indexOf(position);
+        if (selected >= 0) await api.playShowEpisodes(rid, playableEpisodes, selected);
+      } else {
+        await api.playQueue([data.track], 0, source);
+      }
     } catch (reason) {
       if (started === generation) playError = String(reason);
     }
   }
-  function play(episode) {
+  function play(episode, position) {
     if (unavailable(episode)) return;
     if (episode.track?.uri === playingUri) togglePlay();
-    else startEpisodeQueue(episode);
+    else startEpisodeQueue(position);
   }
   async function enqueue(episode) {
     if (unavailable(episode)) return;
@@ -243,11 +313,10 @@
       return;
     }
     const first = playableEpisodes[0];
-    if (first) startEpisodeQueue(first);
+    if (first != null) startEpisodeQueue(first);
   }
 
   /* One row menu for the whole list, hung off the row's "…". */
-  let rowMenu = $state(null);
   $effect(() => {
     route.id;
     query;
@@ -302,7 +371,7 @@
         <p class="detail-meta">
           {#if isShow}
             {#if data.publisher}<span class="who">{data.publisher}</span><span class="sep">/</span>{/if}
-            <span class="num">{allEpisodes.length} {allEpisodes.length === 1 ? "episode" : "episodes"}</span>
+            <span class="num">{episodeCount} {episodeCount === 1 ? "episode" : "episodes"}</span>
           {:else}
             {#if data.show_id}
               <button class="who" title="Go to podcast" onclick={() => navigate("show", data.show_id)}>{data.show_name || "Podcast"}</button>
@@ -368,7 +437,7 @@
       {/if}
       <section class="section episodes">
         <div class="section-head episode-tools">
-          <h2 class="section-title">Episodes <span class="section-count">{allEpisodes.length}</span></h2>
+          <h2 class="section-title">Episodes <span class="section-count">{episodeCount}</span></h2>
           <!-- Finding and ordering, quiet at the head's far end: the field,
                and the order behind one round glyph rather than a select. -->
           <span class="episode-controls">
@@ -418,16 +487,29 @@
             {/snippet}
           </Menu>
         {/if}
-        {#if filtering}
-          <p class="sub episode-results" role="status">{episodes.length} of {allEpisodes.length} episodes match your search.</p>
+        {#if term && answer?.matches}
+          <p class="sub episode-results" role="status">{episodes.length} of {episodeCount} episodes match your search.</p>
         {/if}
-        {#if !episodes.length}
-          {#if filtering}
+        {#if indexError || answer?.error}
+          <div class="empty failed" role="alert">
+            <p class="h">{indexError ? "Episodes could not be loaded." : "Episode search failed."}</p>
+            <p class="why">{indexError || answer.error}</p>
+            <button class="pill" onclick={() => { if (indexError) indexRetry++; else searchRetry++; }}>Try again</button>
+          </div>
+        {:else if !episodeIndex || (term && !answer)}
+          <p class="sub" role="status">{episodeIndex ? "Searching episodes…" : "Loading episodes…"}</p>
+        {:else if !episodes.length}
+          {#if term}
             <div class="empty"><p class="h">No matching episodes.</p><p class="sub">Try a different title or description.</p></div>
           {:else}
             <div class="empty"><p class="h">No episodes yet.</p><p class="sub">This podcast has nothing to play.</p></div>
           {/if}
         {:else}
+          {#if details?.error}
+            <p class="inline-error" role="alert">
+              {details.error} <button class="link-more" onclick={() => rowOwner.retry()}>Try again</button>
+            </p>
+          {/if}
           <div
             class="episode-list"
             bind:this={listElement}
@@ -436,8 +518,10 @@
             onfocusin={retainFocus}
             onfocusout={releaseFocus}
           >
-            {#each renderedRows as index (episodes[index].track.id)}
-              {@const episode = episodes[index]}
+            {#each renderedRows as index (episodes[index])}
+              {@const position = episodes[index]}
+              {@const episode = details?.rows.get(position)}
+              {#if episode}
               {@const date = publication(episode.published_at)}
               {@const current = !!episode.track?.uri && episode.track.uri === playingUri}
               <article
@@ -445,6 +529,7 @@
                 class:current
                 class:unavailable={unavailable(episode)}
                 data-episode-index={index}
+                data-episode-position={position}
                 data-episode-id={episode.track.id}
                 style:top={`${index * ROW_H}px`}
               >
@@ -455,7 +540,7 @@
                       class="ep-play"
                       title={current ? (playback.playing ? "Pause" : "Resume") : "Play"}
                       aria-label={`${current ? (playback.playing ? "Pause" : "Resume") : "Play"} ${episode.track.name}`}
-                      onclick={() => play(episode)}
+                      onclick={() => play(episode, position)}
                     >
                       <span class="ep-play-disc"><Icon name={current && playback.playing ? "pause" : "play"} size={14} /></span>
                     </button>
@@ -485,12 +570,18 @@
                     aria-label={`More for ${episode.track.name}`}
                     aria-haspopup="menu"
                     aria-expanded={rowMenu?.episode === episode}
-                    onclick={(event) => (rowMenu = rowMenu?.episode === episode ? null : { episode, anchor: event.currentTarget })}
+                    onclick={(event) => (rowMenu = rowMenu?.position === position ? null : { position, episode, anchor: event.currentTarget })}
                   >
                     <Icon name="more" size={17} />
                   </button>
                 </div>
               </article>
+              {:else}
+                <div class="ep-row" style:top={`${index * ROW_H}px`} aria-busy="true">
+                  <span class="art skeleton" style:width="60px" style:height="60px"></span>
+                  <span class="ep-title">{episodeIndex[position][0]}</span>
+                </div>
+              {/if}
             {/each}
           </div>
         {/if}
