@@ -1196,17 +1196,34 @@ function gradeSource(src, plan) {
   /* Grade it, pixel by pixel, BEFORE the blur: the fold is a hue
      discontinuity by design, and the blur smooths it. Then lay the
      source's fine detail back over the graded broad light. */
-  const glab = new Float32Array(n * 3);
+  const ab = new Float32Array(n * 2);
   const pair = new Float32Array(n * 2);
+  // A repeated RGB under this exposure/tint has exactly the same grade.
+  // Point at a completed pixel, not a second copy of its four floats.
+  // The stored key is offset by one so zero-initialized slots always miss.
+  const slots = Math.min(8192, 2 ** Math.ceil(Math.log2(Math.max(1, n))));
+  const seen = new Uint32Array(slots * 2);
   for (let y = 0; y < rh; y++) {
     for (let x = 0; x < rw; x++) {
       const i = ((ry0 + y) * src.w + rx0 + x) * 4, p = y * rw + x;
+      const key = 1 + ((S[i] << 16) | (S[i + 1] << 8) | S[i + 2]);
+      const slot = ((Math.imul(key, 0x9e3779b1) >>> 19) & (slots - 1)) * 2;
+      const dst = p * 2;
+      if (seen[slot] === key) {
+        const prev = seen[slot + 1];
+        pair[dst] = pair[prev];
+        pair[dst + 1] = pair[prev + 1];
+        ab[dst] = ab[prev];
+        ab[dst + 1] = ab[prev + 1];
+        continue;
+      }
+      seen[slot] = key;
+      seen[slot + 1] = dst;
       labOfLinear(LIN8[S[i]], LIN8[S[i + 1]], LIN8[S[i + 2]], one);
       const L = one[0];
       gradeInto(L, one[1], one[2], ex, tintLab, s3, ycap, one);
-      glab[p * 3] = one[0]; glab[p * 3 + 1] = one[1]; glab[p * 3 + 2] = one[2];
-      pair[p * 2] = L;
-      pair[p * 2 + 1] = one[0];
+      ab[dst] = one[1]; ab[dst + 1] = one[2];
+      pair[dst] = L; pair[dst + 1] = one[0];
     }
   }
   const base = blur(pair, rw, rh, plan.local, 2);
@@ -1214,8 +1231,8 @@ function gradeSource(src, plan) {
   const rgb = [0, 0, 0];
   for (let p = 0; p < n; p++) {
     const Ln = Math.max(DETAIL_FLOOR, base[p * 2 + 1] + LOCAL_GAIN * (pair[p * 2] - base[p * 2]));
-    const k = Math.min(DETAIL_KMAX, Math.max(DETAIL_KMIN, Math.sqrt(Ln / Math.max(glab[p * 3], DETAIL_FLOOR))));
-    capInto(Ln, glab[p * 3 + 1] * k, glab[p * 3 + 2] * k, s3, ycap, one);
+    const k = Math.min(DETAIL_KMAX, Math.max(DETAIL_KMIN, Math.sqrt(Ln / Math.max(pair[p * 2 + 1], DETAIL_FLOOR))));
+    capInto(Ln, ab[p * 2] * k, ab[p * 2 + 1] * k, s3, ycap, one);
     graded[p * 4 + 3] = Math.sqrt(one[1] * one[1] + one[2] * one[2]);
     linearOfLab(one[0], one[1], one[2], rgb);
     graded[p * 4] = clamp01(rgb[0]);
@@ -1266,7 +1283,9 @@ function emit(out, gain, plan, src, seed, frost, seam) {
   /* Quantise, dithered: each channel rounds up with the probability of its
      fraction, so a gradient's average is exact and its steps dissolve. */
   const rgba = new Uint8ClampedArray(w * h * 4);
-  const encoded = frost ? new Float32Array(w * h * 3) : null;
+  // Each linear RGBA pixel is dead once read. Pack its encoded RGB behind
+  // that read cursor instead of allocating another full-resolution image.
+  const encoded = frost ? out : null;
   /* The columns whose frost the seam reaches, from SPILL under the glass
      (and the frost's blur beyond it) to the seam's end: the haze as it is
      there, seam included. Even-aligned, for the frost's half resolution. */
@@ -1352,20 +1371,20 @@ function spillOf(frame, px, fx) {
 
 /* --- The frost --------------------------------------------------------- */
 
-/** A 3-channel image at half its size, each pixel the mean of its 2x2 block
-    (the last row and column clamped). */
+/** Compact owned RGB scratch in place: a 2×2 block is read before any
+    of its inputs can be overwritten. Clamp the odd last row and column. */
 function halve(img, w, h) {
-  const hw = Math.ceil(w / 2), hh = Math.ceil(h / 2), out = new Float32Array(hw * hh * 3);
+  const hw = Math.ceil(w / 2), hh = Math.ceil(h / 2);
   for (let y = 0; y < hh; y++) {
     const y0 = 2 * y, y1 = Math.min(h - 1, y0 + 1);
     for (let x = 0; x < hw; x++) {
       const x0 = 2 * x, x1 = Math.min(w - 1, x0 + 1), o = (y * hw + x) * 3;
       for (let c = 0; c < 3; c++) {
-        out[o + c] = (img[(y0 * w + x0) * 3 + c] + img[(y0 * w + x1) * 3 + c] + img[(y1 * w + x0) * 3 + c] + img[(y1 * w + x1) * 3 + c]) / 4;
+        img[o + c] = (img[(y0 * w + x0) * 3 + c] + img[(y0 * w + x1) * 3 + c] + img[(y1 * w + x0) * 3 + c] + img[(y1 * w + x1) * 3 + c]) / 4;
       }
     }
   }
-  return out;
+  return img.subarray(0, hw * hh * 3);
 }
 
 /**

@@ -205,19 +205,19 @@ function scratch() {
  * The image is loaded on its own `Image`, never on the one the interface is
  * showing: the displayed `<img>` must not carry `crossorigin`, because if the
  * header were ever missing that attribute would cost the ARTWORK rather than
- * just the colour. Here a refusal costs nothing but a `null`.
+ * just the colour. Here a refusal costs nothing but a missed sample.
  */
 function readHue(url) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.decoding = "async";
-    img.onerror = () => resolve(null);
+    img.onerror = reject;
     img.onload = () => {
       try {
         const c = scratch();
         const ctx = c.getContext("2d", { willReadFrequently: true });
-        if (!ctx) return resolve(null);
+        if (!ctx) return reject(new Error("No sampling canvas"));
         ctx.clearRect(0, 0, SAMPLE, SAMPLE);
         ctx.drawImage(img, 0, 0, SAMPLE, SAMPLE);
         const { data } = ctx.getImageData(0, 0, SAMPLE, SAMPLE);
@@ -266,7 +266,7 @@ function readHue(url) {
         }
         /* Read the image fine, found no colour in it: a black-and-white
            sleeve, a black square, a scan of typed paper. Distinct from
-           `null`, which means we never got to look — see the caller. */
+           a failed read, which means we never got to look. */
         if (best < 0 || bestWeight <= 0) return resolve("mono");
 
         const a = sumA[best];
@@ -280,10 +280,10 @@ function readHue(url) {
            honest answer, because it does not HAVE a colour. */
         const agreement = Math.min(1, bestWeight / (SAMPLE * SAMPLE * 0.03));
         resolve({ hue: angle, chroma: 0.028 + 0.087 * agreement });
-      } catch {
+      } catch (error) {
         /* Tainted canvas: the cover protocol did not send CORS headers. The
            artwork is fine, we simply do not get to know its colour. */
-        resolve(null);
+        reject(error);
       }
     };
     img.src = url;
@@ -319,6 +319,9 @@ const tones = $state({});
 const inflight = new Set();
 const TONE_CACHE_MAX = 512;
 const toneRecency = new Set();
+/** Only outstanding engine-hinted reads. Successful samples and palettes
+    live in the same bounded memos as ordinary demand. */
+const warming = new Map();
 
 function touchTone(key) {
   toneRecency.delete(key);
@@ -328,6 +331,27 @@ function touchTone(key) {
     toneRecency.delete(oldest);
     delete tones[oldest];
   }
+}
+
+/** Warm only a measured colour. Monochrome's palette depends on the
+    demander's identity seed; its successful sample is already memoized. */
+export function warmCoverTone(url) {
+  if (!url || tones[url] || inflight.has(url) || warming.has(url)) return;
+  const sample = readHueOnce(url, coverUrl(url));
+  warming.set(url, sample);
+  sample.then((found) => {
+    if (found !== "mono" && !inflight.has(url)) {
+      tones[url] = palette(found.hue, found.chroma);
+      touchTone(url);
+    }
+  }, () => {}).finally(() => warming.delete(url));
+}
+
+function sampleFor(url) {
+  const read = () => readHueOnce(url, coverUrl(url));
+  // Demand which arrived during a failed speculative read still gets its
+  // own attempt, just like demand arriving after that failure.
+  return (warming.get(url)?.catch(read) ?? read()).catch(() => null);
 }
 
 /**
@@ -378,9 +402,7 @@ export function coverTone(covers, seed = "") {
 
   if (pool.length && !inflight.has(key)) {
     inflight.add(key);
-    Promise.all(
-      pool.map((url) => readHueOnce(url, coverUrl(url)).catch(() => null)),
-    )
+    Promise.all(pool.map(sampleFor))
       .then((found) => {
         /* `null` never got looked at, `"mono"` was looked at and had no colour
            in it; neither can win a contest scored on chroma, so both drop out

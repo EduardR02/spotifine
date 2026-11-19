@@ -24,10 +24,12 @@
      sample { key, frame, geo }
             one more frame of a playing Canvas's first loop, kept for
             `settle` and measured for the type's light.
+     dropLoop { key } discard the sampled frames when a cached still replaces that loop
      settle { seq, key, fade, geo, tint, scale, frost }
             the loop has been seen: if its representative frame is a
             different picture from the one the haze was made of, render it.
    Messages out (seq, key and fade are echoed):
+     ready                                           worker initialized; send the latest render
      haze   { seq, key, fade, bitmap, frost, gather, tone, grey, light, distance?, gpu, ms }
                                                      (gather: { data, w, h }, RGBA bytes)
                                                      a picture to show
@@ -161,16 +163,15 @@ function paint(m, src, seen = null, distance = undefined) {
 onmessage = ({ data: m }) => {
   switch (m.type) {
     case "init": {
-      if (m.cpu) {
-        gpu = false;
-        break;
-      }
-      try {
-        gpu = createGlHaze() ?? false;
-      } catch (error) {
-        console.warn("haze: no GPU renderer; drawing on the CPU.", error);
-        gpu = false;
-      }
+      if (!m.cpu) {
+        try {
+          gpu = createGlHaze() ?? false;
+        } catch (error) {
+          console.warn("haze: no GPU renderer; drawing on the CPU.", error);
+          gpu = false;
+        }
+      } else gpu = false;
+      postMessage({ type: "ready" });
       break;
     }
     case "render": {
@@ -207,6 +208,9 @@ onmessage = ({ data: m }) => {
       }
       break;
     }
+    case "dropLoop":
+      if (loop?.key === m.key) loop = null;
+      break;
     case "settle": {
       if (!loop || loop.key !== m.key || kept?.key !== m.key) {
         postMessage({ type: "done", seq: m.seq, key: m.key, light: null });

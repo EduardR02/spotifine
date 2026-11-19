@@ -38,7 +38,6 @@ const FALL = [[0, 1], [0.38, 0.62], [1, 0.34]];
     the tint: the sheen x (2.4 - 1) / (1 - 0.37), at the sheen's place. */
 const SHEEN = { at: [0.14, 0], size: [1.25, 0.92], stops: [[0, 0.078], [0.46, 0.027], [0.7, 0]] };
 
-let scratch = null;
 /* Every surface here is the CPU's: a strip drawn on the CPU is a picture
    the haze layer paints with its other strips, on one layer, where a
    GPU canvas is a layer of its own, and the compositor handles each one on
@@ -55,7 +54,7 @@ export function holdTwin({ data, w, h }) {
 }
 
 /** The four strips of a plane w x h, in its own CSS px: [x, y, w, h]. */
-export function stripsOf(w, h) {
+function stripsOf(w, h) {
   if (w < 2 * DEPTH || h < 2 * DEPTH) return [];
   return [
     [0, 0, w, DEPTH],
@@ -65,18 +64,38 @@ export function stripsOf(w, h) {
   ];
 }
 
+/** Keep just the current layout's four mask slots per drawable plane, shared
+    by all haze layers. A move changes the twin sample, not the local mask.
+    A resize can reuse its canvases, but invalidates their pixels even when
+    the rounded backing dimensions happen to be unchanged. */
+export function layoutEdges(planes, boxes) {
+  planes.length = boxes.length;
+  boxes.forEach((box, i) => {
+    const old = planes[i];
+    const shape = `${box.w},${box.h},${box.r}`;
+    if (old?.shape === shape) {
+      old.box = box;
+      return;
+    }
+    const strips = stripsOf(box.w, box.h).map((rect, s) => ({
+      rect, mask: old?.strips[s]?.mask ?? null, dpr: 0,
+    }));
+    planes[i] = { box, shape, strips };
+  });
+}
+
 /**
  * Draw one strip of a plane's band into `canvas`.
  * @param canvas  the strip's canvas, laid at box + strip by the caller
  * @param twin    the gathered twin of the window's frost (holdTwin)
  * @param box     the plane: { x, y, w, h, r } in CSS px (r: four radii)
- * @param strip   [x, y, w, h] in the plane's CSS px (stripsOf)
+ * @param strip   one of the plane's mask slots from layoutEdges
  * @param view    { w, h, dpr, slide }: the window, and how a drag has slid
  *                the picture (Ambient.svelte, slide: { from, edge, stretch })
  *                or null
  */
 export function drawStrip(canvas, twin, box, strip, view) {
-  const [sx, sy, sw, sh] = strip;
+  const [sx, sy, sw, sh] = strip.rect;
   const W = Math.max(1, Math.round(sw * view.dpr)), H = Math.max(1, Math.round(sh * view.dpr));
   if (canvas.width !== W) canvas.width = W;
   if (canvas.height !== H) canvas.height = H;
@@ -104,17 +123,26 @@ export function drawStrip(canvas, twin, box, strip, view) {
   ctx.fillStyle = sheen;
   ctx.fillRect(sx - cx, (sy - cy) * (rx / ry), sw, sh * (rx / ry));
 
-  // The band's shape, as alpha: cut to the plane's corners.
-  /* Exactly the strip's size: drawing a canvas copies all of it, and a
-     scratch grown to the tallest and widest strip at once copied a plane's
-     worth of pixels into every strip. */
-  scratch ??= new OffscreenCanvas(1, 1);
-  if (scratch.width !== W) scratch.width = W;
-  if (scratch.height !== H) scratch.height = H;
-  const m = scratch.getContext("2d", CPU);
+  // Only the completed geometry alpha is reusable. The sheen's additive
+  // blend above must operate directly on the new twin for identical bytes.
+  if (strip.dpr !== view.dpr) {
+    const mask = strip.mask ??= new OffscreenCanvas(W, H);
+    if (mask.width !== W) mask.width = W;
+    if (mask.height !== H) mask.height = H;
+    paintMask(mask, box, strip.rect, view.dpr, local);
+    strip.dpr = view.dpr;
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = "destination-in";
+  ctx.drawImage(strip.mask, 0, 0, W, H, 0, 0, W, H);
+  ctx.globalCompositeOperation = "source-over";
+}
+
+function paintMask(mask, box, [sx, sy, sw, sh], dpr, local) {
+  const m = mask.getContext("2d", CPU);
   m.setTransform(1, 0, 0, 1, 0, 0);
   m.globalCompositeOperation = "source-over";
-  m.clearRect(0, 0, W, H);
+  m.clearRect(0, 0, mask.width, mask.height);
   local(m);
   m.save();
   m.beginPath();
@@ -129,7 +157,7 @@ export function drawStrip(canvas, twin, box, strip, view) {
   /* The band along the foot and the right side starts where CSS put it: a
      9.5px tile laid at 100% lands on a whole device pixel, half a pixel
      past the edge, and the band was drawn so. */
-  const yb = Math.round((h - b) * view.dpr) / view.dpr, xb = Math.round((w - b) * view.dpr) / view.dpr;
+  const yb = Math.round((h - b) * dpr) / dpr, xb = Math.round((w - b) * dpr) / dpr;
   /* Only the pieces that reach this strip. */
   const meets = (x, y, pw, ph) => x < sx + sw && x + pw > sx && y < sy + sh && y + ph > sy;
   const piece = (style, x, y, pw, ph) => {
@@ -158,9 +186,4 @@ export function drawStrip(canvas, twin, box, strip, view) {
   m.globalCompositeOperation = "destination-in";
   m.fillStyle = fall;
   m.fillRect(sx, sy, sw, sh);
-
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.globalCompositeOperation = "destination-in";
-  ctx.drawImage(scratch, 0, 0, W, H, 0, 0, W, H);
-  ctx.globalCompositeOperation = "source-over";
 }

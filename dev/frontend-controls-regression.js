@@ -341,7 +341,25 @@ export async function ambientArtworkRegressions() {
     check(!images.some((image) => image.src === minimized), "native-minimized tracks do not start artwork source reads");
     window.__harness.emit("window-state", { maximized: oldFrame.maximized, minimized: false });
     await waitFor(() => bitmapReads.includes(minimized));
-    return ["Successful-cover decode sharing, hidden source deferral and native minimize visibility"];
+    // The retired layer becomes reusable only after the next picture has
+    // covered it. A cache hit must show the actual previous picture, not
+    // simply suppress the worker request and leave the last cover on screen.
+    const visibleLayer = () => [...document.querySelectorAll(".ambient .layer")]
+      .filter((el) => el.style.visibility === "visible")
+      .sort((a, b) => Number(b.style.zIndex) - Number(a.style.zIndex))[0];
+    const shown = async (url) => {
+      await waitFor(() => window.__haze.fades.at(-1)?.key === url);
+      const layer = visibleLayer();
+      await Promise.all(layer.getAnimations().map((anim) => anim.finished));
+      return layer;
+    };
+    const before = await shown(minimized);
+    await shown(current("artwork-intervening"));
+    const { uploads, renders } = window.__haze;
+    const returned = await shown(current("artwork-native-minimized"));
+    check(returned === before && window.__haze.renders === renders && window.__haze.uploads === uploads,
+      "return to unchanged artwork reveals its original layer without rendering or uploading again");
+    return ["Successful-cover decode sharing, hidden/minimized deferral, and a rendered A → B → A cache hit"];
   } finally {
     window.Image = NativeImage;
     window.createImageBitmap = bitmapOf;

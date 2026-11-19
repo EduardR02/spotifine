@@ -1,10 +1,10 @@
 <script>
   import { untrack } from "svelte";
-  import { playback, ui, coverUrl as imageUrl } from "../lib/state.svelte.js";
-  import { coverTone, toneSettled } from "../lib/covertone.svelte.js";
+  import { playback, session, ui, coverUrl as imageUrl } from "../lib/state.svelte.js";
+  import { coverTone, toneSettled, warmCoverTone } from "../lib/covertone.svelte.js";
   import { haze, publishLight, frost, watchFrost, watchShift } from "../lib/ambient.svelte.js";
   import { rgbOf, parseFrost, parseEdge, RESTRAINED } from "../lib/haze.js";
-  import { stripsOf, drawStrip, holdTwin } from "../lib/edges.js";
+  import { layoutEdges, drawStrip, holdTwin } from "../lib/edges.js";
   import { frame } from "../lib/window-frame.svelte.js";
 
   /* =====================================================================
@@ -86,6 +86,16 @@
   let reducedMotion = $state(false);
   let documentVisible = $state(!document.hidden);
   const pageVisible = $derived(documentVisible && !frame.minimized);
+  $effect(() => {
+    if (!enabled || !pageVisible || !playback.preload_uri) return;
+    const uri = playback.preload_uri;
+    const next = playback.queue[playback.upcoming[0]];
+    // Usually O(1), including shuffle. A compact order and the hint can
+    // arrive separately; only look farther when the actual hint changes
+    // or its queue changes, never on a playback-position update.
+    const row = next?.uri === uri ? next : playback.queue.find((r) => r.uri === uri);
+    if (row?.cover_url && row.cover_url !== coverUrl) untrack(() => warmCoverTone(row.cover_url));
+  });
   /** Bumped on every resize; the size itself is read when rendering. */
   let resized = $state(0);
   /** A Canvas whose frames cannot be read (served without CORS). */
@@ -139,11 +149,28 @@
   $effect(() => {
     const el = ambientEl;
     if (!el) return;
-    return watchFrost((clip, boxes) => {
+    const stop = watchFrost((clip, boxes) => {
       el.style.setProperty("--frost-clip", clip);
-      planeBoxes = boxes;
+      layoutEdges(edgePlanes, boxes);
       for (const s of stack) paintEdges(s);
     });
+    // A move between monitors can change the backing pixels without a
+    // single plane changing in CSS px (and thus without a new frost clip).
+    let resolution;
+    const watchDensity = () => {
+      if (resolution) {
+        resolution.removeEventListener("change", watchDensity);
+        for (const s of stack) paintEdges(s);
+      }
+      resolution = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      resolution.addEventListener("change", watchDensity);
+    };
+    watchDensity();
+    return () => {
+      stop();
+      resolution.removeEventListener("change", watchDensity);
+      edgePlanes.length = 0;
+    };
   });
 
   /* ---- The edges (lib/edges.js) --------------------------------------------
@@ -159,7 +186,7 @@
      the slide redrew every strip of every plane on every frame. Only the
      planes the drag resizes are drawn, and on release every strip is drawn
      once where the picture now lies. */
-  let planeBoxes = [];
+  const edgePlanes = [];
 
   function paintEdges(entry, force = false) {
     const holder = entry.el.children[2];
@@ -169,28 +196,27 @@
     const slid = dragEdge == null ? entry.shift : null;
     const view = { w: window.innerWidth || 1, h: window.innerHeight || 1, dpr: window.devicePixelRatio || 1, slide: slid };
     const at = `${slid ? `${slid.from},${slid.edge},${slid.stretch}` : ""}|${view.w}x${view.h}@${view.dpr}`;
-    const strips = planeBoxes.map((box) => stripsOf(box.w, box.h));
-    // A plane that gained or lost strips moves every later plane's canvases.
-    if (strips.reduce((n, s) => n + s.length, 0) !== holder.children.length) force = true;
     entry.drawn ??= [];
     let i = 0;
-    planeBoxes.forEach((box, p) => {
-      const key = `${box.x},${box.y},${box.w},${box.h},${box.r}|${at}`;
+    edgePlanes.forEach(({ box, shape, strips }, p) => {
+      // Earlier planes can gain or lose strips even when the total stays put.
+      const key = `${i}|${box.x},${box.y},${shape}|${at}`;
       const same = !force && entry.drawn[p] === key;
-      for (const strip of strips[p]) {
+      for (const strip of strips) {
         let canvas = holder.children[i++];
         if (!canvas) canvas = holder.appendChild(document.createElement("canvas"));
         if (same) continue;
         const s = canvas.style;
-        s.left = `${box.x + strip[0]}px`;
-        s.top = `${box.y + strip[1]}px`;
-        s.width = `${strip[2]}px`;
-        s.height = `${strip[3]}px`;
+        const [x, y, w, h] = strip.rect;
+        s.left = `${box.x + x}px`;
+        s.top = `${box.y + y}px`;
+        s.width = `${w}px`;
+        s.height = `${h}px`;
         drawStrip(canvas, twin, box, strip, view);
       }
       entry.drawn[p] = key;
     });
-    entry.drawn.length = planeBoxes.length;
+    entry.drawn.length = edgePlanes.length;
     while (holder.children.length > i) holder.lastElementChild.remove();
   }
 
@@ -222,44 +248,70 @@
       Canvas covered the panel out to the window's right edge. */
   let stack = [];
   let queued = null;
+  // One free layer keeps its immutable still. Its two display canvases
+  // are already populated; only the gathered strip source lives longer.
+  let retired = null;
   let z = 1;
 
-  function show(bitmap, frosted, twin, fade, geo) {
-    const el = layerEls.find((c) => c && !stack.some((s) => s.el === c));
+  function discardQueued() {
+    queued?.bitmap.close();
+    queued?.frost?.close();
+    queued = null;
+  }
+
+  function forgetRetired() {
+    if (retired) releaseEdges(retired);
+    retired = null;
+  }
+
+  function show(m) {
+    const el = layerEls.find((c) => c && c !== retired?.el && !stack.some((s) => s.el === c)) ?? retired?.el;
     if (!el) {
-      queued?.bitmap.close();
-      queued?.frosted?.close();
-      queued = { bitmap, frosted, twin, fade, geo };
+      discardQueued();
+      queued = m;
       return;
     }
+    if (el === retired?.el) forgetRetired();
     const [hazeCanvas, frostClip] = el.children;
     const frostCanvas = frostClip.firstElementChild;
-    hazeCanvas.getContext("bitmaprenderer").transferFromImageBitmap(bitmap);
+    hazeCanvas.getContext("bitmaprenderer").transferFromImageBitmap(m.bitmap);
     if (stats) stats.uploads++;
-    frostClip.hidden = !frosted;
-    if (frosted) {
-      frostCanvas.getContext("bitmaprenderer").transferFromImageBitmap(frosted);
+    frostClip.hidden = !m.frost;
+    if (m.frost) {
+      frostCanvas.getContext("bitmaprenderer").transferFromImageBitmap(m.frost);
       if (stats) stats.uploads++;
     }
+    reveal({
+      el, key: m.key, stillKey: asked.stillKey,
+      left: asked.geo.left, covered: coversPanel(asked.geo),
+      twin: m.frost && m.gather ? holdTwin(m.gather) : null,
+      tone: m.tone ? `rgb(${m.tone[0]} ${m.tone[1]} ${m.tone[2]})` : "",
+      grey: m.grey, light: m.light,
+    }, lit ? m.fade : "first");
+  }
+
+  function reveal(entry, fade) {
+    const el = entry.el;
     el.style.zIndex = String(++z);
     el.style.visibility = "visible";
     const { ms, easing } = FADES[fade];
     const duration = reducedMotion ? 0 : ms;
-    const entry = {
-      el,
-      anim: el.animate([{ opacity: 0 }, { opacity: 1 }], { duration, easing, fill: "forwards" }),
-      left: geo?.left ?? null,
-      covered: coversPanel(geo),
-      twin: frosted && twin ? holdTwin(twin) : null,
-      shift: null,
-    };
+    const anim = el.animate([{ opacity: 0 }, { opacity: 1 }], { duration, easing, fill: "forwards" });
+    entry.anim = anim;
     slide(entry, dragEdge);
     paintEdges(entry);
     stack.push(entry);
-    if (stats) stats.fades.push({ fade, ms: duration, at: Math.round(performance.now()), key: asked?.key });
-    entry.anim.finished.then(
+    haze.tone = entry.tone;
+    lit = true;
+    grey = entry.grey;
+    blankTries = 0;
+    lightKey = entry.key;
+    measured(entry.light);
+    if (asked.kind === "video" && fade !== "settle" && fade !== "layout") startPass(asked.el, entry.key);
+    if (stats) stats.fades.push({ fade, ms: duration, at: Math.round(performance.now()), key: entry.key });
+    anim.finished.then(
       () => {
-        if (!stack.includes(entry)) return;
+        if (entry.anim !== anim) return;
         el.style.opacity = "1";
         entry.anim.cancel();
         entry.anim = null;
@@ -267,7 +319,7 @@
         if (queued) {
           const next = queued;
           queued = null;
-          show(next.bitmap, next.frosted, next.twin, next.fade, next.geo);
+          show(next);
         }
       },
       () => {},
@@ -276,10 +328,16 @@
 
   function retire(entry) {
     entry.anim?.cancel();
+    entry.anim = null;
     entry.el.style.visibility = "hidden";
     entry.el.style.opacity = "0";
     slide(entry, null);
-    releaseEdges(entry);
+    if (entry.stillKey) {
+      forgetRetired();
+      retired = entry;
+    } else {
+      releaseEdges(entry);
+    }
   }
 
   /* ---- The drag ------------------------------------------------------------
@@ -341,6 +399,9 @@
   let asked = null;
   /** The source whose pixels the worker holds. */
   let held = null;
+  let heldSeq = 0;
+  /** A sampled loop retained in the worker until settle or source replacement. */
+  let sampledKey = null;
   /** Share of the shown haze that took the record's tint: a tint change
       only re-renders a haze that has some of it. */
   let grey = 0;
@@ -359,11 +420,16 @@
   }
 
   $effect(() => {
+    session.accountEpoch; // never reactivate pictures or source pixels across accounts
     if (!enabled || !layerEls[0]) return;
     const w = new Worker(new URL("../lib/haze.worker.js", import.meta.url), { type: "module" });
-    w.onmessage = ({ data: m }) => receive(m);
+    // Shader setup can outlive several source changes. Don't send a picture
+    // the first real cover has already superseded while the worker starts.
+    w.onmessage = ({ data: m }) => {
+      if (m.type === "ready") worker = w;
+      else receive(m);
+    };
     w.postMessage({ type: "init", cpu: CPU_ONLY });
-    worker = w;
     return () => {
       seq++;
       w.onmessage = null;
@@ -372,11 +438,11 @@
       stopPass();
       clearTimeout(timer);
       timer = 0;
-      queued?.bitmap.close();
-      queued?.frosted?.close();
-      queued = null;
+      discardQueued();
       for (const entry of stack) retire(entry);
       stack = [];
+      forgetRetired();
+      sampledKey = null;
       asked = held = null;
       lit = false;
       lastDiscrete = "";
@@ -393,27 +459,23 @@
           stats.gpu = m.gpu;
           if (m.distance !== undefined) stats.settles.push(+m.distance.toFixed(3));
         }
-        if (m.seq !== seq) {
+        // A blank frame for the held source can clear `asked` (and schedule a
+        // fresh read) after a newer layout-only render was already posted.
+        if (m.seq !== seq || !asked) {
           m.bitmap.close();
           m.frost?.close();
           return;
         }
-        show(m.bitmap, m.frost, m.gather, lit ? m.fade : "first", asked?.geo);
-        // The rail's colour, measured in the worker on the frost it made.
-        if (m.tone) haze.tone = `rgb(${m.tone[0]} ${m.tone[1]} ${m.tone[2]})`;
-        lit = true;
-        grey = m.grey;
-        blankTries = 0;
-        lightKey = m.key;
-        measured(m.light);
-        if (m.fade !== "settle" && m.fade !== "layout" && asked?.kind === "video" && asked.key === m.key) {
-          startPass(asked.el, m.key);
-        }
+        show(m);
         return;
       }
       case "blank":
-        if (m.seq !== seq) return;
+        // A hit doesn't change the worker's source. Neither did this
+        // rejected frame, even if a newer layout or still superseded it.
+        if (m.seq !== heldSeq) return;
+        const rejected = held;
         held = null;
+        if (asked?.key !== rejected) return;
         asked = null;
         blankTries++;
         schedule(150);
@@ -430,42 +492,31 @@
 
   /* ---- Sources ----------------------------------------------------------- */
 
-  /** The decoded cover, as a bitmap. A cover that cannot be had answers
-      with the record's own two colours, so the haze never holds the last
-      record's light. `for` is the cover URL it answers. */
+  /** Prepare the image request in parallel with the Canvas decision so a
+      late/missing/unreadable video never adds another fetch to the fallback.
+      Only the winning still needs a transferable full-size bitmap. */
   let still = $state.raw(null);
-  let failedCover = $state(null);
+  let failedCover = $state.raw(null);
   const hasCurrent = $derived(Boolean(current));
-
-  function keepStill(bitmap, key, url) {
-    still?.bitmap.close();
-    still = { key, for: url, bitmap };
-  }
 
   $effect(() => {
     if (!enabled || !pageVisible || !hasCurrent) return;
+    const epoch = session.accountEpoch;
     const url = coverUrl;
     if (!url) return;
-    if (untrack(() => still?.for === url && still?.key === url)) return;
-    if (untrack(() => failedCover === url)) return;
-    untrack(() => (failedCover = null));
-    let cancelled = false;
+    if (untrack(() => still?.epoch === epoch && still.key === url)) return;
+    if (untrack(() => failedCover?.epoch === epoch && failedCover.url === url)) return;
+    failedCover = null;
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.decoding = "async";
-    const fallback = () => {
-      if (!cancelled) failedCover = url;
-    };
-    img.onload = () => createImageBitmap(img).then((bitmap) => {
-      if (cancelled) bitmap.close();
-      else keepStill(bitmap, url, url);
-    }, fallback);
-    img.onerror = fallback;
+    img.onload = () => { still = { kind: "still", key: url, url, source: img, epoch }; };
+    img.onerror = () => { failedCover = { url, epoch }; };
     img.src = imageUrl(url);
     return () => {
-      cancelled = true;
       img.onload = img.onerror = null;
-      img.removeAttribute("src");
+      // A completed image is still the input for layout/track returns.
+      if (!img.complete) img.removeAttribute("src");
     };
   });
 
@@ -474,11 +525,11 @@
   $effect(() => {
     if (!enabled || !pageVisible || !hasCurrent) return;
     const url = coverUrl;
-    if (url && failedCover !== url) return;
+    const epoch = session.accountEpoch;
+    if (url && (failedCover?.url !== url || failedCover.epoch !== epoch)) return;
     const colours = [tone.tileA, tone.tileB];
     const key = `tile:${colours.join(":")}`;
-    if (untrack(() => still?.for === url && still?.key === key)) return;
-    let cancelled = false;
+    if (untrack(() => still?.epoch === epoch && still.url === url && still.key === key)) return;
     const c = Object.assign(document.createElement("canvas"), { width: 16, height: 16 });
     const g = c.getContext("2d");
     const ramp = g.createLinearGradient(0, 0, 16, 16);
@@ -486,15 +537,13 @@
     ramp.addColorStop(1, colours[1]);
     g.fillStyle = ramp;
     g.fillRect(0, 0, 16, 16);
-    createImageBitmap(c).then((bitmap) => {
-      if (cancelled) bitmap.close();
-      else keepStill(bitmap, key, url);
-    }).catch(() => {});
-    return () => (cancelled = true);
+    still = { kind: "still", key, url, source: c, epoch };
   });
-  $effect(() => () => {
-    still?.bitmap.close();
-    still = null;
+  $effect(() => {
+    if (!enabled || !hasCurrent) {
+      still = null;
+      failedCover = null;
+    }
   });
 
   /** The Canvas while the panel shows it, the haze is lit from it, and its
@@ -559,7 +608,7 @@
     /* While the panel decides what this record's light comes from (a
        bounded wait, lib/canvas.js), the haze holds the last record's. */
     if (haze.awaiting && geo.left != null) return { kind: "wait" };
-    if (still && still.for === coverUrl) return { kind: "still", key: still.key, bitmap: still.bitmap };
+    if (still && still.url === coverUrl && still.epoch === session.accountEpoch) return still;
     return { kind: "wait" };
   }
 
@@ -583,13 +632,13 @@
       pageVisible,
       toneFinal,
     ];
-    if (!deps[0]) return;
     untrack(() => {
       if (trackKey !== lastTrack) {
         toneUntil = performance.now() + TONE_WAIT_MS;
         blankTries = 0;
       }
       lastTrack = trackKey;
+      if (!deps[0]) return;
       if (!pageVisible) {
         haltPass();
         return;
@@ -627,7 +676,8 @@
     const owner = worker;
     if (!owner) return;
     const id = ++seq;
-    asked = { ...want, geo, tintKey };
+    discardQueued();
+    const enteringVideo = want.kind === "video" && asked?.el !== want.el;
     const message = {
       type: "render",
       seq: id,
@@ -638,8 +688,24 @@
       scale: geo.left == null ? RESTRAINED : 1,
       frost: frostFor(geo),
     };
+    // Deliberately exact: the live layout tolerance in sameGeo is not a
+    // cache key. The protocol's cover URLs are immutable; generated tiles
+    // name their exact two colours. Live/settle frames never get a key.
+    const stillKey = want.kind === "still" ? JSON.stringify([want.key, geo, tintKey, message.scale, message.frost]) : null;
+    asked = { key: want.key, kind: want.kind, el: want.el, geo, tintKey, stillKey };
+    if (stillKey && retired?.stillKey === stillKey) {
+      stopPass();
+      if (sampledKey !== null) {
+        post({ type: "dropLoop", key: sampledKey });
+        sampledKey = null;
+      }
+      const entry = retired;
+      retired = null;
+      reveal(entry, fade);
+      return; // held/heldSeq describe worker pixels, not display canvases
+    }
     const transfer = [];
-    if (want.key !== held) {
+    if (want.key !== held || enteringVideo) {
       stopPass();
       if (want.kind === "video") {
         let frame;
@@ -662,17 +728,24 @@
         message.allowBlank = want.el.paused || blankTries >= BLANK_TRIES;
         transfer.push(frame);
       } else {
-        /* A bitmap can only be transferred once: the worker gets a copy. */
-        const copy = await createImageBitmap(want.bitmap).catch(() => null);
-        if (id !== seq || worker !== owner) return copy?.close();
-        if (!pageVisible) {
-          copy?.close();
+        const bitmap = await createImageBitmap(want.source).catch(() => null);
+        if (id !== seq || worker !== owner) return bitmap?.close();
+        if (!pageVisible || desired(geo) !== want) {
+          bitmap?.close();
           asked = null;
           return;
         }
-        message.source = copy;
-        if (copy) transfer.push(copy);
+        if (!bitmap && want.key === want.url) {
+          failedCover = { url: want.url, epoch: want.epoch };
+          asked = null;
+          return;
+        }
+        message.source = bitmap;
+        if (bitmap) transfer.push(bitmap);
+        else asked.stillKey = null; // the worker can still draw its solid fallback
       }
+      heldSeq = id;
+      sampledKey = null;
       held = want.key;
     }
     owner.postMessage(message, transfer);
@@ -713,6 +786,7 @@
         }
         if (stats) stats.samples++;
         post({ type: "sample", key: p.key, frame, geo: geometry() }, [frame]);
+        sampledKey = p.key;
         p.covered += p.every;
         p.taken++;
         if (p.covered >= p.span || p.taken >= PASS_SAMPLES) finishPass();
@@ -755,6 +829,7 @@
       scale: 1,
       frost: frostFor(asked.geo),
     });
+    sampledKey = null;
   }
 </script>
 

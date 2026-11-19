@@ -54,6 +54,11 @@ export function boundedReads(read, { max, limit }) {
       pump();
     });
     memo.set(key, pending);
+    // A load error is not a sample. A later caller may try again; never
+    // remove a newer read if this one was evicted before it finished.
+    pending.catch(() => {
+      if (memo.get(key) === pending) memo.delete(key);
+    });
     if (memo.size > max) memo.delete(memo.keys().next().value);
     return pending;
   };

@@ -25,17 +25,18 @@
      half, frost  its frosted twin at half size, and the seam-lit frost
               at the glass's edge
    Over a cover the type's light is measured on the haze itself, so that
-   pass reads back the part under the panel. Where the CPU crops to save
-   work — the softer lens's columns, the seam-lit strip of the frost — the
-   GPU takes the whole width, which agrees wherever it can be seen.
-   Programs are compiled once; textures live for one render, so nothing is
-   held between records.
+   pass reads back the part under the panel. Only columns reached by a
+   visible softer lens or seam-lit frost sample need blurring. Scratch is
+   reused after its last reader, briefly across nearby renders, never at rest.
    ===================================================================== */
 
 import { prepare, radiusOf, noiseKeys, saturateMatrix, lightOf, toneOf, TONE_COLUMNS, TUNING } from "./haze.js";
 
 /** The measure passes sum this many texels each way at a time. */
 const BLOCK = 8;
+/* Span a debounced layout change (250 ms), not the time between tracks. */
+const BURST_MS = 500;
+const BURST_BYTES = 8 * 1024 * 1024;
 
 /** A number as a GLSL float literal. */
 const glFloat = (v) => {
@@ -222,17 +223,26 @@ float kcOf() {
 }
 `;
 
-const PASSES = {
-  box: `
+/* The same ordered sum for every blur. Only the first horizontal pass
+   can read a wider source, or project the grade's two lightness lanes. */
+function boxShader({ crop = false, local = false } = {}) {
+  return `
 uniform sampler2D uTex;
 uniform ivec2 uDir;
 uniform int uR;
+${crop ? "uniform int uX0;" : ""}
 void main() {
-  ivec2 p = ivec2(gl_FragCoord.xy), last = textureSize(uTex, 0) - 1;
+  ivec2 p = ivec2(gl_FragCoord.xy)${crop ? " + ivec2(uX0, 0)" : ""}, last = textureSize(uTex, 0) - 1;
   vec4 acc = vec4(0.0);
   for (int k = -uR; k <= uR; k++) acc += texelFetch(uTex, clamp(p + uDir * k, ivec2(0), last), 0);
-  outColor = acc / float(2 * uR + 1);
-}`,
+  outColor = ${local ? "vec4(acc.xw, 0.0, 1.0)" : "acc"} / float(2 * uR + 1);
+}`;
+}
+
+const PASSES = {
+  box: boxShader(),
+  boxCrop: boxShader({ crop: true }),
+  boxLocal: boxShader({ local: true }),
 
   sum: `
 uniform sampler2D uTex;
@@ -261,7 +271,7 @@ uniform sampler2D uBase;
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec4 g = texelFetch(uGlab, p, 0), b = texelFetch(uBase, p, 0);
-  float Ln = max(DETAIL_FLOOR, b.x + LOCAL_GAIN * (g.w - b.w));
+  float Ln = max(DETAIL_FLOOR, b.x + LOCAL_GAIN * (g.w - b.y));
   float k = min(DETAIL_KMAX, max(DETAIL_KMIN, sqrt(Ln / max(g.x, DETAIL_FLOOR))));
   vec3 lab = capInto(Ln, g.y * k, g.z * k);
   outColor = vec4(clamp(linearOfLab(lab), 0.0, 1.0), length(lab.yz));
@@ -291,6 +301,7 @@ void main() {
   mix: `
 uniform sampler2D uLensed;
 uniform sampler2D uSofter;
+uniform int uSoftX;
 uniform sampler2D uCols;
 uniform bool uFramed;
 uniform bool uCover;
@@ -307,7 +318,7 @@ void main() {
     float R = uCorner;
     float dx = uFrame.x + R - x, dy = max(R - y, y - (uH - R));
     float t = dx <= 0.0 || dy <= 0.0 ? 1.0 : clamp01(R - sqrt(dx * dx + dy * dy) + 0.5);
-    if (t > 0.0) l += (texelFetch(uSofter, p, 0) - l) * t;
+    if (t > 0.0) l += (texelFetch(uSofter, ivec2(p.x - uSoftX, p.y), 0) - l) * t;
   }
   vec3 lab = labOfLinear(l.rgb);
   float c = length(lab.yz);
@@ -424,6 +435,7 @@ void main() {
 
 PASSES.half = `${HAZE}
 uniform bool uLit;
+uniform int uHalfX;
 uniform int uW;
 uniform int uH;
 vec3 encodedAt(ivec2 p, float kc, float gain) {
@@ -432,7 +444,7 @@ vec3 encodedAt(ivec2 p, float kc, float gain) {
 }
 void main() {
   float kc = kcOf(), gain = gainOf();
-  ivec2 h = ivec2(gl_FragCoord.xy);
+  ivec2 h = ivec2(gl_FragCoord.xy) + ivec2(uHalfX, 0);
   int x0 = 2 * h.x, y0 = 2 * h.y, x1 = min(uW - 1, x0 + 1), y1 = min(uH - 1, y0 + 1);
   vec3 s = encodedAt(ivec2(x0, y0), kc, gain) + encodedAt(ivec2(x1, y0), kc, gain) + encodedAt(ivec2(x0, y1), kc, gain) + encodedAt(ivec2(x1, y1), kc, gain);
   outColor = vec4(s / 4.0, 1.0);
@@ -441,7 +453,8 @@ void main() {
 PASSES.frost = `
 uniform sampler2D uFrost;
 uniform sampler2D uFrostLit;
-uniform bool uSpill;
+uniform int uLitX;
+uniform ivec2 uLitRange;
 uniform mat3 uSat;
 uniform float uBright;
 uniform vec4 uFrame;
@@ -452,6 +465,7 @@ uniform int uH;
 /* The gathered twin (haze.js, parseEdge): the frost under the plane's tint,
    through --frost-edge, less the tint laid back on it. */
 uniform bool uGather;
+uniform ivec2 uToneX;
 uniform float uGain;
 uniform mat3 uEdgeSat;
 uniform float uAlpha;
@@ -462,13 +476,21 @@ vec3 gathered(vec3 v) {
   return clamp((f - uAlpha * uTint) / (1.0 - uAlpha), 0.0, 1.0);
 }
 void main() {
-  ivec2 p = ivec2(int(gl_FragCoord.x), uH - 1 - int(gl_FragCoord.y));
-  vec3 v = frosted(texelFetch(uFrost, p, 0).rgb);
-  if (uSpill) {
-    float k = 1.0 - smooth01(((uFrame.x - 2.0 * (float(p.x) + 0.5)) * uPx - GAP) / SPILL);
-    if (k > 0.0) v += (frosted(texelFetch(uFrostLit, p, 0).rgb) - v) * k;
+  ivec2 fp = ivec2(gl_FragCoord.xy);
+  bool toneRow = uGather && fp.y >= uH;
+  ivec2 p = uGather ? fp : ivec2(fp.x, uH - 1 - fp.y);
+  if (toneRow) {
+    /* Extra rows pack the *ungathered* frost at the rail's two columns.
+       Address and dither at the original pixel, not at its atlas slot. */
+    int slot = (fp.y - uH) * uW + fp.x;
+    p = ivec2(slot < uH ? uToneX.x : uToneX.y, slot % uH);
   }
-  if (uGather) v = gathered(v);
+  vec3 v = frosted(texelFetch(uFrost, p, 0).rgb);
+  if (p.x >= uLitRange.x && p.x < uLitRange.y) {
+    float k = 1.0 - smooth01(((uFrame.x - 2.0 * (float(p.x) + 0.5)) * uPx - GAP) / SPILL);
+    if (k > 0.0) v += (frosted(texelFetch(uFrostLit, ivec2(p.x - uLitX, p.y), 0).rgb) - v) * k;
+  }
+  if (uGather && !toneRow) v = gathered(v);
   int i = (p.y * uW + p.x) * 4;
   outColor = vec4(floor(v.r * 255.0 + noiseAt(i, uKey)), floor(v.g * 255.0 + noiseAt(i + 1, uKey)), floor(v.b * 255.0 + noiseAt(i + 2, uKey)), 255.0) / 255.0;
 }`;
@@ -538,6 +560,7 @@ export function createGlHaze() {
   canvas.addEventListener("webglcontextlost", (event) => {
     event.preventDefault();
     lost = true;
+    releaseBurst();
   });
   canvas.addEventListener("webglcontextrestored", () => {
     try {
@@ -549,20 +572,72 @@ export function createGlHaze() {
   });
   setup();
 
-  /* ---- One render's textures ------------------------------------------- */
+  /* A render owns each texture it acquires exactly once. `free` contains
+     scratch whose last reader has run; `previous` contains only scratch
+     from the last successful render. Uploads are never pooled. */
+  const textures = [], free = [], previous = [];
+  let burstTimer = 0;
 
-  let textures = [];
-  function texture(w, h, data = null, bytes = false) {
+  function releaseBurst() {
+    clearTimeout(burstTimer);
+    burstTimer = 0;
+    for (const tex of previous) gl.deleteTexture(tex.t);
+    previous.length = 0;
+  }
+
+  function take(pool, w, h, format) {
+    for (let i = 0; i < pool.length; i++) {
+      const tex = pool[i];
+      if (tex.w === w && tex.h === h && tex.format === format) {
+        pool[i] = pool[pool.length - 1];
+        pool.pop();
+        return tex;
+      }
+    }
+    return null;
+  }
+
+  function texture(w, h, data = null, format = gl.RGBA32F) {
+    if (!data) {
+      const recycled = take(free, w, h, format);
+      if (recycled) return recycled;
+      const carried = take(previous, w, h, format);
+      if (carried) {
+        textures.push(carried);
+        return carried;
+      }
+    }
     const t = gl.createTexture();
+    const tex = { t, w, h, format, scratchBytes: data ? 0 : w * h * (format === gl.RG32F ? 8 : 16) };
+    textures.push(tex);
     gl.bindTexture(gl.TEXTURE_2D, t);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    if (bytes) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
-    else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, data);
-    textures.push(t);
-    return { t, w, h };
+    gl.texImage2D(gl.TEXTURE_2D, 0, format, w, h, 0, format === gl.RG32F ? gl.RG : gl.RGBA,
+      format === gl.RGBA8 ? gl.UNSIGNED_BYTE : gl.FLOAT, data);
+    return tex;
+  }
+
+  function finishFrame(complete) {
+    /* Don't leave storage attached to the shared FBO when deleting its
+       texture, including when the one-shot idle timer drops the cache. */
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    releaseBurst(); // unmatched previous sizes cannot accumulate across resizes
+    let budget = complete ? BURST_BYTES : 0;
+    for (const tex of textures) {
+      if (tex.scratchBytes && tex.scratchBytes <= budget) {
+        previous.push(tex);
+        budget -= tex.scratchBytes;
+      } else {
+        gl.deleteTexture(tex.t);
+      }
+    }
+    textures.length = free.length = 0;
+    if (previous.length) burstTimer = setTimeout(releaseBurst, BURST_MS);
   }
 
   /** One pass of `name` into `target` (a texture, or null: the canvas). */
@@ -601,16 +676,19 @@ export function createGlHaze() {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
-  /** Three box passes each way, as haze.js blurs. */
-  function blur(src, sigma) {
+  /** Three box pairs; a cropped first pass still samples its source at
+      the original coordinates. All later passes use texture-local ones. */
+  function blur(src, sigma, x0 = 0, width = src.w, format = gl.RGBA32F) {
     const r = radiusOf(sigma);
-    const a = texture(src.w, src.h), b = texture(src.w, src.h);
+    const a = texture(width, src.h, null, format), b = texture(width, src.h, null, format);
+    const first = format === gl.RG32F ? "boxLocal" : x0 ? "boxCrop" : "box";
     let from = src;
     for (let i = 0; i < 3; i++) {
-      run("box", a, { uTex: from, uDir: [1, 0], uR: r });
+      run(i === 0 ? first : "box", a, { uTex: from, uDir: [1, 0], uR: r, uX0: x0 });
       run("box", b, { uTex: a, uDir: [0, 1], uR: r });
       from = b;
     }
+    free.push(a);
     return b;
   }
 
@@ -621,6 +699,7 @@ export function createGlHaze() {
     while (t.w > 1 || t.h > 1) {
       const next = texture(Math.ceil(t.w / BLOCK), Math.ceil(t.h / BLOCK));
       run("sum", next, { uTex: t });
+      free.push(t);
       t = next;
     }
     return t;
@@ -636,28 +715,38 @@ export function createGlHaze() {
     const plan = prepare(src, geo, tint, scale);
     const { w, h, rw, rh, frame, ex } = plan;
     const [key, frostKey] = noiseKeys(seed);
+    let bitmap = null, frosted = null, complete = false;
     try {
       canvas.width = w;
       canvas.height = h;
-      const source = texture(src.w, src.h, new Uint8Array(src.data.buffer, src.data.byteOffset, src.data.length), true);
+      const source = texture(src.w, src.h, new Uint8Array(src.data.buffer, src.data.byteOffset, src.data.length), gl.RGBA8);
       const origin = [plan.rect[0], plan.rect[1]];
       const tone = { uEx: [ex.lo, ex.mid, ex.hi, ex.M], uTint: plan.tintLab, uS3: plan.s3, uYcap: plan.ycap };
 
       const glab = texture(rw, rh);
       run("grade", glab, { ...tone, uSrc: source, uOrigin: origin });
+      const local = blur(glab, plan.local, 0, rw, gl.RG32F);
       const graded = texture(rw, rh);
-      run("detail", graded, { ...tone, uGlab: glab, uBase: blur(glab, plan.local) });
+      run("detail", graded, { ...tone, uGlab: glab, uBase: local });
+      free.push(local, glab);
 
       const at = frame ? [frame.x, frame.y, frame.w, frame.h] : [0, 0, 1, 1];
       const cols = plan.cols ? texture(w, 1, plan.cols) : texture(1, 1, new Float32Array(4));
       const closed = plan.closed ? [plan.closed.ox, plan.closed.oy, plan.closed.k] : [0, 0, 1];
       const laid = texture(w, h);
       run("layout", laid, { uGraded: graded, uCols: cols, uFramed: Boolean(frame), uFrame: at, uClosed: closed });
+      free.push(graded);
       const lensed = blur(laid, plan.lens);
+      /* Only cover columns at/after its first pixel center use the softer
+         lens. Keep all three horizontal radii to their left. */
+      const softX = plan.cover ? Math.max(0, Math.ceil(frame.x - 0.5) - 3 * radiusOf(plan.softer)) : 0;
+      const softer = plan.cover && softX < w ? blur(laid, plan.softer, softX, w - softX) : lensed;
+      free.push(laid);
       const lab = texture(w, h);
       run("mix", lab, {
         uLensed: lensed,
-        uSofter: plan.cover ? blur(laid, plan.softer) : lensed,
+        uSofter: softer,
+        uSoftX: softX,
         uCols: cols,
         uFramed: Boolean(frame),
         uCover: plan.cover,
@@ -667,16 +756,20 @@ export function createGlHaze() {
         uBar: plan.closed ? [plan.closed.cx, plan.closed.radius] : [0, 1],
         uH: h,
       });
+      free.push(lensed);
+      if (softer !== lensed) free.push(softer);
 
-      const sumC = measure("measureC", w, h, { uLab: lab, uMeasureTo: plan.measureTo });
+      const measured = Math.min(w, plan.measureTo);
+      const sumC = measure("measureC", measured, h, { uLab: lab, uMeasureTo: measured });
       const means = { uSumC: sumC, uS3: plan.s3, uYcap: plan.ycap };
-      const sumYP = measure("measureYP", w, h, { ...means, uLab: lab, uMeasureTo: plan.measureTo });
+      const sumYP = measure("measureYP", measured, h, { ...means, uLab: lab, uMeasureTo: measured });
 
-      let edge = lensed;
+      let edge = source; // a valid, unused sampler where there is no seam
       if (plan.seam) {
         const raw = texture(plan.seam.ew, rh);
         run("raw", raw, { uSrc: source, uOrigin: origin });
         edge = blur(raw, plan.seam.soft);
+        free.push(raw);
       }
       const haze = {
         ...means,
@@ -705,21 +798,30 @@ export function createGlHaze() {
       } else {
         light = lightOf(src, plan.shown);
       }
-      const bitmap = canvas.transferToImageBitmap();
+      bitmap = canvas.transferToImageBitmap();
 
-      let frosted = null;
       let gather = null;
       let railTone = null;
       if (frost) {
         const fw = Math.ceil(w / 2), fh = Math.ceil(h / 2);
         const sigma = frost.sigma / 2;
         const half = texture(fw, fh);
-        run("half", half, { ...haze, uLit: false });
+        run("half", half, { ...haze, uLit: false, uHalfX: 0 });
         const blurred = blur(half, sigma);
+        free.push(half);
         let lit = blurred;
-        if (plan.seam) {
-          const halfLit = texture(fw, fh);
-          run("half", halfLit, { ...haze, uLit: true });
+        let litX = 0, litLo = 0, litHi = 0;
+        if (plan.seam && plan.seam.x0 < plan.seam.x1) {
+          /* Only seam texels can make the two halves differ. Their blur
+             reaches 3r on either side; the exact blur of that output
+             strip needs another 3r of source (or the real image edge). */
+          const reach = 3 * radiusOf(sigma);
+          litLo = Math.max(0, Math.floor(plan.seam.x0 / 2) - reach);
+          litHi = Math.min(fw, Math.ceil(plan.seam.x1 / 2) + reach);
+          litX = Math.max(0, litLo - reach);
+          const litEnd = Math.min(fw, litHi + reach);
+          const halfLit = texture(litEnd - litX, fh);
+          run("half", halfLit, { ...haze, uLit: true, uHalfX: litX });
           lit = blur(halfLit, sigma);
         }
         canvas.width = fw;
@@ -727,10 +829,12 @@ export function createGlHaze() {
         const m = saturateMatrix(frost.saturate);
         const edge = frost.edge;
         const e = saturateMatrix(edge?.saturate ?? 1);
+        const toneX = TONE_COLUMNS.map((at) => Math.min(fw - 1, Math.floor(fw * at)));
         const frostPass = {
           uFrost: blurred,
           uFrostLit: lit,
-          uSpill: Boolean(plan.seam),
+          uLitX: litX,
+          uLitRange: [litLo, litHi],
           uSat: [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]],
           uBright: frost.brightness,
           uFrame: at,
@@ -739,44 +843,46 @@ export function createGlHaze() {
           uW: fw,
           uH: fh,
           uGather: false,
+          uToneX: toneX,
           uGain: edge?.gain ?? 1,
           uEdgeSat: [e[0], e[3], e[6], e[1], e[4], e[7], e[2], e[5], e[8]],
           uAlpha: edge?.alpha ?? 0,
           uTint: edge?.tint ?? [0, 0, 0],
         };
         run("frost", null, frostPass);
-        /* The rail's colour (toneOf): two columns of the frost, read back
-           here in the worker, where the stall is nobody's frame. */
-        const columns = new Uint8Array(TONE_COLUMNS.length * fh * 4);
-        TONE_COLUMNS.forEach((at, i) => {
-          gl.readPixels(Math.min(fw - 1, Math.floor(fw * at)), 0, 1, fh, gl.RGBA, gl.UNSIGNED_BYTE,
-            columns.subarray(i * fh * 4, (i + 1) * fh * 4));
-        });
-        railTone = toneOf(columns);
+        const toneBytes = toneX.length * fh * 4;
+        if (!edge) {
+          /* No gather draw: read the tone from the frost before transfer. */
+          const columns = new Uint8Array(toneBytes);
+          toneX.forEach((x, i) => {
+            gl.readPixels(x, 0, 1, fh, gl.RGBA, gl.UNSIGNED_BYTE, columns, i * fh * 4);
+          });
+          railTone = toneOf(columns);
+        }
         frosted = canvas.transferToImageBitmap();
-        /* Its gathered twin, for the planes' edges (haze.js, parseEdge). */
-        /* Read back here, where the stall is nobody's frame: the main
-           thread draws the edges from it on the CPU (lib/edges.js). */
+        /* One read: gather rows already top-down, then both undistorted
+           tone columns and at most a row of unused padding. */
         if (edge) {
+          const rowsH = fh + Math.ceil(toneX.length * fh / fw);
+          canvas.height = rowsH;
           run("frost", null, { ...frostPass, uGather: true });
-          const rows = new Uint8Array(fw * fh * 4);
-          gl.readPixels(0, 0, fw, fh, gl.RGBA, gl.UNSIGNED_BYTE, rows);
-          const data = new Uint8ClampedArray(fw * fh * 4);
-          for (let y = 0; y < fh; y++) data.set(rows.subarray((fh - 1 - y) * fw * 4, (fh - y) * fw * 4), y * fw * 4);
-          gather = { data, w: fw, h: fh };
+          const rows = new Uint8Array(fw * rowsH * 4);
+          gl.readPixels(0, 0, fw, rowsH, gl.RGBA, gl.UNSIGNED_BYTE, rows);
+          const n = fw * fh * 4;
+          gather = { data: new Uint8ClampedArray(rows.buffer, 0, n), w: fw, h: fh };
+          railTone = toneOf(rows.subarray(n, n + toneBytes));
         }
       }
-      if (gl.isContextLost()) {
-        /* Lost part-way: what came out is not the picture. */
-        bitmap.close();
-        frosted?.close();
-        return null;
-      }
+      if (gl.isContextLost()) return null;
+      complete = true;
       return { bitmap, frost: frosted, gather, tone: railTone, grey: plan.grey, light };
     } finally {
-      for (const t of textures) gl.deleteTexture(t);
-      textures = [];
-      /* Nothing held at rest: not even a drawing buffer. */
+      if (!complete) {
+        bitmap?.close();
+        frosted?.close();
+      }
+      finishFrame(complete);
+      /* Even between close renders, no full-size drawing buffer. */
       canvas.width = canvas.height = 1;
     }
   }

@@ -10,6 +10,7 @@ import { parseSpotifyLink } from "./spotify-link.js";
 import { applyCacheMarks } from "./cache-marks.js";
 import { findFolder, insertFirst, moveItem, removeFolder, removePlaylist, renameFolder } from "./library-tree.js";
 import { createCanvasLookups } from "./canvas.js";
+import { decodeTrackWaveform } from "./track-waveform.js";
 
 /* ---------------- Navigation ---------------- */
 
@@ -2773,31 +2774,6 @@ export function allocatePreviewLeaseId() {
 
 let playbackSpeedRequestGeneration = 0;
 
-function decodeTrackWaveform(payload) {
-  if (!payload || typeof payload !== "object") throw new Error("The waveform response was empty.");
-  const binCount = Number(payload.bin_count);
-  const interval = Number(payload.interval_ms);
-  const duration = Number(payload.duration_ms);
-  if (!Number.isInteger(binCount) || binCount < 0 || interval !== 1 ||
-      !Number.isInteger(duration) || duration < 0 || typeof payload.peaks_base64 !== "string") {
-    throw new Error("The waveform response was invalid.");
-  }
-  const binary = atob(payload.peaks_base64);
-  if (binary.length !== binCount * 4) throw new Error("The waveform payload was truncated.");
-  const peaks = new Int16Array(binCount * 2);
-  for (let index = 0; index < peaks.length; index += 1) {
-    const offset = index * 2;
-    const unsigned = binary.charCodeAt(offset) | (binary.charCodeAt(offset + 1) << 8);
-    peaks[index] = unsigned & 0x8000 ? unsigned - 0x10000 : unsigned;
-  }
-  return {
-    track_id: payload.track_id,
-    duration_ms: duration,
-    interval_ms: interval,
-    bin_count: binCount,
-    peaks,
-  };
-}
 /**
  * Play or pause, shown at once.
  *

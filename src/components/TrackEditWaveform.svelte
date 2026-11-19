@@ -1,5 +1,6 @@
 <script>
   import { formatExactTime } from "../lib/time.js";
+  import { indexWaveform, traceWaveform } from "../lib/track-waveform.js";
 
   let {
     durationMs,
@@ -50,6 +51,7 @@
   let cursorValue = 0;
 
   const duration = $derived(Math.max(1, Math.round(Number(durationMs) || 1)));
+  const waveIndex = $derived(indexWaveform(waveform));
   const viewSpan = $derived(Math.max(1, viewEnd - viewStart));
   const zoomLabel = $derived(`${Math.max(1, Math.round(duration / viewSpan))}×`);
   const selectedRange = $derived.by(() => {
@@ -622,34 +624,17 @@
     if (!context) return;
     const styles = getComputedStyle(canvas);
     const center = size.height / 2;
-    const peaks = waveform?.peaks;
-    const interval = Math.max(1, Number(waveform?.interval_ms) || 1);
-    const binCount = Math.min(Number(waveform?.bin_count) || 0, peaks ? peaks.length / 2 : 0);
+    const index = waveIndex;
     context.lineWidth = 1;
     context.strokeStyle = styles.getPropertyValue(quiet ? "--wave-quiet" : "--wave-main").trim() || "#9ccfd8";
     context.beginPath();
-    if (!peaks || !binCount) {
+    if (!index) {
       context.globalAlpha = 0.35;
       context.moveTo(0, Math.round(center) + 0.5);
       context.lineTo(size.width, Math.round(center) + 0.5);
     } else {
       context.globalAlpha = quiet ? 0.62 : 0.9;
-      const span = end - start;
-      for (let x = 0; x < size.width; x += 1) {
-        const from = clamp(Math.floor((start + (x / size.width) * span) / interval), 0, binCount - 1);
-        const to = clamp(Math.ceil((start + ((x + 1) / size.width) * span) / interval), from + 1, binCount);
-        let low = 32767;
-        let high = -32768;
-        for (let bin = from; bin < to; bin += 1) {
-          const index = bin * 2;
-          if (peaks[index] < low) low = peaks[index];
-          if (peaks[index + 1] > high) high = peaks[index + 1];
-        }
-        const top = center - (high / 32768) * (center - 5);
-        const bottom = center - (low / 32768) * (center - 5);
-        context.moveTo(x + 0.5, top);
-        context.lineTo(x + 0.5, bottom);
-      }
+      traceWaveform(context, index, size.width, center, start, end);
     }
     context.stroke();
     context.globalAlpha = 1;
@@ -695,7 +680,7 @@
   });
 
   function drawWaveformsForData() {
-    waveform;
+    waveIndex;
     duration;
     scheduleDraw();
   }
