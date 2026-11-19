@@ -1,10 +1,9 @@
-## Playback and browsing performance
+## Lighter playback
 
-- On AVX2-equipped PCs, stereo playback at 48 kHz uses less CPU. The 44.1→48 kHz filter produces the same samples with the same look-ahead, including at seeks, loops and gapless track boundaries.
-- Uncached track waveforms take less CPU to generate. The peak data and the drawing are unchanged.
-- The glass submits its shaders together on first use. Artwork, frost and edge lighting render as before.
-- A podcast’s header opens before its episode catalogue finishes loading. Only rows near the viewport are transferred in full; search and playback still cover the entire selected order.
-- Playing another row in the same playlist no longer resends an unchanged queue. Sorting, editing or changing output cannot reuse the wrong queue.
+- Playback at 48 kHz takes less CPU on PCs with AVX2, with exactly the same sound, including seeks, loops and gapless transitions.
+- Waveforms in the track editor draw with less CPU.
+- A podcast opens at once, before its full episode list has loaded.
+- Playing another song from the same playlist starts without sending the whole queue again.
 
 ## Lighter glass
 
