@@ -60,7 +60,41 @@ const ARTIST_ROUTES = new Set([
 ]);
 
 /**
- * Clears stale detail so the target view shows its loading state.
+ * Album and artist pages opened recently, so a revisit (or Back) paints at
+ * once instead of showing the skeleton for another round trip. An album does
+ * not change within a session and is not asked for again; an artist is shown
+ * as kept and refreshed behind it. Bounded by count and by age, because the
+ * app can run for a week: an entry older than the limit is a miss. Map order
+ * is recency: a hit re-inserts. Cleared with the account (`searchSessionEpoch`).
+ */
+const DETAIL_MEMORY_AGE_MS = 6 * 60 * 60 * 1000;
+const ALBUM_MEMORY_MAX = 30;
+const ARTIST_MEMORY_MAX = 15;
+const albumMemory = new Map();
+const artistMemory = new Map();
+/** The kept artist payload on screen that this visit has not refreshed yet. */
+let artistAwaitingRefresh = null;
+
+function recall(memory, id) {
+  const kept = memory.get(id);
+  if (!kept) return null;
+  memory.delete(id);
+  // Wall clock, not performance.now(): that one stops while a Mac sleeps.
+  const age = Date.now() - kept.at;
+  if (age < 0 || age > DETAIL_MEMORY_AGE_MS) return null;
+  memory.set(id, kept);
+  return kept.payload;
+}
+
+function remember(memory, max, id, payload) {
+  memory.delete(id);
+  memory.set(id, { payload, at: Date.now() });
+  if (memory.size > max) memory.delete(memory.keys().next().value);
+}
+
+/**
+ * Clears stale detail so the target view shows its loading state, or shows
+ * the kept payload for an album or artist opened recently.
  *
  * Artist detail and every auxiliary artist route are presentations of one
  * payload. Moving among them for the same artist must keep `detail.artist`;
@@ -71,10 +105,10 @@ const ARTIST_ROUTES = new Set([
 function clearStaleDetail(entry) {
   if (entry.name === "playlist") detail.playlist = null;
   if (entry.name === "radio") detail.radio = null;
-  if (entry.name === "album") detail.album = null;
+  if (entry.name === "album") detail.album = recall(albumMemory, entry.id);
   if (ARTIST_ROUTES.has(entry.name)) {
     const sameArtist = ARTIST_ROUTES.has(route.name) && route.id === entry.id;
-    if (!sameArtist) detail.artist = null;
+    if (!sameArtist) detail.artist = artistAwaitingRefresh = recall(artistMemory, entry.id);
   }
   // A failure belongs to the page that produced it, never to the next one.
   detail.error = "";
@@ -936,6 +970,8 @@ function propagateCacheMarks(ids, cached = true) {
   }
   applyCacheMarks(search.results?.tracks, ids, cached);
   // Kept pages are shown again as they are, so they carry the marks too.
+  for (const { payload } of albumMemory.values()) applyCacheMarks(payload.tracks, ids, cached);
+  for (const { payload } of artistMemory.values()) applyCacheMarks(payload.top_tracks, ids, cached);
   for (const page of cataloguePageCache.values()) {
     for (const release of page?.releases ?? []) applyCacheMarks(release?.tracks, ids, cached);
   }
@@ -1110,16 +1146,29 @@ export function loadDetail(name = route.name, id = route.id) {
   const seq = ++browseSeq;
   const epoch = searchSessionEpoch;
   if (!id) return;
+  // A kept album is the whole page; it does not change within a session.
+  if (name === "album" && detail.album && detail.album === albumMemory.get(id)?.payload) return;
   // The artist page and its auxiliary/discography views share one payload;
-  // arriving at any of them with it already loaded must not refetch.
-  if (ARTIST_ROUTES.has(name) && detail.artist?.id === id) return;
+  // arriving at any of them with it already loaded must not refetch, unless
+  // it is the kept copy this visit still has to refresh.
+  if (ARTIST_ROUTES.has(name) && detail.artist?.id === id && detail.artist !== artistAwaitingRefresh) return;
   detail.error = "";
   const settle = (key) => (payload) => {
-    if (seq !== browseSeq || epoch !== searchSessionEpoch) return;
+    if (epoch !== searchSessionEpoch) return;
+    // Kept even when you have already left the page: the next visit is free.
+    if (payload && key === "album") remember(albumMemory, ALBUM_MEMORY_MAX, id, payload);
+    if (payload && key === "artist") {
+      // An unchanged refresh keeps the object on screen, so nothing re-renders.
+      const kept = artistMemory.get(id)?.payload;
+      if (kept && JSON.stringify(kept) === JSON.stringify(payload)) payload = kept;
+      remember(artistMemory, ARTIST_MEMORY_MAX, id, payload);
+    }
+    if (seq !== browseSeq) return;
     // A cached open starts its engine refresh before this command response is
     // delivered. If that fresher event won the race, never replace it with the
     // stale disk snapshot that arrived later.
     if (key === "playlist" && detail.playlist?.id === id) return;
+    if (key === "artist") artistAwaitingRefresh = null;
     detail[key] = payload ?? null;
   };
   const fail = (reason) => {
@@ -1437,6 +1486,9 @@ function observeSearchSession(payload) {
       skipGeneration += 1;
       cataloguePageCache.clear();
       cataloguePagePending.clear();
+      albumMemory.clear();
+      artistMemory.clear();
+      artistAwaitingRefresh = null;
       clearPlaylistRecommendationsCache();
       creditsCache.clear();
       creditsPending.clear();

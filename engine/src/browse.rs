@@ -2675,15 +2675,20 @@ pub async fn album_browse(
     let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}"))
         .map_err(|error| format!("invalid album id: {error}"))?;
     let album: Album = metadata_get(session, &uri, "album").await?;
-    let album_track_count = album.tracks().count();
-    let mut tracks = fetch_tracks(session, album.tracks()).await?;
-    match album_playcounts(session, &uri_of(&album.id), album_track_count).await {
+    let album_uri = uri_of(&album.id);
+    // Both only need the album metadata, so they share one round trip of wait.
+    let (tracks, counts) = tokio::join!(
+        fetch_tracks(session, album.tracks()),
+        album_playcounts(session, &album_uri, album.tracks().count()),
+    );
+    let mut tracks = tracks?;
+    match counts {
         Ok(counts) => apply_playcounts(&mut tracks, &counts),
         Err(error) => eprintln!("album play counts unavailable: {error}"),
     }
     Ok(renderer_engine::protocol::AlbumBrowse {
         id: id_of(&album.id),
-        uri: uri_of(&album.id),
+        uri: album_uri,
         name: album.name.clone(),
         artist_names: album
             .artists
