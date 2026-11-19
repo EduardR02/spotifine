@@ -1,3 +1,11 @@
+## Faster pages
+
+- Albums and artists you opened in the last few hours open again at once, Back and Forward included. An artist page you come back to refreshes quietly in place.
+- An album you open for the first time shows up sooner.
+- Going back to the previous song or panel layout shows its glass at once, with the usual crossfade.
+- The next song's colour is ready before it starts.
+- Long waveforms in the track editor open and zoom faster and keep every peak, at any zoom.
+
 ## Lighter playback
 
 - Playback at 48 kHz takes less CPU on PCs with AVX2, with exactly the same sound, including seeks, loops and gapless transitions.
