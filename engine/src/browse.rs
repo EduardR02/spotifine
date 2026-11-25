@@ -1776,14 +1776,6 @@ async fn fetch_playlist_tracks_limited(
 // ---------------------------------------------------------------------------
 
 const MAX_RADIO_RECOMMENDATIONS: usize = 50;
-const MAX_PLAYLIST_RECOMMENDATIONS: usize = 10;
-
-/// Apollo returns a broad ranked candidate set, but playlist recommendations
-/// only need enough metadata to fill the visible ten-item shelf. Keeping this
-/// bound below one metadata batch preserves rank while avoiding needless
-/// resolutions for candidates that can never be shown.
-const MAX_PLAYLIST_METADATA_CANDIDATES: usize = 20;
-
 const APOLLO_REQUEST_COUNT: usize = 50;
 
 enum InspiredBySource {
@@ -2035,10 +2027,9 @@ pub async fn playlist_recommendations_browse(
     let candidates = dedupe_uris(candidates.iter())
         .into_iter()
         .filter(|candidate| !existing.contains(&id_of(candidate)))
-        .take(MAX_PLAYLIST_METADATA_CANDIDATES)
+        .take(APOLLO_REQUEST_COUNT)
         .collect::<Vec<_>>();
-    let mut tracks = fetch_tracks(session, candidates.iter()).await?;
-    tracks.truncate(MAX_PLAYLIST_RECOMMENDATIONS);
+    let tracks = fetch_tracks(session, &candidates).await?;
     Ok(PlaylistRecommendations {
         playlist_id: id.to_owned(),
         tracks,

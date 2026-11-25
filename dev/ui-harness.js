@@ -99,6 +99,9 @@ const fixtures = {
     { id: "p5", name: "Gym Classics", owner_id: "eduard", tracks_total: 22 },
   ],
 };
+const recommendationsFixture = new URLSearchParams(location.search).has("recommendations")
+  ? makeTracks(47, 100)
+  : [];
 fixtures.episode = {
   show_id: "show1", show_name: "Listening Notes", description: "A short audio-only journey through city sounds.",
   published_at: Date.UTC(2026, 8, 20),
@@ -1118,6 +1121,11 @@ const mock = {
       }
       case "browse_playlist":
         return clone(detailFor(args.id ?? args.playlistId));
+      case "browse_playlist_recommendations": {
+        const playlist = detailFor(args.id);
+        const existing = new Set(playlist.tracks.map((track) => track.uri));
+        return { playlist_id: args.id, tracks: recommendationsFixture.filter((track) => !existing.has(track.uri)) };
+      }
       /* The demo loop for every track, unless setCanvasFixtures has given
          the tracks loops of their own (or none), answered after a delay. */
       case "browse_canvas": {

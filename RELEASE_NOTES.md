@@ -6,6 +6,7 @@
 - If Windows can't launch the updater, Spotifine keeps running and can check for the update again.
 - Windows upgrades preserve **Launch at login**, including when setup runs the previous uninstaller first.
 - Playback errors distinguish an audio-key refusal from an unanswered request. The playback log shows each retry and whether it recovered or stopped.
+- Playlist recommendations can be browsed in batches of ten, without reloading the set between pages.
 
 ## Faster pages
 

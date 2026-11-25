@@ -3191,7 +3191,7 @@ function clearPlaylistRecommendationsCache() {
   playlistRecommendationsCache.clear();
 }
 
-export function loadPlaylistRecommendations(id, revision = "", { force = false } = {}) {
+export function loadPlaylistRecommendations(id, revision = "") {
   const playlistId = String(id ?? "").trim();
   if (!playlistId) return Promise.resolve([]);
   const epoch = searchSessionEpoch;
@@ -3200,18 +3200,15 @@ export function loadPlaylistRecommendations(id, revision = "", { force = false }
   const key = playlistRecommendationsKey(playlistId, snapshot);
   const cached = playlistRecommendationsCache.get(key);
 
-  // A refresh invalidates resolved data, but never duplicates an already
-  // running request. The latter is important when an explicit refresh lands
-  // at the same time as the near-footer observer.
+  // Near-footer loading and an explicit load share an in-flight request.
   if (cached?.promise) {
     touchRecommendationCache(key, cached);
     return cached.promise;
   }
-  if (cached && !force) {
+  if (cached) {
     touchRecommendationCache(key, cached);
     return Promise.resolve(cached.tracks);
   }
-  if (force) playlistRecommendationsCache.delete(key);
 
   let response;
   try {
@@ -3231,9 +3228,7 @@ export function loadPlaylistRecommendations(id, revision = "", { force = false }
       return tracks;
     })
     .catch((error) => {
-      // Errors are deliberately not cached: a later near-footer demand or
-      // explicit refresh gets a chance to recover from startup/transient
-      // engine failures.
+      // Errors aren't cached: opening the footer again or retrying can recover.
       if (playlistRecommendationsCache.get(key)?.promise === request) {
         playlistRecommendationsCache.delete(key);
       }

@@ -10,6 +10,7 @@
    * build another one.
    */
   const SORT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+  const RECOMMENDATION_PAGE_SIZE = 10;
 </script>
 
 <script>
@@ -568,12 +569,19 @@
     }
   });
   let recommendations = $state([]);
+  let recommendationPage = $state(0);
+  const recommendationPageCount = $derived(Math.ceil(recommendations.length / RECOMMENDATION_PAGE_SIZE));
+  const visibleRecommendations = $derived(recommendations.slice(
+    recommendationPage * RECOMMENDATION_PAGE_SIZE,
+    (recommendationPage + 1) * RECOMMENDATION_PAGE_SIZE,
+  ));
   const recommendationAdds = $state({});
   const recommendationState = $state({
     id: null,
     revision: "",
     requested: false,
     loading: false,
+    failed: false,
     hidden: false,
   });
   let recommendationFooter = $state(null);
@@ -606,10 +614,12 @@
     const id = pl?.id ?? null;
     const revision = pl?.snapshot_id ?? "";
     if (recommendationState.id === id && recommendationState.revision === revision) return;
+    if (recommendationState.id !== id) recommendationPage = 0;
     recommendationState.id = id;
     recommendationState.revision = revision;
     recommendationState.requested = false;
     recommendationState.loading = false;
+    recommendationState.failed = false;
     recommendationState.hidden = false;
     recommendations = [];
   });
@@ -634,7 +644,6 @@
   async function requestRecommendations(
     expectedId = pl?.id,
     expectedRevision = pl?.snapshot_id ?? "",
-    { force = false } = {},
   ) {
     const revision = expectedRevision ?? "";
     if (
@@ -642,26 +651,24 @@
       recommendationState.id !== expectedId ||
       recommendationState.revision !== revision ||
       recommendationState.loading ||
-      (recommendationState.requested && !force)
+      (recommendationState.requested && !recommendationState.failed)
     ) return;
     recommendationState.requested = true;
     recommendationState.loading = true;
+    recommendationState.failed = false;
     recommendationState.hidden = false;
     try {
-      const tracks = await loadPlaylistRecommendations(expectedId, revision, { force });
+      const tracks = await loadPlaylistRecommendations(expectedId, revision);
       if (
         recommendationState.id !== expectedId ||
         recommendationState.revision !== revision ||
         route.name !== "playlist" ||
         route.id !== expectedId
       ) return;
-      recommendations = tracks;
-      recommendationState.hidden = recommendations.length === 0;
+      setRecommendations(tracks);
     } catch {
-      // An optional footer failure never invalidates the playlist. Leave an
-      // existing successful set visible during a failed forced refresh.
       if (recommendationState.id === expectedId && recommendationState.revision === revision) {
-        recommendationState.hidden = recommendations.length === 0;
+        recommendationState.failed = true;
       }
     } finally {
       if (recommendationState.id === expectedId && recommendationState.revision === revision) {
@@ -670,10 +677,20 @@
     }
   }
 
+  function setRecommendations(tracks) {
+    recommendations = tracks;
+    recommendationPage = Math.min(recommendationPage, Math.max(0, recommendationPageCount - 1));
+    recommendationState.hidden = tracks.length === 0;
+  }
+
+  function moveRecommendations(by) {
+    const next = recommendationPage + by;
+    if (next >= 0 && next < recommendationPageCount) recommendationPage = next;
+  }
 
   function playRecommendation(index) {
-    if (!recommendations[index]) return;
-    api.playQueue(recommendations, index, `playlist:${pl?.id ?? ""}`).catch(() => {});
+    if (!visibleRecommendations[index]) return;
+    api.playQueue(visibleRecommendations, index, `playlist:${pl?.id ?? ""}`).catch(() => {});
   }
 
   function recommendationAddKey(id, uri) {
@@ -701,8 +718,7 @@
       promotePlaylist(id);
       api.touchPlaylistActivity(id).catch(() => {});
       if (recommendationState.id === id && recommendationState.revision === revision) {
-        recommendations = recommendations.filter((candidate) => candidate.uri !== uri);
-        recommendationState.hidden = recommendations.length === 0;
+        setRecommendations(recommendations.filter((candidate) => candidate.uri !== uri));
       }
     } catch {
       // Keep the recommendation in place so a failed direct Add can be retried.
@@ -1125,17 +1141,21 @@
         <section class="section" aria-labelledby="playlist-recommendations-title">
           <div class="section-head">
             <h2 class="section-title" id="playlist-recommendations-title">Recommended</h2>
-            {#if recommendationState.requested}
-              <button
-                class="link-more"
-                disabled={recommendationState.loading}
-                onclick={() => requestRecommendations(pl.id, pl.snapshot_id, { force: true })}
-              >
-                {recommendationState.loading ? "Refreshing…" : "Refresh"}
-              </button>
-            {:else}
+            {#if recommendationPageCount > 1}
+              <div class="recommendation-pages" role="group" aria-label="Recommendation pages">
+                <button class="btn-round" aria-label="Previous recommendations" title="Previous recommendations"
+                  aria-disabled={recommendationPage === 0} onclick={() => moveRecommendations(-1)}>
+                  <Icon name="back" size={15} />
+                </button>
+                <span class="section-count" role="status">{recommendationPage + 1} / {recommendationPageCount}</span>
+                <button class="btn-round" aria-label="Next recommendations" title="Next recommendations"
+                  aria-disabled={recommendationPage + 1 === recommendationPageCount} onclick={() => moveRecommendations(1)}>
+                  <Icon name="fwd" size={15} />
+                </button>
+              </div>
+            {:else if !recommendationState.requested || recommendationState.failed}
               <button class="link-more" onclick={() => requestRecommendations(pl.id, pl.snapshot_id)}>
-                Load recommendations
+                {recommendationState.failed ? "Retry recommendations" : "Load recommendations"}
               </button>
             {/if}
           </div>
@@ -1155,7 +1175,7 @@
             </div>
           {:else if recommendations.length}
             <TrackList
-              tracks={recommendations}
+              tracks={visibleRecommendations}
               playFrom={playRecommendation}
               showHead={false}
               queueContext={`playlist:${pl?.id ?? ""}`}
@@ -1193,3 +1213,9 @@
     <PlaylistCleanup playlist={pl} onClose={() => { cleanupId = null; queueMicrotask(() => headerActions?.querySelector('[aria-haspopup="menu"]')?.focus()); }} />
   {/key}
 {/if}
+
+<style>
+  .recommendation-pages { display: flex; align-items: center; gap: var(--s1); }
+  .recommendation-pages .section-count { color: var(--fg); }
+  .recommendation-pages button[aria-disabled="true"] { color: var(--fg-3); opacity: 0.45; background: transparent; cursor: default; }
+</style>

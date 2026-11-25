@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { build } from "vite";
 import { stagedBuildOutput } from "./staged-build-output.js";
@@ -20,7 +19,9 @@ async function snapshot(directory, prefix = "") {
 }
 
 test("desktop output matches Vite, preserves unchanged files, and survives build failure", async () => {
-  const root = await mkdtemp(join(tmpdir(), "spotifine-build-test-"));
+  // Vite's HTML output computes a relative path; keep the fixture on the
+  // checkout's drive even when Windows CI's TEMP is on another volume.
+  const root = await mkdtemp(join(import.meta.dirname, "..", "node_modules", ".spotifine-build-test-"));
   const output = join(root, "build");
   const publicDir = join(root, "public");
   const script = join(root, "main.js");

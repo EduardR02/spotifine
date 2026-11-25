@@ -77,6 +77,8 @@ with a preview of exactly which entries go. Playlists can be pinned to the top
 of the library, and folders are kept.
 
 Drag and drop songs to add to a playlist or reorder them.
+Browse the **Recommended** section below a playlist to see up to five pages
+of ten suggestions, depending on how many Spotify returns.
 
 Some extra things I added because we control playback here:
 
