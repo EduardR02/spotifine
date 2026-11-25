@@ -486,23 +486,9 @@
         goForward();
         return;
       }
-      // Hardware media keys work even while typing — that is their point.
-      // (Unfocused delivery is the SMTC integration's job.)
-      if (e.key === "MediaPlayPause") {
-        e.preventDefault();
-        togglePlay();
-        return;
-      }
-      if (e.key === "MediaTrackNext") {
-        e.preventDefault();
-        api.next().catch(() => {});
-        return;
-      }
-      if (e.key === "MediaTrackPrevious") {
-        e.preventDefault();
-        api.previous().catch(() => {});
-        return;
-      }
+      // Hardware media keys (MediaPlayPause / MediaTrackNext / MediaTrackPrevious)
+      // are owned by the OS media session (media_keys.rs) whether focused or not;
+      // handling them here too causes focused presses to fire twice.
       if (typing) return;
       if ((e.ctrlKey || e.metaKey) && e.key === "ArrowRight") {
         e.preventDefault();
