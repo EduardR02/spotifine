@@ -8,6 +8,7 @@
     isPlayingSource,
     togglePlay,
     library,
+    isWritablePlaylist,
     promotePlaylist,
     openCredits,
     ui,
@@ -118,8 +119,9 @@
      beyond the one rect the drag loop already reads per frame.
      ===================================================================== */
   const canReorder = $derived(!!onReorder);
+  const writablePlaylists = $derived(library.filter(isWritablePlaylist));
   /* A presentation adds to no playlist, by menu or by drag. */
-  const canAddToPlaylist = $derived(allowAddToPlaylist && !presentation.name);
+  const canAddToPlaylist = $derived(allowAddToPlaylist && !presentation.name && writablePlaylists.length > 0);
   const dragEnabled = $derived(canAddToPlaylist || !!onReorder);
   /* This table's body element — the reorder zone registered below. */
   const zoneEl = $derived(disableWindowing ? flatBody : bodyEl);
@@ -606,6 +608,7 @@
 
   function openPicker(e) {
     if (!menu.track) return;
+    artistPicker.open = false;
     /* The picker is as tall as the library, so it is placed against its own
        trigger and given the same band as the menu rather than inheriting a
        position that was computed for a much shorter list. */
@@ -622,10 +625,12 @@
   /** One artist: go. Several: hang a submenu off this row. */
   function goToArtist(e) {
     if (menuArtists.length === 1) {
-      menu.open = false;
-      navigateArtist(menuArtists[0].id, menuArtists[0].name);
+      const artist = menuArtists[0];
+      closeMenus();
+      navigateArtist(artist.id, artist.name);
       return;
     }
+    picker.open = false;
     const placed = placePopover(e.currentTarget.getBoundingClientRect(), 40 * menuArtists.length);
     artistPicker.open = true;
     artistPicker.trigger = e.currentTarget;
@@ -703,19 +708,17 @@
   async function addToPlaylist(playlist) {
     if (!picker.track) return;
     const uri = picker.track.uri;
-    /* Close both menus before waiting on IPC so the picker never holds the
+    /* Close all menus before waiting on IPC so the picker never holds the
        pointer hostage while the add is in flight. */
-    picker.open = false;
-    artistPicker.open = false;
-    menu.open = false;
+    closeMenus();
     try {
       await api.addPlaylistTracks(playlist.id, [uri]);
       // An add is library activity, not playback. Failed adds never reach
       // either promotion or the activity command.
       promotePlaylist(playlist.id);
       api.touchPlaylistActivity(playlist.id).catch(() => {});
-    } catch {
-      // A failed add must update neither timestamp.
+    } catch (reason) {
+      ui.error = `Could not add to ${playlist.name}. ${reason instanceof Error ? reason.message : String(reason ?? "")}`.trim();
     }
   }
 
@@ -1076,13 +1079,17 @@
     <!-- Parked where the head starts sticking; see the observer above. -->
     <div class="tl-head-sentinel" bind:this={headSentinel} aria-hidden="true"></div>
     <div class="tl-head" class:stuck={headStuck}>
-      <button
-        class="tl-sort-btn"
-        class:active={sortKey === "order"}
-        aria-label={sortAriaLabel("order", "original/custom order")}
-        aria-pressed={sortKey === "order"}
-        onclick={() => activateSort("order")}
-      ># {#if sortKey === "order"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+      {#if onSort}
+        <button
+          class="tl-sort-btn"
+          class:active={sortKey === "order"}
+          aria-label={sortAriaLabel("order", "original/custom order")}
+          aria-pressed={sortKey === "order"}
+          onclick={() => activateSort("order")}
+        ># {#if sortKey === "order"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+      {:else}
+        <span class="tl-head-label">#</span>
+      {/if}
       {#if colArt}<span></span>{/if}
       <!-- ONE grid cell holding TWO controls, because the cell it names holds
            two things now. Splitting the head this way is what keeps sorting by
@@ -1091,48 +1098,66 @@
            table. Still exactly one cell — the `--cols` invariant above depends
            on the head and the row agreeing on their count. -->
       <span class="tl-title-head">
-        <button
-          class="tl-sort-btn"
-          class:active={sortKey === "title"}
-          aria-label={sortAriaLabel("title", "title")}
-          aria-pressed={sortKey === "title"}
-          onclick={() => activateSort("title")}
-        >Title {#if sortKey === "title"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
-        <span class="tl-head-sep" aria-hidden="true"></span>
-        <button
-          class="tl-sort-btn tl-artist-sort"
-          class:active={sortKey === "artist"}
-          aria-label={sortAriaLabel("artist", "artist")}
-          aria-pressed={sortKey === "artist"}
-          onclick={() => activateSort("artist")}
-        >Artist {#if sortKey === "artist"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+        {#if onSort}
+          <button
+            class="tl-sort-btn"
+            class:active={sortKey === "title"}
+            aria-label={sortAriaLabel("title", "title")}
+            aria-pressed={sortKey === "title"}
+            onclick={() => activateSort("title")}
+          >Title {#if sortKey === "title"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+          <span class="tl-head-sep" aria-hidden="true"></span>
+          <button
+            class="tl-sort-btn tl-artist-sort"
+            class:active={sortKey === "artist"}
+            aria-label={sortAriaLabel("artist", "artist")}
+            aria-pressed={sortKey === "artist"}
+            onclick={() => activateSort("artist")}
+          >Artist {#if sortKey === "artist"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+        {:else}
+          <span class="tl-head-label">Title</span>
+          <span class="tl-head-sep" aria-hidden="true"></span>
+          <span class="tl-head-label tl-artist-sort">Artist</span>
+        {/if}
       </span>
       {#if colAlbum}
-        <button
-          class="tl-sort-btn"
-          class:active={sortKey === "album"}
-          aria-label={sortAriaLabel("album", "album")}
-          aria-pressed={sortKey === "album"}
-          onclick={() => activateSort("album")}
-        >Album {#if sortKey === "album"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+        {#if onSort}
+          <button
+            class="tl-sort-btn"
+            class:active={sortKey === "album"}
+            aria-label={sortAriaLabel("album", "album")}
+            aria-pressed={sortKey === "album"}
+            onclick={() => activateSort("album")}
+          >Album {#if sortKey === "album"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+        {:else}
+          <span class="tl-head-label">Album</span>
+        {/if}
       {/if}
       {#if colAdded}
-        <button
-          class="tl-sort-btn"
-          class:active={sortKey === "added"}
-          aria-label={sortAriaLabel("added", "date added")}
-          aria-pressed={sortKey === "added"}
-          onclick={() => activateSort("added")}
-        >Added {#if sortKey === "added"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+        {#if onSort}
+          <button
+            class="tl-sort-btn"
+            class:active={sortKey === "added"}
+            aria-label={sortAriaLabel("added", "date added")}
+            aria-pressed={sortKey === "added"}
+            onclick={() => activateSort("added")}
+          >Added {#if sortKey === "added"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+        {:else}
+          <span class="tl-head-label">Added</span>
+        {/if}
       {/if}
       {#if colPlays}<span class="tl-plays-head">Plays</span>{/if}
-      <button
-        class="tl-sort-btn tl-sort-duration"
-        class:active={sortKey === "duration"}
-        aria-label={sortAriaLabel("duration", "duration")}
-        aria-pressed={sortKey === "duration"}
-        onclick={() => activateSort("duration")}
-      ><span class="tl-sort-duration-label">Duration</span><Icon name="clock" size={13} />{#if sortKey === "duration"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+      {#if onSort}
+        <button
+          class="tl-sort-btn tl-sort-duration"
+          class:active={sortKey === "duration"}
+          aria-label={sortAriaLabel("duration", "duration")}
+          aria-pressed={sortKey === "duration"}
+          onclick={() => activateSort("duration")}
+        ><span class="tl-sort-duration-label">Duration</span><Icon name="clock" size={13} />{#if sortKey === "duration"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+      {:else}
+        <span class="tl-head-label tl-sort-duration" aria-label="Duration"><Icon name="clock" size={13} /></span>
+      {/if}
       <span></span>
     </div>
   {/if}
@@ -1172,7 +1197,7 @@
        scroller's overlay bar is laid inside the popover, in the top layer. -->
   <Menu class="track-menu" placement={menu} anchor={menu.anchor} group bind:element={menuEl} label="Track actions" onclose={closeMenus}>
     <div class="menu-scroll" use:scrollbar style:max-height="{menu.maxH}px">
-    <button class="menu-item" onclick={() => { menu.open = false; api.addQueue(menu.track, queueSource).catch(() => {}); }}>
+    <button class="menu-item" onclick={() => { const track = menu.track; closeMenus(); api.addQueue(track, queueSource).catch(() => {}); }}>
       <Icon name="queue-add" size={16} /><span class="menu-label">Add to queue</span>
     </button>
     {#if canAddToPlaylist && menu.track?.uri?.startsWith("spotify:track:")}
@@ -1215,7 +1240,7 @@
       </button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:")}
-      <button class="menu-item" onclick={() => { menu.open = false; openCredits(menu.track); }}>
+      <button class="menu-item" onclick={() => { const track = menu.track; closeMenus(); openCredits(track); }}>
         <Icon name="credits" size={16} /><span class="menu-label">View credits</span>
       </button>
     {/if}
@@ -1223,8 +1248,9 @@
       <button
         class="menu-item"
         onclick={() => {
-          menu.open = false;
-          openTrackEditor(menu.track, playlistId);
+          const track = menu.track;
+          closeMenus();
+          openTrackEditor(track, playlistId);
         }}
       >
         <Icon name="scissors" size={16} /><span class="menu-label">Edit playback…</span>
@@ -1267,17 +1293,17 @@
       <p class="menu-error" role="alert">{menu.skipError}</p>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:")}
-      <button class="menu-item" onclick={() => { menu.open = false; navigate("radio", menu.track.id); }}>
+      <button class="menu-item" onclick={() => { const id = menu.track.id; closeMenus(); navigate("radio", id); }}>
         <Icon name="radio" size={16} /><span class="menu-label">Go to song radio</span>
       </button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:episode:") && menu.track?.album_id}
-      <button class="menu-item" onclick={() => { menu.open = false; navigate("show", menu.track.album_id); }}>
+      <button class="menu-item" onclick={() => { const id = menu.track.album_id; closeMenus(); navigate("show", id); }}>
         <Icon name="podcast" size={16} /><span class="menu-label">Go to podcast</span>
       </button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:") && menu.track?.album_id}
-      <button class="menu-item" onclick={() => { menu.open = false; navigate("album", menu.track.album_id); }}>
+      <button class="menu-item" onclick={() => { const id = menu.track.album_id; closeMenus(); navigate("album", id); }}>
         <Icon name="album" size={16} /><span class="menu-label">Go to album</span>
       </button>
     {/if}
@@ -1298,7 +1324,7 @@
       <div class="menu-sep"></div>
       <button
         class="menu-item danger"
-        onclick={() => { menu.open = false; api.removePlaylistTracks(playlistId, [menu.track.uri]).catch(() => {}); }}
+        onclick={() => { const uri = menu.track.uri; closeMenus(); api.removePlaylistTracks(playlistId, [uri]).catch(() => {}); }}
       >
         <Icon name="trash" size={16} /><span class="menu-label">Remove from this playlist</span>
       </button>
@@ -1310,7 +1336,7 @@
 {#if picker.open}
   <Menu class="track-submenu submenu" placement={picker} returnTo={picker.trigger} group label="Add to playlist" onclose={() => (picker.open = false)}>
     <div class="menu-scroll" use:scrollbar style:max-height="{picker.maxH}px">
-      {#each library as pl (pl.id)}
+      {#each writablePlaylists as pl (pl.id)}
         <button class="menu-item" title={pl.name} onclick={() => addToPlaylist(pl)}><span class="menu-label">{pl.name}</span></button>
       {/each}
     </div>
@@ -1324,8 +1350,7 @@
       <button
         class="menu-item"
         onclick={() => {
-          menu.open = false;
-          artistPicker.open = false;
+          closeMenus();
           navigateArtist(artist.id, artist.name);
         }}
         title={artist.name}

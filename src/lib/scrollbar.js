@@ -166,9 +166,14 @@ export function scrollbar(node, options = {}) {
     measure();
   });
 
+  function onWindowResize() {
+    edge = node.getBoundingClientRect().right;
+  }
+
   resize.observe(node);
   watchChildren();
   mutations.observe(node, { childList: true });
+  window.addEventListener("resize", onWindowResize, { passive: true });
   node.addEventListener("scroll", onScroll, { passive: true });
   node.addEventListener("pointermove", onPoint, { passive: true });
   thumb.addEventListener("pointerdown", onDown);
@@ -189,6 +194,7 @@ export function scrollbar(node, options = {}) {
       clearTimeout(timer);
       resize.disconnect();
       mutations.disconnect();
+      window.removeEventListener("resize", onWindowResize);
       node.removeEventListener("scroll", onScroll);
       node.removeEventListener("pointermove", onPoint);
       track.remove();

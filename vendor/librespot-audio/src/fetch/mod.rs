@@ -126,6 +126,7 @@ fn prune_over_limit(cache: &Cache, epoch: u64) -> Vec<FileId> {
         let Some(path) = cache.file_path(file_id) else { continue };
         match fs::remove_file(&path) {
             Ok(()) => {
+                keys::forget_cached_audio_key(cache, file_id);
                 if let Some(sender) = AUDIO_CACHE_EVENT_SENDER.get() {
                     let _ = sender.send(AudioCacheEvent::Removed { track_uri: None, file_id, epoch });
                 }
@@ -1315,10 +1316,15 @@ mod cache_event_tests {
         assert!(exists(kept) && exists(third));
         assert!(drain_removals(&mut receiver).is_empty(), "nothing is pruned within the bound");
         // Playing the older file makes the download the least recently used.
+        let third_key = cache_root(limited_cache).unwrap().join("keys").join(third.to_base16().unwrap());
+        fs::create_dir_all(third_key.parent().unwrap()).unwrap();
+        fs::write(&third_key, [9u8; 16]).unwrap();
+        assert!(third_key.exists());
         assert!(AudioFile::open(&limited, kept, 1, &song_uri, cache_epoch()).await.unwrap().is_cached());
         cache_completed_download(fourth, song_uri.clone(), audio_cache(&limited, &song_uri), completed_file(), cache_epoch()).await;
         assert_eq!(drain_removals(&mut receiver), vec![third], "exactly the least recently used file is pruned and named");
         assert!(exists(kept) && exists(fourth) && !exists(third));
+        assert!(!third_key.exists(), "pruning an audio file removes its matching audio/keys/<file_id> file");
         // A clear and a decoder removal leave no phantom size behind.
         clear_cached_audio(limited_cache).unwrap();
         for file_id in [first, second] {

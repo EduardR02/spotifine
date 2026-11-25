@@ -672,6 +672,9 @@
     render(want, geo, tintKey, newSource ? "track" : "layout");
   }
 
+  const VIDEO_FRAME_RETRIES = 5;
+  let videoFrameRetries = { src: "", count: 0 };
+
   async function render(want, geo, tintKey, fade) {
     const owner = worker;
     if (!owner) return;
@@ -709,17 +712,21 @@
       stopPass();
       if (want.kind === "video") {
         let frame;
+        const src = want.el.currentSrc;
         try {
           frame = new VideoFrame(want.el);
+          if (videoFrameRetries.src === src) videoFrameRetries.count = 0;
         } catch (error) {
           asked = null;
-          if (error?.name === "SecurityError") {
-            /* A cross-origin Canvas without CORS: its light comes from the
-               cover, and the type assumes the brightest picture there is
-               (`foreign`). */
-            unreadable = want.el.currentSrc;
+          if (error?.name === "SecurityError" || error?.name === "ReferenceError" || error?.name === "NotSupportedError") {
+            /* A cross-origin Canvas without CORS or an environment lacking
+               VideoFrame support: its light falls back to the cover. */
+            unreadable = src;
           } else {
-            schedule(150);
+            const count = videoFrameRetries.src === src ? videoFrameRetries.count + 1 : 1;
+            videoFrameRetries = { src, count };
+            if (count >= VIDEO_FRAME_RETRIES) unreadable = src;
+            else schedule(150);
           }
           return;
         }

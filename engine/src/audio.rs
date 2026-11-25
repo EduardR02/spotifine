@@ -283,7 +283,7 @@ pub fn finish_natural_boundary() -> Result<(), String> {
         return Ok(());
     };
 
-    let mut queued = Vec::new();
+    let mut queued = ring.take_recycled();
     let timing;
     {
         let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
@@ -293,11 +293,12 @@ pub fn finish_natural_boundary() -> Result<(), String> {
         }
         match &mut processing.resampler {
             Some(resampler) => resampler.process(&tail, &mut queued),
-            None => queued = tail,
+            None => queued.extend_from_slice(&tail),
         }
         timing = (processing.pipeline_revision, processing.speed, processing.output_rate);
     }
     if queued.is_empty() {
+        ring.recycle_from_producer(queued);
         return Ok(());
     }
     ring.push_timed_at_generation(ring.generation.load(Ordering::Acquire),
@@ -310,7 +311,7 @@ pub fn finish_output_tail() -> Result<(), String> {
     let processing = LIVE_PROCESSING.lock().expect(LIVE_PROCESSING_POISON_MSG).upgrade();
     let ring = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade();
     let (Some(processing), Some(ring)) = (processing, ring) else { return Ok(()); };
-    let mut queued = Vec::new();
+    let mut queued = ring.take_recycled();
     let timing;
     {
         let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
@@ -462,8 +463,19 @@ struct AudibleClock {
     at: Instant,
 }
 
+/// Fixed-capacity pool for recycling consumed packet buffers from the real-time
+/// audio callback back to the producer so the RT callback never calls `free()`.
+const RECYCLE_POOL_CAPACITY: usize = 64;
+/// Upper bound on a recycled buffer's capacity (samples) kept in the pool so an
+/// unusual one-off packet cannot pin oversized memory permanently.
+const MAX_RECYCLED_CAPACITY: usize = 65_536;
+
 struct RingState {
     packets: VecDeque<RingPacket>,
+    /// Pre-allocated buffer return pool: the RT callback pushes finished
+    /// `Vec<f32>` buffers here (never reallocating or dropping), and the
+    /// producer pops and reuses them.
+    recycled: Vec<Vec<f32>>,
     /// Kept alongside `packets` so the producer's fullness check is a field
     /// read rather than a walk of the deque.
     queued_samples: usize,
@@ -488,6 +500,7 @@ impl SampleRing {
             capacity: AtomicUsize::new(capacity),
             state: Mutex::new(RingState {
                 packets: VecDeque::with_capacity(64),
+                recycled: Vec::with_capacity(RECYCLE_POOL_CAPACITY),
                 queued_samples: 0,
                 next_boundary_id: 0,
                 consumed_boundary_id: 0,
@@ -504,6 +517,43 @@ impl SampleRing {
             #[cfg(test)]
             empty_pops: AtomicU64::new(0),
         })
+    }
+
+    /// Takes a recycled `Vec<f32>` buffer from the pool (or an empty one on
+    /// cold start), trimming excess/oversized buffers on the producer thread so
+    /// the RT callback's pool always has headroom.
+    fn take_recycled(&self) -> Vec<f32> {
+        let mut state = self.lock();
+        let mut dropped = Vec::new();
+        let mut chosen = Vec::new();
+        while let Some(mut candidate) = state.recycled.pop() {
+            candidate.clear();
+            if candidate.capacity() <= MAX_RECYCLED_CAPACITY {
+                chosen = candidate;
+                break;
+            }
+            dropped.push(candidate);
+        }
+        while state.recycled.len() > RECYCLE_POOL_CAPACITY / 2 {
+            if let Some(extra) = state.recycled.pop() {
+                dropped.push(extra);
+            }
+        }
+        drop(state);
+        drop(dropped);
+        chosen
+    }
+
+    /// Returns an unused producer-side buffer back to the pool if space allows.
+    fn recycle_from_producer(&self, mut buffer: Vec<f32>) {
+        if buffer.capacity() == 0 || buffer.capacity() > MAX_RECYCLED_CAPACITY {
+            return;
+        }
+        buffer.clear();
+        let mut state = self.lock();
+        if state.recycled.len() < RECYCLE_POOL_CAPACITY / 2 {
+            state.recycled.push(buffer);
+        }
     }
 
     /// A poisoned ring must not take the audio callback or the player thread
@@ -561,6 +611,17 @@ impl SampleRing {
         timing: Option<(u64, f32, u32)>,
     ) -> Result<(), ()> {
         let deadline = Instant::now() + timeout;
+        // Resolve the listening counter BEFORE taking `SampleRing.state` so the
+        // `LISTENING` lock is never nested inside the ring lock shared with the
+        // real-time audio callback.
+        let listening_counter = timing.and_then(|(revision, _, _)| {
+            if samples.is_empty() {
+                return None;
+            }
+            let binding = LISTENING.lock().unwrap_or_else(PoisonError::into_inner);
+            let (_, counter) = binding.as_ref().filter(|(bound, _)| *bound == revision)?;
+            Some(Arc::clone(counter))
+        });
         let mut state = self.lock();
         if self.generation.load(Ordering::Acquire) != generation {
             return Ok(());
@@ -588,12 +649,10 @@ impl SampleRing {
         } else {
             0
         };
-        let listening = timing.and_then(|(revision, speed, rate)| {
-            if samples.is_empty() { return None; }
-            let binding = LISTENING.lock().unwrap_or_else(PoisonError::into_inner);
-            let (_, counter) = binding.as_ref().filter(|(bound, _)| *bound == revision)?;
+        let listening = listening_counter.and_then(|counter| {
+            let (_, speed, rate) = timing?;
             counter.pending_packets.fetch_add(1, Ordering::Relaxed);
-            Some(ListeningPacket { counter: Arc::clone(counter), frames: 0, rate, speed })
+            Some(ListeningPacket { counter, frames: 0, rate, speed })
         });
         let timing = timing.filter(|_| !samples.is_empty()).map(|(revision, speed, rate)| {
             if state.timeline_revision != revision {
@@ -676,9 +735,15 @@ impl SampleRing {
         }
     }
 
-    /// Takes the next packet, or `None` when the producer has fallen behind.
-    fn pop(&self) -> Option<RingPacket> {
+    /// Takes the next packet, or `None` when the producer has fallen behind,
+    /// returning the consumer's finished `Vec<f32>` buffer to the recycle pool
+    /// so the real-time audio callback never frees heap memory.
+    fn pop_recycling(&self, mut returned: Vec<f32>) -> Option<RingPacket> {
         let mut state = self.lock();
+        if returned.capacity() > 0 && state.recycled.len() < state.recycled.capacity() {
+            returned.clear();
+            state.recycled.push(returned);
+        }
         let Some(packet) = state.packets.pop_front() else {
             #[cfg(test)]
             self.empty_pops.fetch_add(1, Ordering::Relaxed);
@@ -702,6 +767,11 @@ impl SampleRing {
         drop(state);
         self.space_freed.notify_one();
         Some(packet)
+    }
+
+    #[cfg(test)]
+    fn pop(&self) -> Option<RingPacket> {
+        self.pop_recycling(Vec::new())
     }
 
     fn acknowledge_boundary(&self, boundary_id: u64) {
@@ -787,8 +857,21 @@ impl SampleRing {
     /// holds. Non-blocking: this is what makes `stop()` instant. Returns
     /// whether this ended a user pause's retention.
     fn clear(&self) -> bool {
-        let mut state = self.lock();
-        state.packets.clear();
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let mut dropped = Vec::new();
+        for mut packet in state.packets.drain(..) {
+            let mut buffer = std::mem::take(&mut packet.samples);
+            if buffer.capacity() > 0
+                && buffer.capacity() <= MAX_RECYCLED_CAPACITY
+                && state.recycled.len() < RECYCLE_POOL_CAPACITY / 2
+            {
+                buffer.clear();
+                state.recycled.push(buffer);
+            } else if buffer.capacity() > 0 {
+                dropped.push(buffer);
+            }
+        }
         state.queued_samples = 0;
         state.consumed_boundary_id = state.next_boundary_id;
         state.marker = None;
@@ -799,7 +882,8 @@ impl SampleRing {
         state.timeline_ms = 0.0;
         state.timeline_revision = 0;
         self.generation.fetch_add(1, Ordering::Release);
-        drop(state);
+        drop(guard);
+        drop(dropped);
         self.space_freed.notify_all();
         retained
     }
@@ -848,6 +932,16 @@ pub fn output_is_ready(revision: u64) -> bool {
         .is_some_and(|output| output.status.revision.load(Ordering::Acquire) == revision
             && output.status.ready.load(Ordering::Acquire)
             && !output.status.failed.load(Ordering::Acquire))
+}
+
+/// Returns `Some(true)` if the live `OutputSink` currently holds an open (or
+/// in-flight opening) native stream, `Some(false)` if it is closed/idle, and
+/// `None` if no `OutputSink` has ever claimed live output.
+pub fn live_output_stream_open() -> Option<bool> {
+    let output = LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade()?;
+    let open = output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_some()
+        || output.pending.lock().unwrap_or_else(PoisonError::into_inner).is_some();
+    Some(open)
 }
 
 /// The packet cursor belongs to the native callback and survives stream pause.
@@ -934,8 +1028,13 @@ impl Iterator for LiveSource {
             let generation = self.ring.generation.load(Ordering::Acquire);
             if generation != self.generation {
                 self.generation = generation;
-                self.packet = RingPacket::default();
-                self.pos = 0;
+                // Advance to the end of the discarded packet so the loop below
+                // recycles its Vec<f32> back into the pool in one lock without
+                // freeing heap memory on the real-time thread.
+                self.packet.boundary_id = 0;
+                self.packet.timing = None;
+                self.packet.listening = None;
+                self.pos = self.packet.samples.len();
             }
         }
 
@@ -946,7 +1045,8 @@ impl Iterator for LiveSource {
             self.packet.listening = None;
             // The loop pass is now heard; the waiting producer reports it.
             self.ring.acknowledge_boundary(std::mem::take(&mut self.packet.boundary_id));
-            match self.ring.pop() {
+            let returned = std::mem::take(&mut self.packet.samples);
+            match self.ring.pop_recycling(returned) {
                 Some(packet) => {
                     self.packet = packet;
                     self.pos = 0;
@@ -954,6 +1054,7 @@ impl Iterator for LiveSource {
                 None => {
                     // Underrun, or simply paused/stopped. Packets hold whole
                     // frames, so this is always a frame boundary.
+                    self.pos = 0;
                     self.silence_remaining = NUM_CHANNELS as usize - 1;
                     self.underrun = true;
                     return Some(0.0);
@@ -1158,10 +1259,11 @@ impl AudioProcessing {
     }
 
     /// Shared by the real sink and device-free audio regression tests. Exact
-    /// 1x/no edit returns the converter's allocation untouched.
+    /// 1x/no edit returns the caller's (recycled) buffer untouched; processed
+    /// packets copy back into it so steady-state playback allocates nothing.
     fn render_packet(
         &mut self,
-        samples: Vec<f32>,
+        mut samples: Vec<f32>,
         source_frame: u64,
         pipeline_scratch: &mut Vec<f32>,
         resampler_scratch: &mut Vec<f32>,
@@ -1171,26 +1273,35 @@ impl AudioProcessing {
         }
         pipeline_scratch.clear();
         resampler_scratch.clear();
-        let (filtered, loop_to) = match &mut self.pipeline {
-            Some(pipeline) => {
-                let loop_to = pipeline.process(source_frame, &samples, pipeline_scratch);
-                (&pipeline_scratch[..], loop_to)
-            }
-            None => (&samples[..], None),
-        };
-        match &mut self.resampler {
-            Some(resampler) => {
-                resampler.process(filtered, resampler_scratch);
-                // An intentional loop jump resets the filter on the next
-                // revision. Emit its lookahead before the audible marker;
-                // ordinary gapless packets keep their rational phase/history.
-                if loop_to.is_some() {
-                    resampler.finish(resampler_scratch);
+        let (use_resampler, loop_to) = {
+            let (filtered, loop_to) = match &mut self.pipeline {
+                Some(pipeline) => {
+                    let loop_to = pipeline.process(source_frame, &samples, pipeline_scratch);
+                    (&pipeline_scratch[..], loop_to)
                 }
-                (resampler_scratch.clone(), loop_to)
+                None => (&samples[..], None),
+            };
+            match &mut self.resampler {
+                Some(resampler) => {
+                    resampler.process(filtered, resampler_scratch);
+                    // An intentional loop jump resets the filter on the next
+                    // revision. Emit its lookahead before the audible marker;
+                    // ordinary gapless packets keep their rational phase/history.
+                    if loop_to.is_some() {
+                        resampler.finish(resampler_scratch);
+                    }
+                    (true, loop_to)
+                }
+                None => (false, loop_to),
             }
-            None => (pipeline_scratch.clone(), loop_to),
+        };
+        samples.clear();
+        if use_resampler {
+            samples.extend_from_slice(resampler_scratch);
+        } else {
+            samples.extend_from_slice(pipeline_scratch);
         }
+        (samples, loop_to)
     }
 
     fn reset(&mut self) {
@@ -1581,7 +1692,7 @@ impl Sink for OutputSink {
         }
         Ok(())
     }
-    fn write(&mut self, position: AudioPacketPosition, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+    fn write(&mut self, position: AudioPacketPosition, packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
         let revision = position.revision;
         if !current_decoder_revision(revision) {
             return Ok(());
@@ -1632,11 +1743,17 @@ impl Sink for OutputSink {
             self.ready_revision = Some(revision);
             signal(AudioSignal::OutputReady { revision });
         }
-        let samples_f32 = converter.f64_to_f32(samples);
+        // Converter::f64_to_f32 is a plain cast (no dithering); fill a recycled
+        // buffer directly so steady-state packets allocate nothing.
+        let mut samples_f32 = self.ring.take_recycled();
+        samples_f32.reserve(samples.len());
+        samples_f32.extend(samples.iter().map(|&sample| sample as f32));
 
         let processing = Arc::clone(&self.processing);
         let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
         if !processing.synchronize_pipeline(revision) {
+            drop(processing);
+            self.ring.recycle_from_producer(samples_f32);
             return Ok(());
         }
         self.pipeline_scratch.clear();
@@ -1651,7 +1768,8 @@ impl Sink for OutputSink {
                 None => std::mem::swap(&mut self.pipeline_scratch, &mut self.resampler_scratch),
             }
             if !self.resampler_scratch.is_empty() {
-                let tail = self.resampler_scratch.clone();
+                let mut tail = self.ring.take_recycled();
+                tail.extend_from_slice(&self.resampler_scratch);
                 drop(processing);
                 self.queue(ring_generation, revision, tail, None, speed)?;
                 processing = self.processing.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1669,6 +1787,7 @@ impl Sink for OutputSink {
         // source frames makes LiveSource emit underrun silence for the cut's
         // original duration, turning a cut into a mute.
         if queued.is_empty() && loop_to_ms.is_none() {
+            self.ring.recycle_from_producer(queued);
             return Ok(());
         }
 
@@ -2957,4 +3076,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn consumed_packet_buffers_recycle_back_to_the_producer_without_rt_frees() {
+        let ring = test_ring();
+        let mut source = LiveSource::new(Arc::clone(&ring));
+        let first = vec![0.25_f32; 64];
+        let first_ptr = first.as_ptr();
+        let second = vec![0.5_f32; 64];
+        let second_ptr = second.as_ptr();
+
+        ring.push(first, Duration::from_millis(50)).unwrap();
+        ring.push(second, Duration::from_millis(50)).unwrap();
+
+        let mut out = vec![0.0_f32; 64];
+        source.render(&mut out, 2, true, 1.0);
+        // Advancing past the first packet returns its buffer to the pool.
+        source.render(&mut out, 2, true, 1.0);
+        // Triggering one more callback drains the second packet's buffer too.
+        let mut tail = vec![0.0_f32; 2];
+        source.render(&mut tail, 2, true, 1.0);
+
+        let recycled_a = ring.take_recycled();
+        let recycled_b = ring.take_recycled();
+        let ptrs = [recycled_a.as_ptr(), recycled_b.as_ptr()];
+        assert!(ptrs.contains(&first_ptr), "first packet buffer must be recycled");
+        assert!(ptrs.contains(&second_ptr), "second packet buffer must be recycled");
+    }
 }

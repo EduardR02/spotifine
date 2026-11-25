@@ -1030,6 +1030,7 @@ async fn fetch_extended<'a, T>(
     kind: ExtensionKind,
     parse: impl Fn(&str, &[u8]) -> Option<T>,
 ) -> Result<Vec<T>, String> {
+    const METADATA_BATCH_CONCURRENCY: usize = 4;
     let unique = dedupe_uris(uris.into_iter());
     if unique.is_empty() {
         return Ok(Vec::new());
@@ -1037,8 +1038,15 @@ async fn fetch_extended<'a, T>(
     let index_by_uri = build_uri_index(&unique);
     let mut results: Vec<Option<T>> = (0..unique.len()).map(|_| None).collect();
     // Every requested batch must succeed before these rows can be published.
-    for chunk in metadata_chunks(&unique, METADATA_BATCH_SIZE) {
-        let entries = fetch_extended_batch(session, chunk, kind).await?;
+    let chunks = metadata_chunks(&unique, METADATA_BATCH_SIZE);
+    let chunks_ref = chunks.as_slice();
+    let batches: Vec<Vec<(String, Vec<u8>)>> =
+        stream::iter(0..chunks_ref.len())
+            .map(|index| fetch_extended_batch(session, chunks_ref[index], kind))
+            .buffer_unordered(METADATA_BATCH_CONCURRENCY)
+            .try_collect()
+            .await?;
+    for entries in batches {
         for (entity_uri, payload) in entries {
             let Some(&index) = index_by_uri.get(&entity_uri) else {
                 continue;
@@ -1258,7 +1266,9 @@ pub(crate) async fn library_shows(session: &Session, uris: &[String]) -> Result<
 
 pub async fn show_browse(session: &Session, id: &str) -> Result<ShowBrowse, String> {
     let uri = podcast_uri("show", id)?;
-    let show: Show = metadata_get(session, &uri, "show").await?;
+    let show: Show = spclient_read(|| Show::get(session, &uri))
+        .await
+        .map_err(|error| format!("show fetch of {uri} failed: {error}"))?;
     if show.is_audiobook {
         return Err("Audiobooks are not podcast shows".to_owned());
     }
@@ -1381,7 +1391,7 @@ fn parse_profile_playlists(payload: &[u8], username: &str, name: &str) -> Result
     Ok((playlists, row_count))
 }
 
-fn profile_username_path(username: &str) -> Result<String, String> {
+pub(crate) fn profile_username_path(username: &str) -> Result<String, String> {
     if username.is_empty() || username.len() > 256 || matches!(username, "." | "..")
         || username.chars().any(char::is_control)
     {
@@ -1623,28 +1633,69 @@ fn playlist_track_cover_urls(tracks: &[TrackRef]) -> Vec<String> {
     urls
 }
 
-// Header-only, on demand. The async lock deduplicates concurrent opens; no
-// rootlist row launches a profile request and no library playlists are cached.
-static PROFILE_HEADERS: LazyLock<tokio::sync::Mutex<HashMap<(String, String), ProfileHeaderEntry>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+// Header-only, on demand. Per-key coalescing deduplicates concurrent opens of
+// the same profile without holding the cache map lock across network I/O.
+static PROFILE_HEADERS: LazyLock<Mutex<HashMap<(String, String), ProfileHeaderEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static PROFILE_HEADERS_PENDING: LazyLock<
+    Mutex<HashMap<(String, String), std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 async fn user_profile_header(session: &Session, username: &str) -> Result<UserProfile, String> {
+    const TTL: Duration = Duration::from_secs(300);
     let encoded = profile_username_path(username)?;
     let key = (session.username(), username.to_owned());
-    let mut entries = PROFILE_HEADERS.lock().await;
-    const TTL: Duration = Duration::from_secs(300);
-    entries.retain(|_, entry| entry.fetched_at.elapsed() < TTL);
-    if let Some(entry) = entries.get(&key) {
-        return Ok(entry.profile.clone());
+    if let Some(profile) = PROFILE_HEADERS
+        .lock()
+        .map_err(|_| "profile header cache is unavailable")?
+        .get(&key)
+        .filter(|entry| entry.fetched_at.elapsed() < TTL)
+        .map(|entry| entry.profile.clone())
+    {
+        return Ok(profile);
     }
-    let payload = spclient_read(|| async { session.spclient().get_user_profile(&encoded, Some(0), Some(0)).await }).await
-        .map_err(|error| format!("private user profile request failed: {error}"))?;
+    let pending = {
+        let mut pending = PROFILE_HEADERS_PENDING
+            .lock()
+            .map_err(|_| "profile header requests are unavailable")?;
+        pending.retain(|_, entry| entry.strong_count() != 0);
+        if let Some(lock) = pending.get(&key).and_then(std::sync::Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            pending.insert(key.clone(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    let _request = pending.lock().await;
+    if let Some(profile) = PROFILE_HEADERS
+        .lock()
+        .map_err(|_| "profile header cache is unavailable")?
+        .get(&key)
+        .filter(|entry| entry.fetched_at.elapsed() < TTL)
+        .map(|entry| entry.profile.clone())
+    {
+        return Ok(profile);
+    }
+    let payload = spclient_read(|| async {
+        session.spclient().get_user_profile(&encoded, Some(0), Some(0)).await
+    })
+    .await
+    .map_err(|error| format!("private user profile request failed: {error}"))?;
     let profile = parse_user_profile(&payload, username)?;
-    evict_oldest_for_fresh_key(&mut entries, 64, 1, true, |entry| entry.fetched_at);
-    entries.insert(key, ProfileHeaderEntry {
-        fetched_at: Instant::now(),
-        profile: profile.clone(),
-    });
+    if let Ok(mut entries) = PROFILE_HEADERS.lock() {
+        entries.retain(|_, entry| entry.fetched_at.elapsed() < TTL);
+        let fresh = !entries.contains_key(&key);
+        evict_oldest_for_fresh_key(&mut entries, 64, 1, fresh, |entry| entry.fetched_at);
+        entries.insert(
+            key,
+            ProfileHeaderEntry {
+                fetched_at: Instant::now(),
+                profile: profile.clone(),
+            },
+        );
+    }
     Ok(profile)
 }
 
@@ -1957,7 +2008,9 @@ async fn artist_radio_browse(
     session: &Session,
     artist_uri: SpotifyUri,
 ) -> Result<RadioBrowse, String> {
-    let artist: Artist = metadata_get(session, &artist_uri, "artist radio artist").await?;
+    let artist: Artist = spclient_read(|| Artist::get(session, &artist_uri))
+        .await
+        .map_err(|error| format!("artist radio artist fetch of {artist_uri} failed: {error}"))?;
     let artist_id = id_of(&artist_uri);
     let context = format!("spotify:station:artist:{artist_id}");
     let bytes = spclient_read(|| async { session.spclient().get_apollo_station("stations",
@@ -2331,11 +2384,11 @@ pub async fn playlist_tree_browse(
     length: usize,
 ) -> Result<Vec<LibraryNode>, String> {
     let length = length.clamp(1, MAX_PLAYLISTS);
+    let user = profile_username_path(&session.username())?;
     let mut snapshot = RootlistSnapshot::default();
     loop {
         let endpoint = format!(
             "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from={offset}&length={length}",
-            user = session.username(),
             offset = snapshot.items.len(),
         );
         let body = spclient_read(|| async { session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await }).await
@@ -2433,46 +2486,6 @@ pub async fn playlist_membership_browse(
         offset = next;
         if complete {
             return Ok(membership);
-        }
-    }
-}
-
-/// Fetches one metadata entity with the bounded retry/backoff schedule:
-/// librespot's `Metadata::get` is a single Mercury round-trip with no retry
-/// of its own, so a transient server-side failure (reported as
-/// `Unavailable`) would otherwise fail the whole browse.
-async fn metadata_get<T: Metadata>(
-    session: &Session,
-    uri: &SpotifyUri,
-    kind: &str,
-) -> Result<T, String> {
-    let backoffs = backoff_sequence(
-        BROWSE_RETRY_ATTEMPTS,
-        BROWSE_BACKOFF_BASE_MS,
-        BROWSE_BACKOFF_MAX_MS,
-    );
-    let mut attempt = 0usize;
-    loop {
-        match T::get(session, uri).await {
-            Ok(item) => return Ok(item),
-            Err(error) => {
-                if !browse_error_is_transient(error.kind, http_status_of(&error))
-                    || attempt >= backoffs.len()
-                {
-                    return Err(format!(
-                        "{kind} fetch of {uri} failed after {} attempts (last error: {error})",
-                        attempt + 1,
-                    ));
-                }
-                let backoff = backoffs[attempt];
-                eprintln!(
-                    "{kind} fetch of {uri} failed ({error}); retrying in {backoff} ms (attempt {}/{})",
-                    attempt + 1,
-                    backoffs.len() + 1,
-                );
-                tokio::time::sleep(Duration::from_millis(backoff)).await;
-                attempt += 1;
-            }
         }
     }
 }
@@ -2665,7 +2678,9 @@ pub async fn album_browse(
 ) -> Result<spotifine_common::protocol::AlbumBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}"))
         .map_err(|error| format!("invalid album id: {error}"))?;
-    let album: Album = metadata_get(session, &uri, "album").await?;
+    let album: Album = spclient_read(|| Album::get(session, &uri))
+        .await
+        .map_err(|error| format!("album fetch of {uri} failed: {error}"))?;
     let album_uri = uri_of(&album.id);
     // Both only need the album metadata, so they share one round trip of wait.
     let (tracks, counts) = tokio::join!(
@@ -3528,7 +3543,9 @@ pub async fn artist_browse(
 ) -> Result<spotifine_common::protocol::ArtistBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
         .map_err(|error| format!("invalid artist id: {error}"))?;
-    let artist: Artist = metadata_get(session, &uri, "artist").await?;
+    let artist: Artist = spclient_read(|| Artist::get(session, &uri))
+        .await
+        .map_err(|error| format!("artist fetch of {uri} failed: {error}"))?;
     let artist_uri = uri_of(&artist.id);
     let top_track_uris = artist.top_tracks.for_country(&session.country());
     let groups = artist_release_groups(&artist);
@@ -4062,7 +4079,9 @@ pub async fn artist_catalogue_browse(
     } else {
         let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
             .map_err(|error| format!("invalid artist id: {error}"))?;
-        let artist: Artist = metadata_get(session, &uri, "artist").await?;
+        let artist: Artist = spclient_read(|| Artist::get(session, &uri))
+            .await
+            .map_err(|error| format!("artist fetch of {uri} failed: {error}"))?;
         let groups = artist_release_groups(&artist);
         catalogue_manifest(session, id, &groups, &selected).await?
     };
@@ -4093,16 +4112,34 @@ pub async fn artist_catalogue_browse(
         .into_iter()
         .map(|track| (track.uri.clone(), track))
         .collect();
+    const PLAYCOUNT_CONCURRENCY: usize = 4;
+    let seeds_ref = seeds.as_slice();
+    let playcounts: Vec<(usize, Result<HashMap<String, u64>, String>)> = stream::iter(0..seeds_ref.len())
+        .map(|index| {
+            let uri = seeds_ref[index].header.uri.as_str();
+            let track_count = seeds_ref[index].track_uris.len();
+            async move { (index, album_playcounts(session, uri, track_count).await) }
+        })
+        .buffer_unordered(PLAYCOUNT_CONCURRENCY)
+        .collect()
+        .await;
+    let mut counts_by_index: Vec<Option<Result<HashMap<String, u64>, String>>> =
+        (0..seeds.len()).map(|_| None).collect();
+    for (index, result) in playcounts {
+        counts_by_index[index] = Some(result);
+    }
     let mut complete = Vec::with_capacity(seeds.len());
-    for mut release in seeds.drain(..) {
+    for (mut release, counts) in seeds.drain(..).zip(counts_by_index) {
         release.header.tracks = release
             .track_uris
             .iter()
             .filter_map(|uri| by_uri.get(&uri_of(uri)).cloned())
             .collect();
-        match album_playcounts(session, &release.header.uri, release.track_uris.len()).await {
-            Ok(counts) => apply_playcounts(&mut release.header.tracks, &counts),
-            Err(error) => eprintln!("album play counts unavailable: {error}"),
+        if let Some(counts) = counts {
+            match counts {
+                Ok(counts) => apply_playcounts(&mut release.header.tracks, &counts),
+                Err(error) => eprintln!("album play counts unavailable: {error}"),
+            }
         }
         complete.push(release.header);
     }
@@ -4136,6 +4173,40 @@ fn context_page_next_cursor(
         })
 }
 
+async fn liked_song_page_uris(
+    session: &Session,
+    cursor: Option<&str>,
+    what: &str,
+) -> Result<(Vec<SpotifyUri>, Option<String>), String> {
+    if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+        let payload = spclient_read(|| async { session.spclient().get_next_page(cursor).await })
+            .await
+            .map_err(|error| format!("{what} page request failed: {error}"))?;
+        let json = std::str::from_utf8(&payload)
+            .map_err(|error| format!("{what} page was not utf-8: {error}"))?;
+        let page = protobuf_json_mapping::parse_from_str::<
+            librespot_protocol::context_page::ContextPage,
+        >(json)
+        .map_err(|error| format!("unparseable {what} page: {error}"))?;
+        Ok((
+            context_page_track_uris(&page),
+            context_page_next_cursor(&page),
+        ))
+    } else {
+        let context_uri = format!("spotify:user:{}:collection", session.username());
+        let context = spclient_read(|| async { session.spclient().get_context(&context_uri).await })
+            .await
+            .map_err(|error| format!("{what} request failed: {error}"))?;
+        let uris = context
+            .pages
+            .iter()
+            .flat_map(context_page_track_uris)
+            .collect();
+        let next_cursor = context.pages.iter().find_map(context_page_next_cursor);
+        Ok((uris, next_cursor))
+    }
+}
+
 /// Read-only Saved Tracks browse through librespot's authenticated context
 /// resolver. Pagination remains explicit: opening Liked Songs fetches one
 /// page; following `next_cursor` is the only thing that fetches another.
@@ -4143,31 +4214,7 @@ pub async fn liked_songs_browse(
     session: &Session,
     cursor: Option<&str>,
 ) -> Result<spotifine_common::protocol::LikedSongsPage, String> {
-    let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-        let payload = spclient_read(|| async { session.spclient().get_next_page(cursor).await }).await
-            .map_err(|error| format!("liked songs page request failed: {error}"))?;
-        let json = std::str::from_utf8(&payload)
-            .map_err(|error| format!("liked songs page was not utf-8: {error}"))?;
-        let page = protobuf_json_mapping::parse_from_str::<
-            librespot_protocol::context_page::ContextPage,
-        >(json)
-        .map_err(|error| format!("unparseable liked songs page: {error}"))?;
-        (
-            context_page_track_uris(&page),
-            context_page_next_cursor(&page),
-        )
-    } else {
-        let context_uri = format!("spotify:user:{}:collection", session.username());
-        let context = spclient_read(|| async { session.spclient().get_context(&context_uri).await }).await
-            .map_err(|error| format!("liked songs request failed: {error}"))?;
-        let uris = context
-            .pages
-            .iter()
-            .flat_map(context_page_track_uris)
-            .collect();
-        let next_cursor = context.pages.iter().find_map(context_page_next_cursor);
-        (uris, next_cursor)
-    };
+    let (uris, next_cursor) = liked_song_page_uris(session, cursor, "liked songs").await?;
     let tracks = fetch_tracks(session, uris.iter()).await?;
     Ok(spotifine_common::protocol::LikedSongsPage {
         tracks,
@@ -4185,31 +4232,7 @@ pub async fn liked_song_uris_browse(
     session: &Session,
     cursor: Option<&str>,
 ) -> Result<spotifine_common::protocol::LikedUrisPage, String> {
-    let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-        let payload = spclient_read(|| async { session.spclient().get_next_page(cursor).await }).await
-            .map_err(|error| format!("liked song uris page request failed: {error}"))?;
-        let json = std::str::from_utf8(&payload)
-            .map_err(|error| format!("liked song uris page was not utf-8: {error}"))?;
-        let page = protobuf_json_mapping::parse_from_str::<
-            librespot_protocol::context_page::ContextPage,
-        >(json)
-        .map_err(|error| format!("unparseable liked song uris page: {error}"))?;
-        (
-            context_page_track_uris(&page),
-            context_page_next_cursor(&page),
-        )
-    } else {
-        let context_uri = format!("spotify:user:{}:collection", session.username());
-        let context = spclient_read(|| async { session.spclient().get_context(&context_uri).await }).await
-            .map_err(|error| format!("liked song uris request failed: {error}"))?;
-        let uris = context
-            .pages
-            .iter()
-            .flat_map(context_page_track_uris)
-            .collect();
-        let next_cursor = context.pages.iter().find_map(context_page_next_cursor);
-        (uris, next_cursor)
-    };
+    let (uris, next_cursor) = liked_song_page_uris(session, cursor, "liked song uris").await?;
     Ok(spotifine_common::protocol::LikedUrisPage {
         uris: uris.iter().map(uri_of).collect(),
         next_cursor,
@@ -4477,14 +4500,16 @@ fn track_credits_from_query(parsed: &CreditsQueryJson, track_uri: &str) -> Track
 #[derive(Default, Deserialize)]
 struct SearchDesktopResponse {
     #[serde(default)]
-    data: SearchDesktopData,
+    data: Option<SearchDesktopData>,
+    #[serde(default)]
+    errors: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Default, Deserialize)]
 #[allow(non_snake_case)] // GraphQL schema field names
 struct SearchDesktopData {
     #[serde(default)]
-    searchV2: SearchV2Json,
+    searchV2: Option<SearchV2Json>,
 }
 
 #[derive(Default, Deserialize)]
@@ -6173,15 +6198,27 @@ async fn album_playcounts(
     album_uri: &str,
     track_count: usize,
 ) -> Result<HashMap<String, u64>, String> {
+    const ALBUM_PLAYCOUNT_PAGE_CONCURRENCY: usize = 4;
     if track_count == 0 {
         return Ok(HashMap::new());
     }
-    let mut counts = HashMap::new();
+    let mut pages = Vec::new();
     let mut offset = 0;
     while offset < track_count {
         let limit = (track_count - offset).min(ALBUM_TRACKS_PAGE_SIZE);
-        let body = album_tracks_body(album_uri, offset, limit);
-        let payload = pathfinder_post(session, &body, "album play counts").await?;
+        pages.push((offset, limit));
+        offset += limit;
+    }
+    let payloads: Vec<Vec<u8>> = stream::iter(pages)
+        .map(|(offset, limit)| async move {
+            let body = album_tracks_body(album_uri, offset, limit);
+            pathfinder_post(session, &body, "album play counts").await
+        })
+        .buffer_unordered(ALBUM_PLAYCOUNT_PAGE_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let mut counts = HashMap::new();
+    for payload in payloads {
         let parsed: AlbumCountsResponse = serde_json::from_slice(&payload)
             .map_err(|error| format!("unparseable album play-count response: {error}"))?;
         if let Some(items) = parsed
@@ -6192,7 +6229,6 @@ async fn album_playcounts(
         {
             collect_playcount_items(items, &mut counts);
         }
-        offset += limit;
     }
     if counts.is_empty() {
         return Err("Spotify returned no play counts for this album".to_owned());
@@ -6274,18 +6310,47 @@ fn search_desktop_body(query: &str, limit: usize, hash: &str) -> String {
     .to_string()
 }
 
+struct PathfinderError {
+    message: String,
+    /// True when the error is specific to the persisted-query document (e.g.
+    /// HTTP 400/404/422), so falling through to the next hash makes sense.
+    /// False for auth (login5 / 401 / 403) and transport/server failures.
+    retry_next_hash: bool,
+}
+
+fn pathfinder_http_retries_next_hash(
+    kind: librespot_core::error::ErrorKind,
+    status: Option<u16>,
+) -> bool {
+    if browse_error_is_transient(kind, status) {
+        return false;
+    }
+    match status {
+        Some(401 | 403) | None => false,
+        Some(_) => true,
+    }
+}
+
 /// One pathfinder attempt for a given persisted-query body: POST with the
 /// session's login5 bearer + client token, transient failures retried with
 /// the bounded backoff. A client error (e.g. a 400 persisted-query
-/// rejection) fails fast so the caller can fall back to another hash.
+/// rejection) fails fast so the caller can fall back to another hash, while
+/// auth and transport/server errors abort early.
 ///
 /// `what` names the operation in error and retry messages only.
-async fn pathfinder_post(session: &Session, body: &str, what: &str) -> Result<Vec<u8>, String> {
+async fn pathfinder_post_typed(
+    session: &Session,
+    body: &str,
+    what: &str,
+) -> Result<Vec<u8>, PathfinderError> {
     let token = session
         .login5()
         .auth_token()
         .await
-        .map_err(|error| format!("{what} authentication failed: {error}"))?;
+        .map_err(|error| PathfinderError {
+            message: format!("{what} authentication failed: {error}"),
+            retry_next_hash: false,
+        })?;
     let mut builder = Request::builder()
         .method(Method::POST)
         .uri(PATHFINDER_ENDPOINT)
@@ -6299,7 +6364,10 @@ async fn pathfinder_post(session: &Session, body: &str, what: &str) -> Result<Ve
     }
     let request = builder
         .body(Bytes::from(body.to_owned()))
-        .map_err(|error| format!("{what} request construction failed: {error}"))?;
+        .map_err(|error| PathfinderError {
+            message: format!("{what} request construction failed: {error}"),
+            retry_next_hash: false,
+        })?;
 
     let backoffs = backoff_sequence(
         BROWSE_RETRY_ATTEMPTS,
@@ -6311,12 +6379,16 @@ async fn pathfinder_post(session: &Session, body: &str, what: &str) -> Result<Ve
         match session.http_client().request_body(request.clone()).await {
             Ok(bytes) => return Ok(bytes.to_vec()),
             Err(error) => {
-                let transient = browse_error_is_transient(error.kind, http_status_of(&error));
+                let status = http_status_of(&error);
+                let transient = browse_error_is_transient(error.kind, status);
                 if !transient || attempt >= backoffs.len() {
-                    return Err(format!(
-                        "{what} request failed after {} attempt(s) (last error: {error})",
-                        attempt + 1,
-                    ));
+                    return Err(PathfinderError {
+                        message: format!(
+                            "{what} request failed after {} attempt(s) (last error: {error})",
+                            attempt + 1,
+                        ),
+                        retry_next_hash: pathfinder_http_retries_next_hash(error.kind, status),
+                    });
                 }
                 let backoff = backoffs[attempt];
                 eprintln!(
@@ -6329,6 +6401,24 @@ async fn pathfinder_post(session: &Session, body: &str, what: &str) -> Result<Ve
             }
         }
     }
+}
+
+async fn pathfinder_post(session: &Session, body: &str, what: &str) -> Result<Vec<u8>, String> {
+    pathfinder_post_typed(session, body, what)
+        .await
+        .map_err(|error| error.message)
+}
+
+fn parse_search_desktop_payload(payload: &[u8]) -> Result<SearchV2Json, String> {
+    let SearchDesktopResponse { data, errors } = serde_json::from_slice(payload)
+        .map_err(|error| format!("unparseable search response: {error}"))?;
+    data.and_then(|data| data.searchV2).ok_or_else(|| {
+        if errors.as_deref().unwrap_or_default().is_empty() {
+            "search response contained no results".to_owned()
+        } else {
+            "search persisted query was rejected".to_owned()
+        }
+    })
 }
 
 /// Search via the official client's pathfinder GraphQL `searchDesktop`
@@ -6348,16 +6438,21 @@ pub async fn search_browse(
     let mut last_error = String::new();
     for hash in SEARCH_DESKTOP_HASHES {
         let body = search_desktop_body(query.trim(), limit, hash);
-        let payload = match pathfinder_post(session, &body, "search").await {
+        let payload = match pathfinder_post_typed(session, &body, "search").await {
             Ok(payload) => payload,
+            Err(error) if error.retry_next_hash => {
+                last_error = error.message;
+                continue;
+            }
+            Err(error) => return Err(error.message),
+        };
+        let search = match parse_search_desktop_payload(&payload) {
+            Ok(search) => search,
             Err(error) => {
                 last_error = error;
                 continue;
             }
         };
-        let parsed: SearchDesktopResponse = serde_json::from_slice(&payload)
-            .map_err(|error| format!("unparseable search response: {error}"))?;
-        let search = &parsed.data.searchV2;
         let mut shows = search.podcasts.as_ref()
             .into_iter()
             .flat_map(|section| section.items.iter())
@@ -6401,18 +6496,14 @@ pub async fn search_browse(
         }
         return Ok(spotifine_common::protocol::SearchBrowse {
             top: search_top_ref(query.trim(), &search.topResultsV2),
-            tracks: parsed
-                .data
-                .searchV2
+            tracks: search
                 .tracksV2
                 .items
                 .iter()
                 .map(|wrapper| track_ref_from_hit(&wrapper.item.data))
                 .collect(),
             albums: openable_by_id(
-                parsed
-                    .data
-                    .searchV2
+                search
                     .albumsV2
                     .items
                     .iter()
@@ -6421,9 +6512,7 @@ pub async fn search_browse(
                 |album| (album.id.as_str(), album.name.as_str()),
             ),
             artists: openable_by_id(
-                parsed
-                    .data
-                    .searchV2
+                search
                     .artists
                     .items
                     .iter()
@@ -6432,9 +6521,7 @@ pub async fn search_browse(
                 |artist| (artist.id.as_str(), artist.name.as_str()),
             ),
             playlists: openable_by_id(
-                parsed
-                    .data
-                    .searchV2
+                search
                     .playlists
                     .as_ref()
                     .and_then(|section| section.items.as_deref())
@@ -6540,7 +6627,7 @@ mod tests {
     fn podcast_search_keeps_show_identity_and_ranks_the_episode_without_claiming_playability() {
         // Direct data wrappers and podcastV2 fields follow Spotifly's
         // searchAll.ts and SpotifyScraper's captured searchDesktop schema.
-        let response: SearchDesktopResponse = serde_json::from_str(r#"{"data":{"searchV2":{
+        let search = parse_search_desktop_payload(br#"{"data":{"searchV2":{
             "podcasts":{"items":[{"data":{
                 "uri":"spotify:show:0123456789ABCDEFGHIJKL","name":"A show",
                 "publisher":{"name":"A publisher"},
@@ -6555,7 +6642,6 @@ mod tests {
                 "__typename":"Episode","uri":"spotify:episode:1abcdefghijklmnopqrstu","name":"An episode"
             }}}]}
         }}}"#).unwrap();
-        let search = response.data.searchV2;
         let show = podcast_show_hit(search.podcasts.as_ref().unwrap().items[0].hit().unwrap()).unwrap();
         assert_eq!(show.publisher, "A publisher");
         assert_eq!(show.cover_url.as_deref(), Some("https://i.scdn.co/image/show"));
@@ -7436,8 +7522,8 @@ mod tests {
                 }
             }
         }"#;
-        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        let top = search_top_ref("top 50", &parsed.data.searchV2.topResultsV2)
+        let parsed = parse_search_desktop_payload(body.as_bytes()).unwrap();
+        let top = search_top_ref("top 50", &parsed.topResultsV2)
             .expect("a top result");
         match top {
             spotifine_common::protocol::SearchTopRef::Playlist(playlist) => {
@@ -7465,8 +7551,8 @@ mod tests {
                 }
             }
         }"#;
-        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        let top = search_top_ref("real answer", &parsed.data.searchV2.topResultsV2)
+        let parsed = parse_search_desktop_payload(body.as_bytes()).unwrap();
+        let top = search_top_ref("real answer", &parsed.topResultsV2)
             .expect("a top result");
         match top {
             spotifine_common::protocol::SearchTopRef::Artist(artist) => {
@@ -7480,9 +7566,8 @@ mod tests {
     /// result, never an error: the groups below it are still a useful page.
     #[test]
     fn search_desktop_top_result_absent_is_not_an_error() {
-        let parsed: SearchDesktopResponse =
-            serde_json::from_str(r#"{"data": {"searchV2": {}}}"#).unwrap();
-        assert!(search_top_ref("anything", &parsed.data.searchV2.topResultsV2).is_none());
+        let parsed = parse_search_desktop_payload(br#"{"data": {"searchV2": {}}}"#).unwrap();
+        assert!(search_top_ref("anything", &parsed.topResultsV2).is_none());
     }
 
     #[test]
@@ -7535,28 +7620,22 @@ mod tests {
                 }
             }
         }"#;
-        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        let parsed = parse_search_desktop_payload(body.as_bytes()).unwrap();
         let converted = spotifine_common::protocol::SearchBrowse {
-            top: search_top_ref("anything", &parsed.data.searchV2.topResultsV2),
+            top: search_top_ref("anything", &parsed.topResultsV2),
             tracks: parsed
-                .data
-                .searchV2
                 .tracksV2
                 .items
                 .iter()
                 .map(|wrapper| track_ref_from_hit(&wrapper.item.data))
                 .collect(),
             albums: parsed
-                .data
-                .searchV2
                 .albumsV2
                 .items
                 .iter()
                 .map(|wrapper| album_ref_from_hit(&wrapper.data))
                 .collect(),
             artists: parsed
-                .data
-                .searchV2
                 .artists
                 .items
                 .iter()
@@ -7687,11 +7766,9 @@ mod tests {
 
     /// The Playlists section exactly as `search_browse` assembles it.
     fn search_playlist_section(body: &str) -> Vec<PlaylistRef> {
-        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        let parsed = parse_search_desktop_payload(body.as_bytes()).unwrap();
         openable_by_id(
             parsed
-                .data
-                .searchV2
                 .playlists
                 .as_ref()
                 .and_then(|section| section.items.as_deref())
@@ -7752,11 +7829,9 @@ mod tests {
                           "profile": {"name": "Real Artist"}}}
             ]}
         }}}"#;
-        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        let parsed = parse_search_desktop_payload(body.as_bytes()).unwrap();
         let albums = openable_by_id(
             parsed
-                .data
-                .searchV2
                 .albumsV2
                 .items
                 .iter()
@@ -7766,8 +7841,6 @@ mod tests {
         );
         let artists = openable_by_id(
             parsed
-                .data
-                .searchV2
                 .artists
                 .items
                 .iter()
@@ -7799,13 +7872,13 @@ mod tests {
                                    "profile": {"name": "Old Shape Artist"}}}}
             ]}
         }}}"#;
-        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.data.searchV2.albumsV2.items.len(), 1);
+        let parsed = parse_search_desktop_payload(body.as_bytes()).unwrap();
+        assert_eq!(parsed.albumsV2.items.len(), 1);
         assert_eq!(
-            album_ref_from_hit(&parsed.data.searchV2.albumsV2.items[0].data).name,
+            album_ref_from_hit(&parsed.albumsV2.items[0].data).name,
             "Old Shape"
         );
-        let top = search_top_ref("old shape artist", &parsed.data.searchV2.topResultsV2)
+        let top = search_top_ref("old shape artist", &parsed.topResultsV2)
             .expect("the pre-V2 top-result section still ranks");
         assert!(matches!(
             top,
@@ -9056,10 +9129,8 @@ mod tests {
                       "visuals": {"avatarImage": null}}},
             {"data": {"uri": "spotify:artist:5abcdefghijklmnopqrstu", "profile": {"name": "No Visuals"}}}
         ]}}}}"#;
-        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        let parsed = parse_search_desktop_payload(body.as_bytes()).unwrap();
         let artists: Vec<ArtistRef> = parsed
-            .data
-            .searchV2
             .artists
             .items
             .iter()
@@ -9125,20 +9196,38 @@ mod tests {
     fn search_desktop_json_tolerates_unknown_shapes() {
         let body =
             r#"{"weird": true, "data": {"searchV2": {"tracksV2": {"somethingElse": [1, 2]}}}}"#;
-        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        assert!(parsed.data.searchV2.tracksV2.items.is_empty());
-        assert!(parsed.data.searchV2.albumsV2.items.is_empty());
-        assert!(parsed.data.searchV2.artists.items.is_empty());
+        let parsed = parse_search_desktop_payload(body.as_bytes()).unwrap();
+        assert!(parsed.tracksV2.items.is_empty());
+        assert!(parsed.albumsV2.items.is_empty());
+        assert!(parsed.artists.items.is_empty());
 
         // A track with only a URI yields empty strings, never an error.
         let bare = r#"{"data": {"searchV2": {"tracksV2": {"items": [{"item": {"data": {"uri": "spotify:track:2abcdefghijklmnopqrstu"}}}]}}}}"#;
-        let parsed: SearchDesktopResponse = serde_json::from_str(bare).unwrap();
-        let track = track_ref_from_hit(&parsed.data.searchV2.tracksV2.items[0].item.data);
+        let parsed = parse_search_desktop_payload(bare.as_bytes()).unwrap();
+        let track = track_ref_from_hit(&parsed.tracksV2.items[0].item.data);
         assert_eq!(track.id, "2abcdefghijklmnopqrstu");
         assert_eq!(track.name, "");
         assert!(track.artist_names.is_empty());
         assert_eq!(track.cover_url, "");
         assert_eq!(track.duration_ms, 0);
+
+        // GraphQL HTTP-200 rejection and unparseable bodies return Err so
+        // search_browse falls through to the next persisted-query hash.
+        assert!(parse_search_desktop_payload(
+            br#"{"errors":[{"message":"PersistedQueryNotFound"}]}"#
+        ).is_err());
+        assert!(parse_search_desktop_payload(br#"{"data":null,"errors":[{"message":"bad hash"}]}"#).is_err());
+        assert!(parse_search_desktop_payload(br#"{"data":{}}"#).is_err());
+        assert!(parse_search_desktop_payload(b"not json").is_err());
+
+        // Persisted-query 4xx rejections retry next hash; auth & transport errors abort early.
+        assert!(pathfinder_http_retries_next_hash(ErrorKind::FailedPrecondition, Some(400)));
+        assert!(pathfinder_http_retries_next_hash(ErrorKind::NotFound, Some(404)));
+        assert!(!pathfinder_http_retries_next_hash(ErrorKind::Unauthenticated, Some(401)));
+        assert!(!pathfinder_http_retries_next_hash(ErrorKind::PermissionDenied, Some(403)));
+        assert!(!pathfinder_http_retries_next_hash(ErrorKind::Unavailable, Some(503)));
+        assert!(!pathfinder_http_retries_next_hash(ErrorKind::Unavailable, Some(429)));
+        assert!(!pathfinder_http_retries_next_hash(ErrorKind::Unavailable, None));
 
         // Duration may arrive as a JSON number as well as a string.
         let duration: SearchDurationJson =

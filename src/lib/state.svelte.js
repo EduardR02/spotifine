@@ -1366,7 +1366,7 @@ export function loadTrackCredits(track) {
 
 
 /** See the note on `api.search`; this is the single knob that moves latency. */
-export const SEARCH_LIMIT = 10;
+const SEARCH_LIMIT = 10;
 
 /**
  * Debounce before a keystroke becomes a request. Every search costs at least
@@ -1496,6 +1496,7 @@ function observeSearchSession(payload) {
       panelCreditsSeq += 1;
       Object.assign(trackCredits, { id: null, loading: false, data: null, error: null });
       closeCredits();
+      ui.error = null;
       browseSeq += 1;
       Object.assign(detail, { playlist: null, radio: null, album: null, artist: null, error: "" });
       library.length = 0;
@@ -1890,14 +1891,14 @@ const MADE_FOR_YOU_RULES = Object.freeze([
  * Returns the canonical personalized-playlist kind, or `null` for an ordinary
  * library playlist. Callers pass either a Playlist object or a name string.
  */
-export function classifyLibraryPlaylist(playlist) {
+function classifyLibraryPlaylist(playlist) {
   const raw = typeof playlist === "string" ? playlist : playlist?.name;
   const name = String(raw ?? "").trim().replace(/\s+/g, " ").toLowerCase();
   if (!name) return null;
   return MADE_FOR_YOU_RULES.find(([, pattern]) => pattern.test(name))?.[0] ?? null;
 }
 
-export function isMadeForYouPlaylist(playlist) {
+function isMadeForYouPlaylist(playlist) {
   return classifyLibraryPlaylist(playlist) !== null;
 }
 /**
@@ -1911,7 +1912,7 @@ export function isMadeForYouPlaylist(playlist) {
  * grid. Daily Mixes 1-6 get their own ordered band; later mixes are treated as
  * other personalized items rather than displacing the requested six.
  */
-export function personalizedPlaylistRank(playlist) {
+function personalizedPlaylistRank(playlist) {
   const kind = classifyLibraryPlaylist(playlist);
   if (!kind) return null;
   if (kind === "release-radar") return 0;
@@ -1929,7 +1930,7 @@ export function personalizedPlaylistRank(playlist) {
 }
 
 /** The DJ shelf is not a user playlist recommendation and never belongs on Home. */
-export function isDjPlaylist(playlist) {
+function isDjPlaylist(playlist) {
   const raw = typeof playlist === "string" ? playlist : playlist?.name;
   const name = String(raw ?? "").trim().replace(/\s+/g, " ").toLowerCase();
   return /^dj(?:\b|$)/.test(name);
@@ -1950,7 +1951,7 @@ const PERSONALIZED_DISCOVERY_QUERIES = Object.freeze(["Daily Mix", "Release Rada
 const PERSONALIZED_SEARCH_LIMIT = 20;
 const PERSONALIZED_FAILURE_MESSAGE = "Personalized playlists could not load.";
 
-export const personalizedDiscovery = $state({
+const personalizedDiscovery = $state({
   playlists: [],
   status: "idle",
   error: "",
@@ -2198,6 +2199,11 @@ export function libraryKind(row) {
   return row?.uri?.startsWith("spotify:album:") ? "album" : "playlist";
 }
 
+/** True when the current signed-in user owns this library playlist and can add tracks to it. */
+export function isWritablePlaylist(row) {
+  return libraryKind(row) === "playlist" && !!row?.owner_id && !!session.username && row.owner_id === session.username;
+}
+
 export function setLibrary(playlists, { fresh = false, tree } = {}) {
   // A presentation run has no stored library: its one answer is the
   // configured library, and until then the rail keeps its loading frame.
@@ -2395,7 +2401,7 @@ export function insertPlaylist(playlist) {
  * as `null` whenever the backend has no stamp of its own; `null` means "not
  * supplied" and preserves ours. A concrete timestamp outranks it.
  */
-export function applyPlaylistSummary(summary) {
+function applyPlaylistSummary(summary) {
   const id = typeof summary?.id === "string" ? summary.id : "";
   if (!id) return false;
   const row = library.find((playlist) => playlist?.id === id);
@@ -2425,9 +2431,15 @@ function editFailed(what, error) {
 // Compute each optimistic edit only after the previous one has settled, so
 // rollback snapshots never contain another uncommitted edit.
 let treeEditTail = null;
-function serializeTreeEdit(edit) {
+function serializeTreeEdit(edit, onStale = () => false) {
   const epoch = searchSessionEpoch;
-  const run = () => epoch === searchSessionEpoch ? edit() : false;
+  const run = () => {
+    try {
+      return epoch === searchSessionEpoch ? edit() : onStale();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
   const operation = treeEditTail ? treeEditTail.then(run, run) : Promise.resolve(run());
   const pending = operation.finally(() => {
     if (treeEditTail === pending) treeEditTail = null;
@@ -2459,14 +2471,16 @@ function libraryItemName(item) {
 }
 
 /** A new folder, first in the library or first in `parent`. Throws. */
-export async function createLibraryFolder(name, parent = null) {
-  const epoch = searchSessionEpoch;
-  const folder = await api.createFolder(name.trim(), parent);
-  if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
-  if (!findFolder(libraryState.tree, folder.id)) {
-    libraryState.tree = insertFirst(libraryState.tree, parent, folder);
-  }
-  return folder;
+export function createLibraryFolder(name, parent = null) {
+  return serializeTreeEdit(async () => {
+    const epoch = searchSessionEpoch;
+    const folder = await api.createFolder(name.trim(), parent);
+    if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
+    if (!findFolder(libraryState.tree, folder.id)) {
+      libraryState.tree = insertFirst(libraryState.tree, parent, folder);
+    }
+    return folder;
+  }, () => { throw new Error("The Spotify session changed."); });
 }
 
 export function renameLibraryFolder(id, name) {
@@ -2483,16 +2497,18 @@ export function renameLibraryFolder(id, name) {
 }
 
 /** The folder and everything in it, gone from the library. Throws. */
-export async function deleteLibraryFolder(id) {
-  const epoch = searchSessionEpoch;
-  await api.deleteFolder(id);
-  if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
-  const { tree, playlistIds } = removeFolder(libraryState.tree, id);
-  libraryState.tree = tree;
-  const gone = new Set(playlistIds);
-  for (let index = library.length - 1; index >= 0; index--) {
-    if (gone.has(library[index]?.id)) library.splice(index, 1);
-  }
+export function deleteLibraryFolder(id) {
+  return serializeTreeEdit(async () => {
+    const epoch = searchSessionEpoch;
+    await api.deleteFolder(id);
+    if (epoch !== searchSessionEpoch) throw new Error("The Spotify session changed.");
+    const { tree, playlistIds } = removeFolder(libraryState.tree, id);
+    libraryState.tree = tree;
+    const gone = new Set(playlistIds);
+    for (let index = library.length - 1; index >= 0; index--) {
+      if (gone.has(library[index]?.id)) library.splice(index, 1);
+    }
+  }, () => { throw new Error("The Spotify session changed."); });
 }
 
 /**
@@ -3444,7 +3460,7 @@ export async function initEvents() {
       : [],
   );
   if (failures.length > 0) {
-    playback.error = failures.join("; ");
+    ui.error = failures.join("; ");
   }
 
   // Pull initial state. The engine may not be ready yet (offline, never), so

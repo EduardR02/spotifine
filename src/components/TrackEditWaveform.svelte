@@ -48,7 +48,7 @@
   let pendingHover = null;
   let mainSize = { width: 0, height: 0 };
   let overviewSize = { width: 0, height: 0 };
-  let cursorValue = 0;
+  let cursorValue = $state(0);
 
   const duration = $derived(Math.max(1, Math.round(Number(durationMs) || 1)));
   const waveIndex = $derived(indexWaveform(waveform));
@@ -591,6 +591,7 @@
       return;
     }
     if (disabled) return;
+    if (command || event.altKey) return;
     if (event.key === "+" || event.key === "=") {
       event.preventDefault(); zoomAt(0.5);
     } else if (event.key === "-" || event.key === "_") {

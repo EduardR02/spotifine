@@ -252,7 +252,41 @@ fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
+    use std::ffi::c_int;
+    use std::fs::File;
+    use std::os::unix::io::FromRawFd;
+
+    const STDOUT_FD: c_int = 1;
+    const STDERR_FD: c_int = 2;
+
+    unsafe extern "C" {
+        fn dup(oldfd: c_int) -> c_int;
+        fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+    }
+
+    // SAFETY: POSIX dup/dup2 on standard stdio fds; the duplicated descriptor
+    // is uniquely owned by `File` on return.
+    unsafe {
+        let duplicate = dup(STDOUT_FD);
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let output = File::from_raw_fd(duplicate);
+
+        // Redirect fd 1 to stderr so stray stdout writes from dependencies
+        // cannot corrupt the JSON-lines protocol pipe while we keep our
+        // private duplicate of the original stdout.
+        if dup2(STDERR_FD, STDOUT_FD) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Box::new(output))
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
     Ok(Box::new(io::stdout()))
 }

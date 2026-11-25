@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use url::Url;
 
-use crate::app::{load_app_settings, update_app_settings, AppSettings, AppState};
+use crate::app::{load_app_settings, update_app_settings_async, AppSettings, AppState};
 
 const REDIRECT: &str = "http://127.0.0.1:5589/personal-api/callback";
 const VAULT_SERVICE: &str = "Spotifine.PersonalApi";
@@ -157,6 +157,24 @@ fn erase_grant() -> Result<(), String> {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(_) => Err("could not erase the protected Spotify grant".to_owned()),
     }
+}
+
+async fn load_grant_async() -> Result<Option<Grant>, String> {
+    tokio::task::spawn_blocking(load_grant)
+        .await
+        .map_err(|_| "could not read the protected Spotify grant".to_owned())?
+}
+
+async fn save_grant_async(grant: Grant) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || save_grant(&grant))
+        .await
+        .map_err(|_| "could not save the protected Spotify grant".to_owned())?
+}
+
+async fn erase_grant_async() -> Result<(), String> {
+    tokio::task::spawn_blocking(erase_grant)
+        .await
+        .map_err(|_| "could not erase the protected Spotify grant".to_owned())?
 }
 
 fn scopes_contain(scopes: &str, wanted: &str) -> bool {
@@ -351,10 +369,14 @@ impl PersonalApi {
         Ok(Arc::new(Self { http, operation: AsyncMutex::new(()), session: Mutex::new(Session::default()) }))
     }
 
-    fn ensure_loaded(&self) -> Result<(), String> {
+    async fn ensure_loaded(&self) -> Result<(), String> {
+        if self.session.lock().loaded {
+            return Ok(());
+        }
+        let grant = load_grant_async().await?;
         let mut session = self.session.lock();
         if !session.loaded {
-            session.grant = load_grant()?;
+            session.grant = grant;
             session.loaded = true;
         }
         Ok(())
@@ -362,14 +384,14 @@ impl PersonalApi {
 
     pub async fn status(&self, app: &AppHandle) -> Result<Status, String> {
         let _operation = self.operation.lock().await;
-        self.ensure_loaded()?;
+        self.ensure_loaded().await?;
         Ok(app_status(app, &self.session.lock(), &load_app_settings()))
     }
 
-    fn disconnect_locked(&self, app: &AppHandle) -> Result<Status, String> {
+    async fn disconnect_locked(&self, app: &AppHandle) -> Result<Status, String> {
         // Only clear memory after the native deletion succeeds; never report disconnected
         // while a usable grant remains on disk.
-        erase_grant()?;
+        erase_grant_async().await?;
         let mut session = self.session.lock();
         session.grant = None;
         session.loaded = true;
@@ -384,19 +406,20 @@ impl PersonalApi {
 
     pub async fn disconnect(&self, app: &AppHandle) -> Result<Status, String> {
         let _operation = self.operation.lock().await;
-        self.disconnect_locked(app)
+        self.disconnect_locked(app).await
     }
 
     pub async fn configure(&self, app: &AppHandle, client_id: String) -> Result<Status, String> {
-        let client_id = client_id.trim();
-        if !client_id.is_empty() && !valid_client_id(client_id) {
+        let client_id = client_id.trim().to_owned();
+        if !client_id.is_empty() && !valid_client_id(&client_id) {
             return Err("Spotify Client ID must be 32 hexadecimal characters".to_owned());
         }
         let _operation = self.operation.lock().await;
         let mut settings = load_app_settings();
         if settings.personal_client_id != client_id {
-            self.disconnect_locked(app)?;
-            settings = update_app_settings(|settings| settings.personal_client_id = client_id.to_owned())?;
+            self.disconnect_locked(app).await?;
+            let next_id = client_id.clone();
+            settings = update_app_settings_async(move |settings| settings.personal_client_id = next_id).await?;
             emit(app, &self.session.lock());
         }
         Ok(app_status(app, &self.session.lock(), &settings))
@@ -488,7 +511,7 @@ impl PersonalApi {
         if enable_devices && !scopes_contain(&grant.scopes, DEVICE_SCOPES) {
             return Err("Spotify did not grant the requested Connect permissions".to_owned());
         }
-        save_grant(&grant)?;
+        save_grant_async(grant.clone()).await?;
         let mut session = self.session.lock();
         session.grant = Some(grant);
         session.loaded = true;
@@ -506,8 +529,9 @@ impl PersonalApi {
 
     // Called only while `operation` is locked: refresh rotation and requests cannot race
     // with disconnect, reauthorization, or another rotation.
-    async fn access_token(&self, app: &AppHandle, devices: bool) -> Result<String, String> {
-        self.ensure_loaded()?;
+    // Returns `(access_token, freshly_refreshed)`.
+    async fn access_token(&self, app: &AppHandle, devices: bool, force_refresh: bool) -> Result<(String, bool), String> {
+        self.ensure_loaded().await?;
         let settings = load_app_settings();
         let grant = {
             let session = self.session.lock();
@@ -520,8 +544,8 @@ impl PersonalApi {
             if !scopes_contain(&grant.scopes, LIBRARY_SCOPES) {
                 return Err("reconnect to grant Spotify library permissions".to_owned());
             }
-            if grant.expires_at > now().saturating_add(30) {
-                return Ok(grant.access_token.clone());
+            if !force_refresh && grant.expires_at > now().saturating_add(30) {
+                return Ok((grant.access_token.clone(), false));
             }
             grant.clone()
         };
@@ -530,7 +554,7 @@ impl PersonalApi {
             Ok(token) => token,
             Err(error) => {
                 if error.contains("authorization expired") {
-                    self.disconnect_locked(app)?;
+                    self.disconnect_locked(app).await?;
                 }
                 return Err(error);
             }
@@ -538,11 +562,11 @@ impl PersonalApi {
         let updated = refreshed_grant(grant, token);
         // Persist the rotated token before exposing it to a call; failure is not a
         // valid reason to make an unrecoverable grant appear functional.
-        save_grant(&updated)?;
+        save_grant_async(updated.clone()).await?;
         check_account(app, &updated)?;
         let access_token = updated.access_token.clone();
         self.session.lock().grant = Some(updated);
-        Ok(access_token)
+        Ok((access_token, true))
     }
 
     fn check_active_grant(&self, app: &AppHandle) -> Result<(), String> {
@@ -550,17 +574,26 @@ impl PersonalApi {
     }
 
     async fn request(&self, app: &AppHandle, devices: bool, method: Method, path: &str, uris: Option<&[String]>, body: Option<serde_json::Value>) -> Result<reqwest::Response, String> {
-        let token = self.access_token(app, devices).await?;
         let mut url = Url::parse("https://api.spotify.com/v1/").expect("static API URL").join(path).expect("static API route");
         if let Some(uris) = uris {
             url.query_pairs_mut().append_pair("uris", &uris.join(","));
         }
+        let (token, refreshed) = self.access_token(app, devices, false).await?;
         self.check_active_grant(app)?;
-        let response = api_request(&self.http, &token, method, url, body).send().await
-            .map_err(|_| UNREACHABLE.to_owned())?;
-        if !response.status().is_success() {
-            return Err(spotify_error(response.status()));
-        }
+        let response = send_with_refresh_retry(
+            &self.http,
+            &token,
+            refreshed,
+            method,
+            url,
+            body,
+            || async {
+                let (fresh_token, _) = self.access_token(app, devices, true).await?;
+                self.check_active_grant(app)?;
+                Ok(fresh_token)
+            },
+        )
+        .await?;
         self.check_active_grant(app)?;
         Ok(response)
     }
@@ -604,12 +637,12 @@ impl PersonalApi {
 
     pub async fn account_changed(&self, app: &AppHandle, username: &str) {
         let _operation = self.operation.lock().await;
-        let needs_disconnect = self.ensure_loaded().is_ok()
+        let needs_disconnect = self.ensure_loaded().await.is_ok()
             && self.session.lock().grant.as_ref().is_some_and(|grant| grant.account_id != username);
         if needs_disconnect {
             // A previously authorized account must never silently become the new
             // playback account's library or Connect identity.
-            if self.disconnect_locked(app).is_err() {
+            if self.disconnect_locked(app).await.is_err() {
                 let mut session = self.session.lock();
                 session.error = Some("could not erase the previous account's protected grant".to_owned());
                 emit(app, &session);
@@ -625,6 +658,38 @@ impl PersonalApi {
             }
         }
     }
+}
+
+async fn send_with_refresh_retry<F, Fut>(
+    http: &Client,
+    token: &str,
+    already_refreshed: bool,
+    method: Method,
+    url: Url,
+    body: Option<serde_json::Value>,
+    refresh: F,
+) -> Result<reqwest::Response, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let mut response = api_request(http, token, method.clone(), url.clone(), body.clone())
+        .send()
+        .await
+        .map_err(|_| UNREACHABLE.to_owned())?;
+    if response.status() == StatusCode::UNAUTHORIZED && !already_refreshed {
+        // A cached token can be revoked or clock-skewed before its nominal
+        // expiry; force one refresh-token exchange and retry once.
+        let fresh_token = refresh().await?;
+        response = api_request(http, &fresh_token, method, url, body)
+            .send()
+            .await
+            .map_err(|_| UNREACHABLE.to_owned())?;
+    }
+    if !response.status().is_success() {
+        return Err(spotify_error(response.status()));
+    }
+    Ok(response)
 }
 
 async fn answer(stream: &mut TcpStream, success: bool) {
@@ -956,5 +1021,51 @@ mod tests {
             assert_eq!(std::str::from_utf8(&bytes[..size]).unwrap().contains("200 OK"), expected);
         }
         assert_eq!(task.await.unwrap().unwrap().unwrap(), "approved");
+    }
+
+    #[tokio::test]
+    async fn cached_token_401_refreshes_and_retries_once_but_fresh_token_401_fails() {
+        let http = Client::builder().no_proxy().build().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/v1/me/player", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let mut seen_auth = Vec::new();
+            for (expected_auth, status) in [("bearer stale", "401 Unauthorized"), ("bearer fresh", "200 OK"), ("bearer fresh", "401 Unauthorized")] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.windows(4).any(|part| part == b"\r\n\r\n") { break; }
+                }
+                let head = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                let auth = head.lines()
+                    .find_map(|line| line.strip_prefix("authorization:").map(|value| value.trim().to_owned()))
+                    .unwrap_or_default();
+                assert_eq!(auth, expected_auth);
+                seen_auth.push(auth);
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }
+            seen_auth
+        });
+
+        let refreshes = std::sync::atomic::AtomicUsize::new(0);
+        let response = send_with_refresh_retry(&http, "stale", false, Method::GET, url.clone(), None, || async {
+            refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("fresh".to_owned())
+        }).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let second_refreshes = std::sync::atomic::AtomicUsize::new(0);
+        let error = send_with_refresh_retry(&http, "fresh", true, Method::GET, url, None, || async {
+            second_refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("unused".to_owned())
+        }).await.err().unwrap();
+        assert_eq!(second_refreshes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(error, spotify_error(StatusCode::UNAUTHORIZED));
+        assert_eq!(server.await.unwrap().len(), 3);
     }
 }

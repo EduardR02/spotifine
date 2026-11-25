@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use librespot_core::FileId;
 use librespot_core::cache::Cache;
@@ -34,6 +35,12 @@ struct Index {
 }
 
 static INDEX: Mutex<Option<Index>> = Mutex::new(None);
+/// Serializes disk writes so concurrent saves cannot race on renames or
+/// overwrite a newer snapshot with an older one. Lock ordering is always
+/// `WRITE_LOCK -> INDEX`.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+static SAVE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -78,7 +85,7 @@ pub fn install(path: PathBuf, cached_files: Vec<FileId>) {
         if !files.is_empty() { tracks.insert(track, files); }
     }
     *INDEX.lock().expect("cache index mutex poisoned") = Some(Index { path, tracks, unmapped, dirty });
-    save_if_dirty();
+    save_if_dirty_sync();
 }
 
 /// `file_id` holds `track_id`'s audio: it was stored or played for it, or a
@@ -143,30 +150,117 @@ pub fn cached_among<'a>(ids: impl IntoIterator<Item = &'a str>, cache: &Cache) -
     Some(cached)
 }
 
-/// Writes the index if it changed since it was last written. Small (one line
-/// per cached track) and written only after the cache itself changed.
-pub fn save_if_dirty() {
-    let (path, bytes) = {
-        let mut guard = INDEX.lock().expect("cache index mutex poisoned");
-        let Some(index) = guard.as_mut().filter(|index| index.dirty) else { return };
-        let stored = Stored {
-            tracks: index.tracks.iter()
-                .map(|(track, files)| (track.clone(), files.iter().copied().filter_map(file_hex).collect()))
-                .collect(),
+/// Serializes pending dirty snapshots to disk under [`WRITE_LOCK`] using a
+/// unique temporary file in the destination directory. Returns `true` when no
+/// dirty state remains unwritten and `false` if a disk write failed.
+fn write_pending_now() -> bool {
+    let _write = WRITE_LOCK.lock().expect("cache index write mutex poisoned");
+    loop {
+        let (path, bytes) = {
+            let mut guard = INDEX.lock().expect("cache index mutex poisoned");
+            let Some(index) = guard.as_mut().filter(|index| index.dirty) else {
+                return true;
+            };
+            let stored = Stored {
+                tracks: index
+                    .tracks
+                    .iter()
+                    .map(|(track, files)| {
+                        (
+                            track.clone(),
+                            files.iter().copied().filter_map(file_hex).collect(),
+                        )
+                    })
+                    .collect(),
+            };
+            let Ok(bytes) = serde_json::to_vec(&stored) else {
+                return true;
+            };
+            index.dirty = false;
+            (index.path.clone(), bytes)
         };
-        let Ok(bytes) = serde_json::to_vec(&stored) else { return };
-        index.dirty = false;
-        (index.path.clone(), bytes)
-    };
-    let temporary = path.with_extension("tmp");
-    let written = std::fs::write(&temporary, &bytes)
-        .and_then(|()| spotifine_common::atomic::replace_file_atomically(&temporary, &path, false));
-    if let Err(error) = written {
-        eprintln!("could not save the audio cache index: {error}");
-        let _ = std::fs::remove_file(&temporary);
-        if let Some(index) = INDEX.lock().expect("cache index mutex poisoned").as_mut() {
-            index.dirty = true;
+        let seq = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("audio-index");
+        let temporary = path.with_file_name(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+        let written = std::fs::write(&temporary, &bytes).and_then(|()| {
+            spotifine_common::atomic::replace_file_atomically(&temporary, &path, false)
+        });
+        if let Err(error) = written {
+            eprintln!("could not save the audio cache index: {error}");
+            let _ = std::fs::remove_file(&temporary);
+            if let Some(index) = INDEX.lock().expect("cache index mutex poisoned").as_mut() {
+                index.dirty = true;
+            }
+            return false;
         }
+    }
+}
+
+/// Synchronously flushes any dirty cache index state to disk (used at startup
+/// and during shutdown so the final snapshot lands before process exit).
+pub fn save_if_dirty_sync() {
+    let _ = write_pending_now();
+}
+
+/// Writes the index if it changed since it was last written. Small (one line
+/// per cached track) and written only after the cache itself changed. Inside a
+/// Tokio runtime, coalesces concurrent requests onto a single-flight
+/// `spawn_blocking` worker so async tasks never block on disk I/O.
+pub fn save_if_dirty() {
+    let is_dirty = INDEX
+        .lock()
+        .expect("cache index mutex poisoned")
+        .as_ref()
+        .is_some_and(|index| index.dirty);
+    if !is_dirty {
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if SAVE_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        handle.spawn_blocking(|| {
+            struct FlightGuard(bool);
+            impl Drop for FlightGuard {
+                fn drop(&mut self) {
+                    if self.0 {
+                        SAVE_IN_FLIGHT.store(false, Ordering::Release);
+                    }
+                }
+            }
+            let mut guard = FlightGuard(true);
+            loop {
+                let flushed = write_pending_now();
+                guard.0 = false;
+                SAVE_IN_FLIGHT.store(false, Ordering::Release);
+                if !flushed {
+                    return;
+                }
+                let still_dirty = INDEX
+                    .lock()
+                    .expect("cache index mutex poisoned")
+                    .as_ref()
+                    .is_some_and(|index| index.dirty);
+                if !still_dirty {
+                    return;
+                }
+                if SAVE_IN_FLIGHT
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
+                guard.0 = true;
+            }
+        });
+    } else {
+        let _ = write_pending_now();
     }
 }
 
@@ -236,5 +330,44 @@ mod tests {
         assert_eq!(cached_among(["track-a"], &cache), Some(Vec::new()), "a clear unmaps everything");
         uninstall();
         assert_eq!(cached_among(["track-a"], &cache), None, "no index, no answer");
+    }
+
+    #[test]
+    fn concurrent_saves_serialize_with_unique_temp_files_and_leave_no_tmp_behind() {
+        let (directory, cache) = fixture();
+        let path = directory.path().join("audio-index.json");
+        let files: Vec<FileId> = (1u8..=16).map(|byte| FileId::from_raw(&[byte; 20])).collect();
+        for &file_id in &files {
+            write(&cache, file_id);
+        }
+        install(path.clone(), files.clone());
+
+        let handles: Vec<_> = files
+            .iter()
+            .enumerate()
+            .map(|(idx, &file_id)| {
+                std::thread::spawn(move || {
+                    record(&format!("track-{idx}"), file_id);
+                    save_if_dirty_sync();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        save_if_dirty_sync();
+
+        let tmp_leftovers: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert!(tmp_leftovers.is_empty(), "no temp files left behind: {tmp_leftovers:?}");
+
+        install(path, files);
+        let ids: Vec<String> = (0..16).map(|idx| format!("track-{idx}")).collect();
+        let cached = cached_among(ids.iter().map(String::as_str), &cache).unwrap();
+        assert_eq!(cached.len(), 16);
+        uninstall();
     }
 }

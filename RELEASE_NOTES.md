@@ -1,3 +1,12 @@
+## Stability, macOS & UI fixes
+
+- **macOS library tabs:** Fixed `Playlists · Artists · Podcasts` truncating with ellipses on macOS so all three labels stay readable on one row across window widths.
+- **macOS lifecycle & controls:** Fixed **Start minimized** reopening the window, stopped background position updates while minimized, fixed Lock Screen timeline drift at non-1.0× speed, kept the top of the Now Playing panel draggable without Canvas, and shut down the playback engine cleanly before update restarts.
+- **Account & login fixes:** Free Spotify accounts now show a clear Premium-required message immediately instead of retrying for minutes; logging out frees the OAuth callback port right away; and Spotify usernames with spaces or special characters work across library and playlist edits.
+- **Interface & interaction fixes:** Settings is now reachable while logged out, long error banners wrap cleanly and can be selected, the playback speed popover closes properly on toggle and stays inside the window, the waveform editor's cursor readout updates live without hijacking copy/zoom shortcuts, Spacebar ignores held keys and shortcuts, and drag-and-drop / "Add to playlist" only target playlists you can edit.
+- **Faster & lighter under the hood:** Faster loading for large playlists and artist discographies, zero heap frees on the real-time audio callback, non-blocking settings/keychain I/O, bounded cover-art cache (with orphaned audio-key cleanup), and silent Windows installer upgrades preserve **Launch at login**.
+- **Homebrew tap:** macOS users can now install via `brew install --cask eduardr02/tap/spotifine`.
+
 ## Desktop fixes
 
 - Windows can minimize to the notification area without stopping playback. Turn on **Minimize to tray** in Settings. Right-click the tray icon for Open, Play/Pause, Next, and Quit.

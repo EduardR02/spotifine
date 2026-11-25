@@ -11,12 +11,17 @@ use serde::{Deserialize, Serialize};
 
 use spotifine_common::protocol::{
     normalize_canonical_playlist_description, AlbumBrowse, AlbumRef, ArtistBrowse,
-    ArtistCataloguePage, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
-    ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist, CreditRole, EpisodeRef,
-    HistoryItem as EngineHistoryItem, HistoryPage as EngineHistoryPage, LibraryItem, LibraryNode,
-    LikedSongsPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse,
-    SearchBrowse, SearchTopRef, ShowRef, SongwriterPlaylist as EngineSongwriterPlaylist,
-    TrackCredits, TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform, UserProfile,
+    ArtistCataloguePage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistReleases,
+    CreditRole, HistoryItem as EngineHistoryItem, HistoryPage as EngineHistoryPage, LibraryItem,
+    LibraryNode, PlaylistBrowse, PlaylistRef, RadioBrowse, SearchBrowse, SearchTopRef, ShowRef,
+    SongwriterPlaylist as EngineSongwriterPlaylist, TrackCredits, UserProfile,
+};
+
+pub use spotifine_common::protocol::{
+    ArtistImage as ArtistImageDetail, ArtistReleaseCounts as ArtistReleaseTotals,
+    ArtistTopCity as ArtistTopCityDetail, CreditArtist as Contributor, EpisodeRef as EpisodeDetail,
+    LikedSongsPage as LikedSongsDetail, PlaylistRecommendations as PlaylistRecommendationsDetail,
+    TrackRef as Track, TrackWaveform,
 };
 
 /// The verified songwriter playlist returned by the artist's separate
@@ -36,152 +41,7 @@ impl From<EngineSongwriterPlaylist> for SongwriterPlaylist {
     fn from(source: EngineSongwriterPlaylist) -> Self {
         Self {
             playlist: Playlist::from(&source.playlist),
-            tracks: source.tracks.into_iter().map(Track::from).collect(),
-        }
-    }
-}
-
-/// One playable track. Field-for-field identical to the engine's `TrackRef`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct Track {
-    pub id: String,
-    pub uri: String,
-    pub name: String,
-    pub artist_names: Vec<String>,
-    /// Artist ids parallel to `artist_names` — same length, same order — so
-    /// every credited artist on a track is individually linkable instead of
-    /// just the primary.
-    ///
-    /// The two are always the same length: the engine builds them in one pass
-    /// over one list, and [`align_artist_ids`] repairs entries loaded from a
-    /// cache written before this field existed. An individual id may still be
-    /// empty for an artist with no resolvable id, so render a name as a link
-    /// only when its id is non-empty.
-    pub artist_ids: Vec<String>,
-    /// Primary artist, unchanged and still used on its own in several places.
-    pub artist_id: String,
-    pub album_id: String,
-    pub album_name: String,
-    pub cover_url: String,
-    pub duration_ms: u32,
-    /// Lifetime Spotify play count on surfaces whose official payload carries
-    /// it (albums and artist Popular). Missing everywhere else.
-    pub play_count: Option<u64>,
-    /// Unix timestamp in milliseconds when this playlist item was added.
-    /// Absent for tracks sourced from albums, search, or legacy caches.
-    pub added_at: Option<i64>,
-    /// Stable metadata/account restriction. Runtime player/network failures
-    /// never mutate this persisted field.
-    pub unavailable: bool,
-    pub unavailable_reason: Option<String>,
-    /// Whether this track's audio is already in the app-owned librespot cache,
-    /// as measured by the engine at browse time.
-    ///
-    /// This one field is EPHEMERAL where every other field here is durable, so
-    /// it is never written to `playlist_tracks_cache.json`: an audio cache
-    /// that has been cleared or pruned since the file was written would
-    /// otherwise show download marks for tracks that are no longer on disk.
-    pub cached: bool,
-    /// Compact queue source context used when a play becomes a local history
-    /// row. It is intentionally ephemeral metadata, not part of the row.
-    pub context: String,
-    /// Frozen queue-only edit snapshot. Browse/cache tracks leave it absent.
-    pub effective_edit: Option<TrackEdit>,
-}
-
-impl From<TrackRef> for Track {
-    fn from(track: TrackRef) -> Self {
-        Self {
-            id: track.id,
-            uri: track.uri,
-            name: track.name,
-            artist_names: track.artist_names,
-            artist_ids: track.artist_ids,
-            artist_id: track.artist_id,
-            album_id: track.album_id,
-            album_name: track.album_name,
-            cover_url: track.cover_url,
-            duration_ms: track.duration_ms,
-            play_count: track.play_count,
-            added_at: track.added_at,
-            unavailable: track.unavailable,
-            unavailable_reason: track.unavailable_reason,
-            context: track.context,
-            cached: track.cached,
-            effective_edit: track.effective_edit,
-        }
-    }
-}
-
-impl From<&TrackRef> for Track {
-    fn from(track: &TrackRef) -> Self {
-        Self {
-            id: track.id.clone(),
-            uri: track.uri.clone(),
-            name: track.name.clone(),
-            artist_names: track.artist_names.clone(),
-            artist_ids: track.artist_ids.clone(),
-            artist_id: track.artist_id.clone(),
-            album_id: track.album_id.clone(),
-            album_name: track.album_name.clone(),
-            cover_url: track.cover_url.clone(),
-            duration_ms: track.duration_ms,
-            play_count: track.play_count,
-            added_at: track.added_at,
-            unavailable: track.unavailable,
-            unavailable_reason: track.unavailable_reason.clone(),
-            context: track.context.clone(),
-            cached: track.cached,
-            effective_edit: track.effective_edit.clone(),
-        }
-    }
-}
-
-impl From<Track> for TrackRef {
-    fn from(track: Track) -> Self {
-        Self {
-            id: track.id,
-            uri: track.uri,
-            name: track.name,
-            artist_names: track.artist_names,
-            artist_ids: track.artist_ids,
-            artist_id: track.artist_id,
-            album_id: track.album_id,
-            album_name: track.album_name,
-            cover_url: track.cover_url,
-            duration_ms: track.duration_ms,
-            play_count: track.play_count,
-            added_at: track.added_at,
-            unavailable: track.unavailable,
-            unavailable_reason: track.unavailable_reason,
-            context: track.context,
-            cached: track.cached,
-            effective_edit: track.effective_edit,
-        }
-    }
-}
-
-/// Frontend-facing copy of the engine waveform payload. Keeping this at the
-/// Tauri boundary makes the line-protocol conversion explicit while preserving
-/// the shared snake_case field contract.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct TrackWaveform {
-    pub track_id: String,
-    pub duration_ms: u32,
-    pub interval_ms: u16,
-    pub bin_count: u32,
-    pub peaks_base64: String,
-}
-
-impl From<EngineTrackWaveform> for TrackWaveform {
-    fn from(waveform: EngineTrackWaveform) -> Self {
-        Self {
-            track_id: waveform.track_id,
-            duration_ms: waveform.duration_ms,
-            interval_ms: waveform.interval_ms,
-            bin_count: waveform.bin_count,
-            peaks_base64: waveform.peaks_base64,
+            tracks: source.tracks,
         }
     }
 }
@@ -204,7 +64,7 @@ impl From<EngineHistoryItem> for HistoryEntry {
             ms_played: entry.row.ms_played,
             completed: entry.row.completed,
             context: entry.row.context,
-            track: Track::from(entry.track),
+            track: entry.track,
         }
     }
 }
@@ -227,21 +87,6 @@ impl From<EngineHistoryPage> for HistoryPageDetail {
             recorded: page.recorded,
             offset: page.offset,
             next_offset: page.next_offset,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct LikedSongsDetail {
-    pub tracks: Vec<Track>,
-    pub next_cursor: Option<String>,
-}
-
-impl From<LikedSongsPage> for LikedSongsDetail {
-    fn from(page: LikedSongsPage) -> Self {
-        Self {
-            tracks: page.tracks.into_iter().map(Track::from).collect(),
-            next_cursor: page.next_cursor,
         }
     }
 }
@@ -425,7 +270,7 @@ impl From<PlaylistBrowse> for PlaylistDetail {
     fn from(browse: PlaylistBrowse) -> Self {
         let revision = browse.revision.unwrap_or_default();
         let excluded_track_ids = browse.excluded_track_ids;
-        let tracks: Vec<Track> = browse.tracks.into_iter().map(Track::from).collect();
+        let tracks = browse.tracks;
         Self {
             playlist: Playlist {
                 id: browse.id,
@@ -474,31 +319,11 @@ pub struct RadioDetail {
 impl From<RadioBrowse> for RadioDetail {
     fn from(browse: RadioBrowse) -> Self {
         Self {
-            seed: browse.seed.into(),
-            tracks: browse.tracks.into_iter().map(Track::from).collect(),
+            seed: browse.seed,
+            tracks: browse.tracks,
             seed_kind: browse.seed_kind,
             seed_artist: browse.seed_artist.map(Artist::from),
             cover_url: browse.cover_url,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct PlaylistRecommendationsDetail {
-    pub playlist_id: String,
-    pub tracks: Vec<Track>,
-}
-
-impl From<PlaylistRecommendations> for PlaylistRecommendationsDetail {
-    fn from(recommendations: PlaylistRecommendations) -> Self {
-        Self {
-            playlist_id: recommendations.playlist_id,
-            tracks: recommendations
-                .tracks
-                .into_iter()
-                .map(Track::from)
-                .collect(),
         }
     }
 }
@@ -571,7 +396,7 @@ impl From<AlbumBrowse> for AlbumDetail {
         align_album_artist_ids(&mut album);
         Self {
             album,
-            tracks: browse.tracks.into_iter().map(Track::from).collect(),
+            tracks: browse.tracks,
         }
     }
 }
@@ -611,26 +436,6 @@ pub struct ArtistReleaseGroups {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct ArtistReleaseTotals {
-    pub albums: usize,
-    pub singles: usize,
-    pub compilations: usize,
-    pub appears_on: usize,
-}
-
-impl From<ArtistReleaseCounts> for ArtistReleaseTotals {
-    fn from(counts: ArtistReleaseCounts) -> Self {
-        Self {
-            albums: counts.albums,
-            singles: counts.singles,
-            compilations: counts.compilations,
-            appears_on: counts.appears_on,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
 pub struct ArtistCataloguePageDetail {
     pub releases: Vec<AlbumDetail>,
     pub total: usize,
@@ -655,49 +460,6 @@ impl From<ArtistReleases> for ArtistReleaseGroups {
             singles: convert(releases.singles),
             compilations: convert(releases.compilations),
             appears_on: convert(releases.appears_on),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct ArtistTopCityDetail {
-    pub city: String,
-    pub country: String,
-    pub region: String,
-    pub listeners: Option<u64>,
-}
-
-/// One editorial photograph with the dimensions the service reported for it.
-/// The About gallery needs the shape of every picture before any of them has
-/// loaded, so the size travels with the URL rather than being discovered on
-/// load. Absent dimensions reach the page as null and are read there as a
-/// neutral square.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct ArtistImageDetail {
-    pub url: String,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-}
-
-impl From<ArtistImage> for ArtistImageDetail {
-    fn from(image: ArtistImage) -> Self {
-        Self {
-            url: image.url,
-            width: image.width,
-            height: image.height,
-        }
-    }
-}
-
-impl From<ArtistTopCity> for ArtistTopCityDetail {
-    fn from(city: ArtistTopCity) -> Self {
-        Self {
-            city: city.city,
-            country: city.country,
-            region: city.region,
-            listeners: city.listeners,
         }
     }
 }
@@ -752,7 +514,7 @@ impl From<&ArtistPick> for ArtistPickDetail {
                 ArtistPickItem::Album(album) => {
                     ArtistPickItemDetail::Album(Album::from(album.clone()))
                 }
-                ArtistPickItem::Track(track) => ArtistPickItemDetail::Track(Track::from(track)),
+                ArtistPickItem::Track(track) => ArtistPickItemDetail::Track(track.clone()),
             },
         }
     }
@@ -763,20 +525,12 @@ impl From<ArtistOverview> for ArtistOverviewDetail {
         Self {
             biography: overview.biography,
             header_image_url: overview.header_image_url,
-            biography_images: overview
-                .biography_images
-                .into_iter()
-                .map(ArtistImageDetail::from)
-                .collect(),
+            biography_images: overview.biography_images,
             popularity: overview.popularity,
             followers: overview.followers,
             monthly_listeners: overview.monthly_listeners,
             world_rank: overview.world_rank,
-            top_cities: overview
-                .top_cities
-                .into_iter()
-                .map(ArtistTopCityDetail::from)
-                .collect(),
+            top_cities: overview.top_cities,
             popular_releases: overview
                 .popular_releases
                 .into_iter()
@@ -819,9 +573,9 @@ impl From<ArtistBrowse> for ArtistDetail {
                 name: browse.name,
                 cover_url: browse.portrait_url.unwrap_or_default(),
             },
-            top_tracks: browse.top_tracks.into_iter().map(Track::from).collect(),
+            top_tracks: browse.top_tracks,
             releases: browse.releases.into(),
-            release_counts: browse.release_counts.into(),
+            release_counts: browse.release_counts,
             releases_next_offset: browse.releases_next_offset,
             overview: browse.overview.map(ArtistOverviewDetail::from),
         }
@@ -849,29 +603,6 @@ impl From<ShowRef> for Show {
             publisher: reference.publisher,
             description: reference.description,
             cover_url: reference.cover_url.unwrap_or_default(),
-        }
-    }
-}
-
-/// An episode retains its audio-only queue row for direct playback.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct EpisodeDetail {
-    pub show_id: String,
-    pub show_name: String,
-    pub description: String,
-    pub published_at: Option<i64>,
-    pub track: Track,
-}
-
-impl From<EpisodeRef> for EpisodeDetail {
-    fn from(reference: EpisodeRef) -> Self {
-        Self {
-            show_id: reference.show_id,
-            show_name: reference.show_name,
-            description: reference.description,
-            published_at: reference.published_at,
-            track: Track::from(reference.track),
         }
     }
 }
@@ -1110,7 +841,7 @@ pub enum SearchTop {
 impl From<SearchTopRef> for SearchTop {
     fn from(top: SearchTopRef) -> Self {
         match top {
-            SearchTopRef::Track(reference) => Self::Track(Track::from(reference)),
+            SearchTopRef::Track(reference) => Self::Track(reference),
             SearchTopRef::Album(reference) => Self::Album(Album::from(reference)),
             SearchTopRef::Artist(reference) => Self::Artist(Artist::from(reference)),
             SearchTopRef::Playlist(reference) => Self::Playlist(Playlist::from(&reference)),
@@ -1138,49 +869,16 @@ impl From<SearchBrowse> for SearchResult {
     fn from(browse: SearchBrowse) -> Self {
         Self {
             top: browse.top.map(SearchTop::from),
-            tracks: browse.tracks.into_iter().map(Track::from).collect(),
+            tracks: browse.tracks,
             albums: browse.albums.into_iter().map(Album::from).collect(),
             artists: browse.artists.into_iter().map(Artist::from).collect(),
             playlists: browse.playlists.iter().map(Playlist::from).collect(),
             shows: browse.shows.into_iter().map(Show::from).collect(),
-            episodes: browse.episodes.into_iter().map(EpisodeDetail::from).collect(),
+            episodes: browse.episodes,
         }
     }
 }
 
-/// One contributor in a track's credits.
-///
-/// `id` is the validated Spotify artist id from the source credit URI. The
-/// frontend uses it only to open the external
-/// `https://artists.spotify.com/songwriter/{id}` page; it must never route to
-/// the in-app artist view. An empty id means the contributor remains plain
-/// text. `subroles` are the service's own labels (`composer`, `lyricist`,
-/// `producer`, `main artist`, ...), possibly empty.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct Contributor {
-    pub id: String,
-    pub uri: String,
-    /// External page for this contributor, supplied finished by the service.
-    /// The frontend opens it verbatim and never builds one; empty means the
-    /// name renders as plain text.
-    pub url: String,
-    pub name: String,
-    /// The service's own labels, kept verbatim for truthful per-person detail.
-    pub subroles: Vec<String>,
-}
-
-impl From<CreditArtist> for Contributor {
-    fn from(artist: CreditArtist) -> Self {
-        Self {
-            id: artist.id,
-            uri: artist.uri,
-            url: artist.url,
-            name: artist.name,
-            subroles: artist.subroles,
-        }
-    }
-}
 /// One source-provided role group of a track's credits, e.g. Artist or
 /// Composition & Lyrics. The title is passed through exactly as the service
 /// called it; an unrecognised group is still worth showing.
@@ -1195,7 +893,7 @@ impl From<CreditRole> for CreditGroup {
     fn from(role: CreditRole) -> Self {
         Self {
             title: role.title,
-            contributors: role.artists.into_iter().map(Contributor::from).collect(),
+            contributors: role.artists,
         }
     }
 }
@@ -1428,6 +1126,9 @@ pub struct CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spotifine_common::protocol::{
+        ArtistImage, ArtistTopCity, EpisodeRef, TrackRef, TrackWaveform as EngineTrackWaveform,
+    };
 
     #[test]
     fn compact_events_preserve_plan_and_current_context_without_queue_rows() {
@@ -1845,10 +1546,9 @@ mod tests {
             added_at: Some(1_725_000_123_456),
             ..Track::default()
         };
-        let reference: TrackRef = track.clone().into();
+        let reference: TrackRef = track.clone();
         assert_eq!(reference.artist_ids, vec!["a1", "b1"]);
         assert_eq!(reference.added_at, Some(1_725_000_123_456));
-        assert_eq!(Track::from(&reference), track);
         assert_eq!(Track::from(reference), track);
     }
 

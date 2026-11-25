@@ -1,4 +1,5 @@
 <script>
+  import { untrack } from "svelte";
   import { coverUrl } from "../lib/state.svelte.js";
   import { identityTone } from "../lib/covertone.svelte.js";
 
@@ -67,6 +68,19 @@
   let failed = $state({});
   let shown = $state({});
 
+  const activeUrls = $derived(tier === "mosaic" ? pool : primary ? [primary] : []);
+  $effect.pre(() => {
+    const keep = new Set(activeUrls);
+    untrack(() => {
+      for (const key of Object.keys(shown)) {
+        if (!keep.has(key)) delete shown[key];
+      }
+      for (const key of Object.keys(failed)) {
+        if (!keep.has(key)) delete failed[key];
+      }
+    });
+  });
+
   /** Every image of the selected tier has painted. */
   const revealed = $derived(
     tier === "mosaic" ? pool.every((u) => shown[u]) : !!shown[primary],
@@ -92,7 +106,10 @@
       node.addEventListener("error", () => (failed[u] = true), { once: true, signal: gate.signal });
     };
     arm(url);
-    return { update: arm };
+    return {
+      update: arm,
+      destroy: () => gate?.abort(),
+    };
   }
 </script>
 

@@ -1552,7 +1552,27 @@ window.__harness = {
   },
 };
 
+const simulateMac = new URLSearchParams(location.search).has("mac");
+if (simulateMac) {
+  Object.defineProperty(navigator, "userAgent", {
+    value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15",
+    configurable: true,
+  });
+  document.documentElement.dataset.os = "mac";
+}
+
 await import("../src/styles/app.css");
+if (simulateMac) {
+  // Approximate macOS SF Pro's wider glyph advance widths on Windows so
+  // tight chrome (like the sidebar library header) can be checked honestly.
+  const style = document.createElement("style");
+  style.textContent = `:root[data-os="mac"] {
+    --font-display: "Helvetica Neue", Arial, sans-serif;
+    --font-text: "Helvetica Neue", Arial, sans-serif;
+    --font-small: "Helvetica Neue", Arial, sans-serif;
+  }`;
+  document.head.appendChild(style);
+}
 const { mount } = await import("svelte");
 const { default: App } = await import("../src/App.svelte");
 const state = await import("../src/lib/state.svelte.js");

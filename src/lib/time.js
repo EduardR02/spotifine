@@ -46,26 +46,6 @@ export function parseExactTime(value) {
   return Math.round((hours * 3600 + minutes * 60 + seconds) * 1000);
 }
 
-/**
- * "1 hr 12 min" style duration for collection footers.
- *
- * Under an hour it keeps seconds ("38 min 12 sec"): a five-track playlist
- * rounded to whole minutes threw away most of what the number was telling you.
- */
-export function formatDuration(ms) {
-  if (!Number.isFinite(ms) || ms <= 0) return "0 sec";
-  const total = Math.round(ms / 1000);
-  const h = Math.floor(total / 3600);
-  if (h > 0) {
-    const m = Math.round((total % 3600) / 60);
-    return m > 0 ? `${h} hr ${m} min` : `${h} hr`;
-  }
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  if (m === 0) return `${s} sec`;
-  return s > 0 ? `${m} min ${s} sec` : `${m} min`;
-}
-
 /** Human-readable binary byte size for cache and diagnostics surfaces. */
 export function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
@@ -81,7 +61,24 @@ export function formatBytes(bytes) {
   return `${value.toFixed(decimals)} ${units[unit]}`;
 }
 
-/** Summed duration of a track list, as "8 hr 12 min". */
+/**
+ * Summed duration of a track list, as "8 hr 12 min" or "38 min 12 sec".
+ *
+ * Under an hour it keeps seconds: a five-track playlist rounded to whole
+ * minutes threw away most of what the number was telling you.
+ */
 export function formatTotal(tracks) {
-  return formatDuration(tracks.reduce((sum, t) => sum + (t.duration_ms || 0), 0));
+  const ms = tracks.reduce((sum, t) => sum + (t?.duration_ms || 0), 0);
+  if (!Number.isFinite(ms) || ms <= 0) return "0 sec";
+  const total = Math.round(ms / 1000);
+  if (total >= 3600) {
+    const totalMinutes = Math.round(total / 60);
+    const h = Math.floor(totalMinutes / 60);
+    const m = totalMinutes % 60;
+    return m > 0 ? `${h} hr ${m} min` : `${h} hr`;
+  }
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  if (m === 0) return `${s} sec`;
+  return s > 0 ? `${m} min ${s} sec` : `${m} min`;
 }

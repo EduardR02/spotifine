@@ -700,6 +700,9 @@ async fn run(
                 }
             }
             Some(()) = output_receiver.recv() => {
+                // Coalesce burst OS default-output hotplug notifications into
+                // a single switch so rapid driver events do not cascade teardowns.
+                while output_receiver.try_recv().is_ok() {}
                 if engine.on_default_output_changed() {
                     engine.emit_state()?;
                     engine.tick_audio_device(&auth_sender);

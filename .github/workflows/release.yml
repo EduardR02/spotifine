@@ -54,6 +54,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      mac_sha256: ${{ steps.publish.outputs.mac_sha256 }}
+      is_latest: ${{ steps.publish.outputs.is_latest }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -62,6 +66,7 @@ jobs:
           merge-multiple: true
           path: release-assets
       - name: Publish complete signed release and latest.json
+        id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -78,6 +83,7 @@ jobs:
           done
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           version="${RELEASE_TAG#v}"
+          mac_sha256="$(sha256sum "$zip" | awk '{print $1}')"
           # Keep /releases/latest on the previous complete release throughout
           # the build and upload. Only draft assets may be replaced on retry.
           if ! gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,body,assets > release.json; then
@@ -92,6 +98,7 @@ jobs:
             for asset in "${assets[@]}"; do
               jq -e --arg name "$asset" 'any(.assets[]; .name == $name and .state == "uploaded" and .size > 0)' release.json > /dev/null
             done
+            printf 'version=%s\nmac_sha256=%s\nis_latest=false\n' "$version" "$mac_sha256" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           jq -n \
@@ -124,3 +131,84 @@ jobs:
             make_latest=false
           fi
           gh release edit "$RELEASE_TAG" --draft=false --latest="$make_latest"
+          printf 'version=%s\nmac_sha256=%s\nis_latest=%s\n' "$version" "$mac_sha256" "$make_latest" >> "$GITHUB_OUTPUT"
+
+  publish-homebrew:
+    if: github.ref_type == 'tag' && needs.publish.outputs.is_latest == 'true'
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew tap cask
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          MAC_SHA256: ${{ needs.publish.outputs.mac_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$HOMEBREW_TAP_TOKEN" ]]; then
+            echo "HOMEBREW_TAP_TOKEN secret is not set; skipping Homebrew tap update."
+            exit 0
+          fi
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/EduardR02/homebrew-tap.git" tap
+          cd tap
+          mkdir -p Casks
+          cat > Casks/spotifine.rb <<EOF
+          cask "spotifine" do
+            version "${VERSION}"
+            sha256 "${MAC_SHA256}"
+
+            url "https://github.com/EduardR02/spotifine/releases/download/v#{version}/Spotifine-macos-arm64.zip",
+                verified: "github.com/EduardR02/spotifine/"
+            name "Spotifine"
+            desc "Lightweight Spotify desktop client"
+            homepage "https://eduardr02.github.io/spotifine/"
+
+            depends_on arch: :arm64
+            depends_on macos: ">= :sonoma"
+
+            auto_updates true
+
+            app "Spotifine.app"
+
+            zap trash: [
+              "~/Library/Application Support/Spotifine",
+              "~/Library/Caches/com.spotifine.client",
+              "~/Library/Preferences/com.spotifine.client.plist",
+              "~/Library/WebKit/com.spotifine.client",
+            ]
+          end
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/spotifine.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "Update spotifine to ${VERSION}"
+            git push
+          fi
+
+  publish-winget:
+    if: github.ref_type == 'tag' && needs.publish.outputs.is_latest == 'true'
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Winget token
+        id: check
+        shell: bash
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if [[ -n "$WINGET_TOKEN" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "WINGET_TOKEN secret is not set; skipping Winget update."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Submit Winget manifest update
+        if: steps.check.outputs.configured == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: EduardR02.Spotifine
+          installers-regex: '^Spotifine-windows-x64-setup\.exe$'
+          release-tag: ${{ github.ref_name }}
+          token: ${{ secrets.WINGET_TOKEN }}

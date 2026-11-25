@@ -46,6 +46,9 @@ struct Timing {
     /// Browse and edit commands run network round-trips inside the engine.
     browse: Duration,
     waveform: Duration,
+    /// Upper bound on awaiting a dispatched `clear_audio_cache` ACK so
+    /// `CacheStatsRead::Clearing` cannot wedge permanently on a hung engine.
+    clear_cache: Duration,
     respawn: RespawnPolicy,
 }
 
@@ -54,6 +57,7 @@ impl Timing {
         command: Duration::from_secs(10),
         browse: Duration::from_secs(30),
         waveform: Duration::from_secs(5 * 60),
+        clear_cache: Duration::from_secs(90),
         respawn: RespawnPolicy {
             start: Duration::from_secs(2),
             max: Duration::from_secs(30),
@@ -1425,15 +1429,26 @@ impl EngineClient {
             self.retire_process(generation);
             if kind == "clear_audio_cache" {
                 // A partial write can have reached the child. Retirement must
-                // be observed at EOF before releasing the disk-work owner.
-                let _ = (&mut receiver).await;
+                // be observed at EOF before releasing the disk-work owner,
+                // bounded so a stuck child cannot wedge cache-stats readers.
+                let _ = tokio::time::timeout(Duration::from_secs(5), &mut receiver).await;
             }
         }
         match result {
             Ok(Ok(reply)) => {
                 let reply = match reply {
                     Some(reply) => reply,
-                    None => receiver.await.map_err(|_| "engine request was dropped".to_owned())?,
+                    None => match tokio::time::timeout(self.timing.clear_cache, &mut receiver).await {
+                        Ok(reply) => reply.map_err(|_| "engine request was dropped".to_owned())?,
+                        Err(_) => {
+                            self.retire_process(generation);
+                            let _ = tokio::time::timeout(Duration::from_secs(5), &mut receiver).await;
+                            return Err(format!(
+                                "engine did not answer {kind} within {}s",
+                                self.timing.clear_cache.as_secs()
+                            ));
+                        }
+                    },
                 };
                 if reply.ok { Ok(reply) }
                 else { Err(reply.error.unwrap_or_else(|| "engine rejected the request".to_owned())) }
@@ -2318,6 +2333,10 @@ impl EngineClient {
         if let Ok(line) = request_line(&self.next_request_id(), "shutdown", ()) {
             let _ = self.write_line(line);
         }
+        // Drop the writer sender immediately so `engine-writer` flushes the
+        // queued shutdown line and closes ChildStdin; the engine then observes
+        // EOF promptly instead of waiting out the full 4s exit loop.
+        *self.stdin.lock() = None;
         let child = self.process.lock().take();
         if let Some(mut child) = child {
             // The engine reserves three seconds for final listening delivery;
@@ -2331,7 +2350,6 @@ impl EngineClient {
                 }
             }
         }
-        *self.stdin.lock() = None;
         self.fail_pending_on_exit();
 
         let generation = self.persist_generation.load(Ordering::Acquire);
@@ -2885,6 +2903,9 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
             let mut line = String::new();
             loop {
                 line.clear();
+                if line.capacity() > 65_536 {
+                    line.shrink_to(65_536);
+                }
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
                     Ok(_) => {
@@ -3453,6 +3474,7 @@ mod tests {
         command: Duration::from_millis(250),
         browse: Duration::from_secs(10),
         waveform: Duration::from_secs(10),
+        clear_cache: Duration::from_secs(10),
         respawn: RespawnPolicy {
             start: Duration::from_millis(100),
             max: Duration::from_secs(10),

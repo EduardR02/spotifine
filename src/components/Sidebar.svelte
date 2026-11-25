@@ -688,7 +688,7 @@
         <div class="lib-modes" role="tablist" aria-label="Library collection">
           {#each modes as [id, label] (id)}
             <button class="lib-mode" class:on={mode === id} role="tab" aria-selected={mode === id} onclick={() => showMode(id)}>
-              <span>{label}</span>
+              {label}
             </button>
           {/each}
         </div>
@@ -995,14 +995,13 @@
   .rail-item { left: 0; right: 0; }
   .rail-probes { position: absolute; visibility: hidden; pointer-events: none; width: 1px; overflow: hidden; }
   .lib-row.liked-row { grid-template-columns: 32px minmax(0, 1fr) auto; }
-  .lib-head-btn { width: 24px; height: 24px; }
+  .lib-head-btn { width: 22px; height: 22px; }
   /* Three collections do not fit the narrow rail beside two buttons. The
      "+" gives way there; the same Create playlist / Create folder menu opens
      from a right-click on the list, and the filter's "Create" still makes a
      playlist. */
   @media (max-width: 1180px) {
     .lib-new { display: none; }
-    .lib-mode { font-size: 11px; }
   }
   .lib-filter { width: 100%; }
 

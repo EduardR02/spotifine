@@ -41,7 +41,7 @@
 
   function playOrToggle() {
     if (playingThis) togglePlay();
-    else playFrom(0);
+    else if (tracks.length) api.playQueue(tracks, 0, source, { automaticStart: true }).catch(() => {});
   }
 
   async function shufflePlay() {

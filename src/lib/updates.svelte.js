@@ -1,9 +1,9 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 
 const DAY = 24 * 60 * 60 * 1000;
+const RETRY_BACKOFF = 15 * 60 * 1000;
 const CACHE_KEY = "sr.update-check";
 let timer;
 let running = false;
@@ -86,10 +86,6 @@ export async function checkUpdates(automatic = false) {
     updates.phase = update ? "available" : "current";
     updates.error = "";
     if (previous) void previous.close().catch(() => {});
-  } catch (error) {
-    updates.phase = previousPhase;
-    if (!automatic) updates.error = `Could not check for updates: ${String(error)}`;
-  } finally {
     if (updates.currentVersion) {
       try {
         localStorage.setItem(CACHE_KEY, JSON.stringify({
@@ -98,6 +94,10 @@ export async function checkUpdates(automatic = false) {
       } catch { /* optional */ }
     }
     schedule(DAY);
+  } catch (error) {
+    updates.phase = previousPhase;
+    if (!automatic) updates.error = `Could not check for updates: ${String(error)}`;
+    schedule(RETRY_BACKOFF);
   }
 }
 
@@ -106,7 +106,7 @@ export async function restartUpdate() {
   updates.error = "";
   updates.phase = "restarting";
   try {
-    await relaunch();
+    await invoke("relaunch_app");
   } catch (error) {
     updates.phase = "installed";
     updates.error = `The update is installed, but restart failed: ${String(error)}`;

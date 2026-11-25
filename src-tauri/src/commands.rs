@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use crate::app::{
     carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir,
-    insert_created_playlist, is_followed_playlist, load_app_settings, now_secs,
-    order_by_last_activity, playlist_detail_from_cache, playlist_qualifies, remove_membership,
-    remember_last_account, update_app_settings, save_membership, save_playlist_list,
-    save_tracks_cache,
-    touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, tracks_cache_bytes,
+    insert_created_playlist, is_followed_playlist, load_account_library_from_disk,
+    load_app_settings, now_secs, order_by_last_activity, playlist_detail_from_cache,
+    playlist_qualifies, remove_membership, remember_last_account, save_membership,
+    save_playlist_list, save_tracks_cache, touch_playlist_activity as stamp_playlist_activity,
+    touch_playlist_played, tracks_cache_bytes, update_app_settings, update_app_settings_async,
     upsert_membership, upsert_playlist, upsert_tracks_cache, write_tracks_cache_bytes, AppSettings,
-    AppState, CacheStatsRead, MembershipEntry, PlaylistListCache, PlaylistRefreshOwner, PlaylistTracksEntry, RefreshCause,
-    LIBRARY_PAGE_SIZE, LIKED_MEMBERSHIP_ID,
+    AppState, CacheStatsRead, MembershipEntry, PlaylistListCache, PlaylistRefreshOwner,
+    PlaylistTracksEntry, RefreshCause, LIBRARY_PAGE_SIZE, LIKED_MEMBERSHIP_ID,
 };
 use crate::engine_client::{unmark_cached_rows, EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
 use crate::log;
@@ -66,6 +66,22 @@ pub async fn check_for_update(webview: tauri::Webview) -> Result<Option<Value>, 
     metadata["rid"] = json!(webview.resources_table().add(update));
     Ok(Some(metadata))
 }
+
+/// Shuts down the playback engine and flushes durable playback state before
+/// restarting the application (e.g. after installing a macOS update).
+#[tauri::command]
+pub async fn relaunch_app(app: AppHandle) -> Result<(), String> {
+    let shutdown_handle = app.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        crate::shutdown_for_exit(&shutdown_handle);
+    })
+    .await
+    {
+        log::warn(&format!("could not shut down engine before restart: {error}"));
+    }
+    app.restart()
+}
+
 // ---------------------------------------------------------------------------
 // Playback commands
 // ---------------------------------------------------------------------------
@@ -78,8 +94,17 @@ pub async fn play(app: AppHandle, router: State<'_, Arc<PlaybackRouter>>) -> Res
 /// Whether the window can be seen, which decides how often a selected Spotify
 /// device is read; `refresh` (on focus) reads it at once.
 #[tauri::command]
-pub async fn set_window_visible(router: State<'_, Arc<PlaybackRouter>>, visible: bool, refresh: bool) -> Result<(), String> {
+pub async fn set_window_visible(
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
+    visible: bool,
+    refresh: bool,
+) -> Result<(), String> {
     router.set_visible(visible, refresh);
+    #[cfg(not(windows))]
+    window_minimized_changed(&app, !visible);
+    #[cfg(windows)]
+    let _ = app;
     Ok(())
 }
 
@@ -329,7 +354,7 @@ pub async fn set_playlist_track_excluded(
 ) -> Result<(), String> {
     let account_generation = library_account_generation(&app);
     client.set_playlist_track_excluded(&playlist_id, &track_id, excluded).await?;
-    record_playlist_edit(&app, &playlist_id, account_generation)?;
+    record_playlist_edit(&app, &playlist_id, account_generation).await?;
     spawn_refresh_playlist(app.clone(), playlist_id, RefreshCause::Edit);
     // The exclusion is saved. A Spotify device that could not take the new
     // order is the router's to report and retry; it is not a failed save.
@@ -576,7 +601,7 @@ pub async fn show_episode_index(webview: tauri::Webview, client: State<'_, Arc<E
         // walk before the next batch, rather than running through the archive.
         for ids in page.episode_ids.chunks(spotifine_common::protocol::METADATA_BATCH_SIZE) {
             open_show(&webview, rid)?;
-            rows.extend(client.browse_show_episodes(&page.id, ids).await?.into_iter().map(EpisodeDetail::from));
+            rows.extend(client.browse_show_episodes(&page.id, ids).await?);
         }
         Ok::<_, String>(rows)
     }).await?;
@@ -662,7 +687,7 @@ pub async fn hydrate_library_covers(
     }
     let resolved = client.browse_playlist_covers(&references).await?;
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (dir, cache, summaries) = {
         let mut guard = state.lock();
         if !library_generation_is_current(&guard, generation) {
@@ -679,17 +704,11 @@ pub async fn hydrate_library_covers(
             changed |= playlist.fill_artwork(metadata);
             summaries.push(playlist.clone());
         }
-        let cache = changed.then(|| PlaylistListCache {
-            version: 1,
-            fetched_at: guard.playlists_fetched_at,
-            me_id: guard.me_id.clone(),
-            playlists: guard.playlists.clone(),
-            playlist_tree: guard.playlist_tree.clone(),
-        });
+        let cache = changed.then(|| library_list_cache(&guard));
         (guard.library_dir(), cache, summaries)
     };
     if let Some(cache) = cache {
-        save_playlist_list(&dir, &cache);
+        let _ = tokio::task::spawn_blocking(move || save_playlist_list(&dir, &cache)).await;
     }
     Ok(summaries)
 }
@@ -801,7 +820,7 @@ pub async fn create_playlist(
     let reference = client.create_playlist(&name).await?;
     let playlist = commit_library_edit(&app, account_generation, |guard| {
         insert_created_playlist(&mut guard.playlists, Playlist::from(&reference), now_secs())
-    })?;
+    }).await?;
     spawn_refresh_library(app);
     Ok(playlist)
 }
@@ -817,7 +836,7 @@ pub async fn rename_playlist(
     client.rename_playlist(&id, &name).await?;
     commit_library_edit(&app, account_generation, |guard| {
         guard.record_playlist_rename(&id, &name);
-    })?;
+    }).await?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -836,7 +855,7 @@ pub async fn delete_playlist(
     forget_library_playlists(&app, account_generation, |tree| {
         remove_tree_playlist(tree, &id);
         vec![id.clone()]
-    })?;
+    }).await?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -846,14 +865,14 @@ pub async fn delete_playlist(
 /// answers with their ids), and puts all of it on disk before a concurrent
 /// older refresh can persist — or the removed rows reappear on the next
 /// start.
-fn forget_library_playlists(
+async fn forget_library_playlists(
     app: &AppHandle,
     account_generation: u64,
     edit_tree: impl FnOnce(&mut Vec<LibraryNodeDetail>) -> Vec<String>,
 ) -> Result<(), String> {
     let state = app.state::<Mutex<AppState>>();
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (dir, list_cache, tracks_cache, membership) = {
         let mut guard = state.lock();
         guard.check_account_generation(account_generation)?;
@@ -880,13 +899,16 @@ fn forget_library_playlists(
             membership,
         )
     };
-    save_playlist_list(&dir, &list_cache);
-    if let Some(tracks_cache) = tracks_cache {
-        save_tracks_cache(&dir, &tracks_cache);
-    }
-    if let Some(entries) = membership {
-        save_membership(&dir, &entries);
-    }
+    let _ = tokio::task::spawn_blocking(move || {
+        save_playlist_list(&dir, &list_cache);
+        if let Some(tracks_cache) = tracks_cache {
+            save_tracks_cache(&dir, &tracks_cache);
+        }
+        if let Some(entries) = membership {
+            save_membership(&dir, &entries);
+        }
+    })
+    .await;
     Ok(())
 }
 
@@ -900,10 +922,10 @@ fn library_list_cache(state: &AppState) -> PlaylistListCache {
     }
 }
 
-fn record_playlist_edit(app: &AppHandle, id: &str, account_generation: u64) -> Result<(), String> {
+async fn record_playlist_edit(app: &AppHandle, id: &str, account_generation: u64) -> Result<(), String> {
     let state = app.state::<Mutex<AppState>>();
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (dir, bytes) = {
         let mut guard = state.lock();
         guard.check_account_generation(account_generation)?;
@@ -911,7 +933,7 @@ fn record_playlist_edit(app: &AppHandle, id: &str, account_generation: u64) -> R
         (guard.library_dir(), changed.then(|| tracks_cache_bytes(&guard.tracks_cache)).flatten())
     };
     if let Some(bytes) = bytes {
-        tokio::task::block_in_place(|| write_tracks_cache_bytes(&dir, &bytes));
+        let _ = tokio::task::spawn_blocking(move || write_tracks_cache_bytes(&dir, &bytes)).await;
     }
     Ok(())
 }
@@ -924,14 +946,14 @@ fn library_account_generation(app: &AppHandle) -> u64 {
 /// fenced like a delete: a rootlist read that was already in flight predates
 /// the edit and must not install over it. The refresh that follows brings
 /// the account's own answer.
-fn commit_library_edit<R>(
+async fn commit_library_edit<R>(
     app: &AppHandle,
     account_generation: u64,
     edit: impl FnOnce(&mut AppState) -> R,
 ) -> Result<R, String> {
     let state = app.state::<Mutex<AppState>>();
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (dir, cache, result) = {
         let mut guard = state.lock();
         guard.check_account_generation(account_generation)?;
@@ -940,7 +962,7 @@ fn commit_library_edit<R>(
         let result = edit(&mut guard);
         (guard.library_dir(), library_list_cache(&guard), result)
     };
-    save_playlist_list(&dir, &cache);
+    let _ = tokio::task::spawn_blocking(move || save_playlist_list(&dir, &cache)).await;
     Ok(result)
 }
 
@@ -958,7 +980,7 @@ pub async fn follow_playlist(
     client.follow_playlist(&playlist.id).await?;
     let row = commit_library_edit(&app, account_generation, |guard| {
         insert_created_playlist(&mut guard.playlists, playlist, now_secs())
-    })?;
+    }).await?;
     spawn_refresh_library(app);
     Ok(row)
 }
@@ -983,7 +1005,7 @@ pub async fn create_folder(
     };
     commit_library_edit(&app, account_generation, |guard| {
         LibraryNodeDetail::insert_first(&mut guard.playlist_tree, parent.as_deref(), folder.clone());
-    })?;
+    }).await?;
     spawn_refresh_library(app);
     Ok(folder)
 }
@@ -1004,7 +1026,7 @@ pub async fn rename_folder(
         {
             *current = name;
         }
-    })?;
+    }).await?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -1025,7 +1047,7 @@ pub async fn delete_folder(
             folder.playlist_ids(&mut inside);
         }
         inside
-    })?;
+    }).await?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -1043,7 +1065,7 @@ pub async fn move_library_item(
     client.move_library_item(&item, folder.as_deref()).await?;
     commit_library_edit(&app, account_generation, |guard| {
         LibraryNodeDetail::move_to(&mut guard.playlist_tree, &item, folder.as_deref());
-    })?;
+    }).await?;
     spawn_refresh_library(app);
     Ok(())
 }
@@ -1057,7 +1079,7 @@ pub async fn add_playlist_tracks(
 ) -> Result<(), String> {
     let account_generation = library_account_generation(&app);
     client.add_playlist_tracks(&id, &uris).await?;
-    record_playlist_edit(&app, &id, account_generation)?;
+    record_playlist_edit(&app, &id, account_generation).await?;
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
@@ -1072,7 +1094,7 @@ pub async fn remove_playlist_tracks(
 ) -> Result<(), String> {
     let account_generation = library_account_generation(&app);
     client.remove_playlist_tracks(&id, &uris, expected_snapshot_id.as_deref()).await?;
-    record_playlist_edit(&app, &id, account_generation)?;
+    record_playlist_edit(&app, &id, account_generation).await?;
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
@@ -1088,7 +1110,7 @@ pub async fn reorder_playlist_tracks(
 ) -> Result<(), String> {
     let account_generation = library_account_generation(&app);
     client.reorder_playlist_tracks(&id, from, to, row_count).await?;
-    record_playlist_edit(&app, &id, account_generation)?;
+    record_playlist_edit(&app, &id, account_generation).await?;
     spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
@@ -1111,7 +1133,7 @@ pub async fn set_normalisation(
     client: State<'_, Arc<EngineClient>>,
     enabled: bool,
 ) -> Result<AppSettings, String> {
-    let settings = update_app_settings(|settings| settings.normalisation = enabled)?;
+    let settings = update_app_settings_async(move |settings| settings.normalisation = enabled).await?;
     client.set_normalisation(enabled).await?;
     Ok(settings)
 }
@@ -1128,7 +1150,7 @@ pub async fn set_spotify_listening_enabled(
     client: State<'_, Arc<EngineClient>>,
     enabled: bool,
 ) -> Result<ListeningPreferenceUpdate, String> {
-    let settings = update_app_settings(|settings| settings.spotify_listening_enabled = enabled)?;
+    let settings = update_app_settings_async(move |settings| settings.spotify_listening_enabled = enabled).await?;
     let apply_error = client.set_spotify_listening_enabled(enabled).await.err().map(|error| {
         format!("Preference saved, but the running player's state could not be confirmed. Restart Spotifine before relying on this change: {error}")
     });
@@ -1144,7 +1166,7 @@ pub async fn logout(
     app.state::<Arc<PlaybackRouter>>().disconnect(&app).await;
     personal.disconnect(&app).await?;
     client.logout().await?;
-    select_library_account(&app, "");
+    select_library_account(&app, "").await;
     Ok(())
 }
 
@@ -1202,7 +1224,7 @@ pub async fn personal_api_set_saved(
     // reconcile pass, and the UI hears about it through the one event every
     // other index change uses (which also drops the cached Liked Songs page).
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let written = {
         let mut guard = state.lock();
         guard.check_account_generation(account_generation)?;
@@ -1210,7 +1232,7 @@ pub async fn personal_api_set_saved(
             .then(|| (guard.library_dir(), guard.memberships.clone()))
     };
     if let Some((dir, entries)) = written {
-        save_membership(&dir, &entries);
+        let _ = tokio::task::spawn_blocking(move || save_membership(&dir, &entries)).await;
         let _ = app.emit("memberships_changed", json!({"saved_tracks": true, "uris": uris, "saved": saved}));
     }
     Ok(())
@@ -1273,7 +1295,7 @@ pub fn get_presentation() -> Option<String> {
 #[tauri::command]
 pub async fn touch_playlist(state: State<'_, Mutex<AppState>>, id: String) -> Result<(), String> {
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (dir, cache) = {
         let mut guard = state.lock();
         if !touch_playlist_played(&mut guard.playlists, &id, now_secs()) {
@@ -1281,18 +1303,9 @@ pub async fn touch_playlist(state: State<'_, Mutex<AppState>>, id: String) -> Re
             // album, an artist page): no local timestamp should be invented.
             return Ok(());
         }
-        (
-            guard.library_dir(),
-            PlaylistListCache {
-                version: 1,
-                fetched_at: guard.playlists_fetched_at,
-                me_id: guard.me_id.clone(),
-                playlists: guard.playlists.clone(),
-                playlist_tree: guard.playlist_tree.clone(),
-            },
-        )
+        (guard.library_dir(), library_list_cache(&guard))
     };
-    save_playlist_list(&dir, &cache);
+    let _ = tokio::task::spawn_blocking(move || save_playlist_list(&dir, &cache)).await;
     Ok(())
 }
 
@@ -1307,24 +1320,15 @@ pub async fn touch_playlist_activity(
     id: String,
 ) -> Result<(), String> {
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (dir, cache) = {
         let mut guard = state.lock();
         if !stamp_playlist_activity(&mut guard.playlists, &id, now_secs()) {
             return Ok(());
         }
-        (
-            guard.library_dir(),
-            PlaylistListCache {
-                version: 1,
-                fetched_at: guard.playlists_fetched_at,
-                me_id: guard.me_id.clone(),
-                playlists: guard.playlists.clone(),
-                playlist_tree: guard.playlist_tree.clone(),
-            },
-        )
+        (guard.library_dir(), library_list_cache(&guard))
     };
-    save_playlist_list(&dir, &cache);
+    let _ = tokio::task::spawn_blocking(move || save_playlist_list(&dir, &cache)).await;
     Ok(())
 }
 
@@ -1392,47 +1396,47 @@ fn restore_autostart_registration(app: &AppHandle, enabled: bool) -> Result<(), 
 }
 
 #[tauri::command]
-pub fn set_audio_cache_limit(mb: u64) -> Result<AppSettings, String> {
+pub async fn set_audio_cache_limit(mb: u64) -> Result<AppSettings, String> {
     if !matches!(mb, 0 | 1024 | 2048 | 4096 | 8192) {
         return Err("audio cache limit must be 1, 2, 4, or 8 GiB, or unlimited".to_owned());
     }
-    update_app_settings(|settings| settings.audio_cache_limit_mb = mb)
+    update_app_settings_async(move |settings| settings.audio_cache_limit_mb = mb).await
 }
 
 /// Updates the OS registration before persisting the preference. If writing
 /// the preference fails, restore the registration to its previous state.
 #[tauri::command]
-pub fn set_launch_at_login(app: AppHandle, enabled: bool) -> Result<AppSettings, String> {
-    let was_enabled = set_autostart_registration(&app, enabled)?;
+pub async fn set_launch_at_login(app: AppHandle, enabled: bool) -> Result<AppSettings, String> {
+    tokio::task::spawn_blocking(move || {
+        let was_enabled = set_autostart_registration(&app, enabled)?;
 
-    let updated = update_app_settings(|settings| settings.launch_at_login = enabled);
-    if let Err(error) = updated.as_ref() {
-        if was_enabled != enabled {
-            if let Err(rollback_error) = restore_autostart_registration(&app, was_enabled) {
-                return Err(format!(
-                    "{error}; could not roll back launch-at-login registration: {rollback_error}"
-                ));
+        let updated = update_app_settings(|settings| settings.launch_at_login = enabled);
+        if let Err(error) = updated.as_ref() {
+            if was_enabled != enabled {
+                if let Err(rollback_error) = restore_autostart_registration(&app, was_enabled) {
+                    return Err(format!(
+                        "{error}; could not roll back launch-at-login registration: {rollback_error}"
+                    ));
+                }
             }
+            return Err(error.clone());
         }
-        return Err(error.clone());
-    }
-    updated
+        updated
+    })
+    .await
+    .map_err(|error| format!("could not update launch-at-login setting: {error}"))?
 }
 
 #[tauri::command]
-pub fn set_start_minimized(enabled: bool) -> Result<AppSettings, String> {
-    update_app_settings(|settings| settings.start_minimized = enabled)
+pub async fn set_start_minimized(enabled: bool) -> Result<AppSettings, String> {
+    update_app_settings_async(move |settings| settings.start_minimized = enabled).await
 }
 
 #[tauri::command]
 pub async fn set_minimize_to_tray(app: AppHandle, enabled: bool) -> Result<AppSettings, String> {
     #[cfg(windows)]
     {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let handle = app.clone();
-        app.run_on_main_thread(move || { let _ = tx.send(crate::tray::set_enabled(&handle, enabled)); })
-            .map_err(|error| error.to_string())?;
-        rx.await.map_err(|error| error.to_string())?
+        crate::tray::set_enabled(&app, enabled).await
     }
     #[cfg(not(windows))]
     {
@@ -1442,8 +1446,8 @@ pub async fn set_minimize_to_tray(app: AppHandle, enabled: bool) -> Result<AppSe
 }
 
 #[tauri::command]
-pub fn set_animated_canvas(enabled: bool) -> Result<AppSettings, String> {
-    update_app_settings(|settings| settings.animated_canvas = enabled)
+pub async fn set_animated_canvas(enabled: bool) -> Result<AppSettings, String> {
+    update_app_settings_async(move |settings| settings.animated_canvas = enabled).await
 }
 
 /// Spotify devices on or off, locally: the grant stays. Saved first, so a
@@ -1455,7 +1459,7 @@ pub async fn set_devices_enabled(
     router: State<'_, Arc<PlaybackRouter>>,
     enabled: bool,
 ) -> Result<AppSettings, String> {
-    let settings = update_app_settings(|settings| settings.devices_enabled = enabled)?;
+    let settings = update_app_settings_async(move |settings| settings.devices_enabled = enabled).await?;
     router.set_devices_enabled(&app, enabled).await;
     Ok(settings)
 }
@@ -1746,6 +1750,18 @@ async fn run_restore_attempt(
     None
 }
 
+/// Lifecycle hooks dispatched off `consume_states` onto one serialized worker
+/// so keyring/network awaits never stall engine state forwarding or overflow
+/// the broadcast channel.
+enum LifecycleHook {
+    SessionChanged {
+        disconnect_router: bool,
+        username: String,
+    },
+    EngineRecovered(PlaybackState),
+    PauseLocalWhileRemote,
+}
+
 /// Consumes engine state lines, mirrors them into `AppState`, and emits the
 /// `state`/`position`/`session` events. The scalar lanes are forwarded in the
 /// shape the window already applies: a position heartbeat goes out as the
@@ -1759,12 +1775,47 @@ async fn run_restore_attempt(
 pub async fn consume_states(app: AppHandle, mut lines: tokio::sync::broadcast::Receiver<StateLine>) {
     // Owned handle so spawned tasks do not borrow the AppHandle.
     let client = app.state::<Arc<EngineClient>>().inner().clone();
+    let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel::<LifecycleHook>();
+    {
+        let app = app.clone();
+        let client = client.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(hook) = lifecycle_rx.recv().await {
+                match hook {
+                    LifecycleHook::SessionChanged {
+                        disconnect_router,
+                        username,
+                    } => {
+                        if disconnect_router {
+                            app.state::<Arc<PlaybackRouter>>().disconnect(&app).await;
+                        }
+                        app.state::<Arc<PersonalApi>>()
+                            .account_changed(&app, &username)
+                            .await;
+                    }
+                    LifecycleHook::EngineRecovered(state) => {
+                        app.state::<Arc<PlaybackRouter>>()
+                            .engine_recovered(&app, &state)
+                            .await;
+                    }
+                    LifecycleHook::PauseLocalWhileRemote => {
+                        if app.state::<Arc<PlaybackRouter>>().is_remote() {
+                            if let Err(error) = client.pause().await {
+                                app.state::<Arc<PlaybackRouter>>().report_error(&app, &error);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let mut previous_identity: Option<(String, String)> = None;
     let mut last_error = String::new();
     let mut restore_error: Option<(String, String)> = None;
     let mut published_queue: Option<u64> = None;
     let mut published_order: Option<u64> = None;
+    let mut last_remote_generation = app.state::<Arc<PlaybackRouter>>().remote_generation();
     // The first authenticated line may be held while the playback queue is
     // restored. Rootlist browse is independent of those transport setters.
     let mut library_refresh_during_restore = false;
@@ -1860,7 +1911,7 @@ pub async fn consume_states(app: AppHandle, mut lines: tokio::sync::broadcast::R
                 let disconnected = {
                     let managed = app.state::<Mutex<AppState>>();
                     let persistence = managed.lock().playlist_persistence.clone();
-                    let _serialize = persistence.lock();
+                    let _serialize = persistence.lock().await;
                     let mut guard = managed.lock();
                     guard.fence_library_reads();
                     guard.playback.playing = false;
@@ -1939,16 +1990,16 @@ pub async fn consume_states(app: AppHandle, mut lines: tokio::sync::broadcast::R
         // that blank state plus every intermediate setter state. EngineClient
         // clears the plan on a matching frame or the successful wire barrier.
         if state.auth_state == "ready" && !state.username.is_empty() {
-            select_library_account(&app, &state.username);
+            select_library_account(&app, &state.username).await;
         } else if matches!(state.auth_state.as_str(), "logged_out" | "needs_login") {
-            select_library_account(&app, "");
+            select_library_account(&app, "").await;
         }
         if state.auth_state != "ready"
             && app.state::<Mutex<AppState>>().lock().playback.auth_state == "ready"
         {
             let managed = app.state::<Mutex<AppState>>();
             let persistence = managed.lock().playlist_persistence.clone();
-            let _serialize = persistence.lock();
+            let _serialize = persistence.lock().await;
             managed.lock().fence_library_reads();
         }
         if state.auth_state != "ready" {
@@ -2028,32 +2079,49 @@ pub async fn consume_states(app: AppHandle, mut lines: tokio::sync::broadcast::R
         }
         if session_changed && (state.auth_state == "ready" || state.auth_state == "logged_out") {
             let router = app.state::<Arc<PlaybackRouter>>();
-            if router.snapshot().is_some_and(|remote| state.auth_state == "logged_out" || remote.username != state.username) {
-                router.disconnect(&app).await;
-            }
-            app.state::<Arc<PersonalApi>>()
-                .account_changed(&app, if state.auth_state == "ready" { &state.username } else { "" })
-                .await;
+            let disconnect_router = router.snapshot().is_some_and(|remote| {
+                state.auth_state == "logged_out" || remote.username != state.username
+            });
+            let username = if state.auth_state == "ready" {
+                state.username.clone()
+            } else {
+                String::new()
+            };
+            let _ = lifecycle_tx.send(LifecycleHook::SessionChanged {
+                disconnect_router,
+                username,
+            });
         }
         if state.auth_state == "ready" {
-            app.state::<Arc<PlaybackRouter>>().engine_recovered(&app, &state).await;
+            let _ = lifecycle_tx.send(LifecycleHook::EngineRecovered(state.clone()));
         }
-
 
         // Full states are reserved for real changes; the scalar lanes were
         // already forwarded above as their own events.
-        if !app.state::<Arc<PlaybackRouter>>().is_remote() {
+        let router = app.state::<Arc<PlaybackRouter>>();
+        let remote_generation = router.remote_generation();
+        if remote_generation != last_remote_generation {
+            last_remote_generation = remote_generation;
+            published_queue = None;
+            published_order = None;
+        }
+        if !router.is_remote() {
             let include_queue = state.queue_revision == 0 || published_queue != Some(state.queue_revision);
             let include_order = state.order_revision == 0 || published_order != Some(state.order_revision);
             let _ = app.emit("state", PlaybackEvent::new(&state, include_queue, include_order));
             published_queue = Some(state.queue_revision);
             published_order = Some(state.order_revision);
             media_keys::update_state(&state);
-        } else if state.playing {
-            // An engine recovery or an un-routed internal action must not
-            // restore local audio underneath an external output.
-            if let Err(error) = client.pause().await {
-                app.state::<Arc<PlaybackRouter>>().report_error(&app, &error);
+        } else {
+            // While remote output owns the frontend's queue/order, clear local
+            // delta tracking so remote->local handback cannot collide on
+            // `order_revision` and omit `upcoming`.
+            published_queue = None;
+            published_order = None;
+            if state.playing {
+                // An engine recovery or an un-routed internal action must not
+                // restore local audio underneath an external output.
+                let _ = lifecycle_tx.send(LifecycleHook::PauseLocalWhileRemote);
             }
         }
         if session_changed {
@@ -2068,7 +2136,7 @@ pub async fn consume_states(app: AppHandle, mut lines: tokio::sync::broadcast::R
                 }),
             );
         }
-        publish_library_account(&app);
+        publish_library_account(&app).await;
         if became_ready {
             if let Some(started) = restore_started_at.take() {
                 log::info(&format!(
@@ -2104,18 +2172,34 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) -> 
 /// it for the next cold start, which opens that namespace before the session
 /// is up. Once another account is known to be signed in, the previous one's
 /// disk data is never exposed again.
-fn select_library_account(app: &AppHandle, account: &str) {
+async fn select_library_account(app: &AppHandle, account: &str) {
     let managed = app.state::<Mutex<AppState>>();
     if managed.lock().me_id == account { return; }
     let persistence = managed.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let data_dir = {
-        let mut guard = managed.lock();
-        guard.select_library_account(account);
+        let guard = managed.lock();
+        if guard.me_id == account { return; }
         guard.data_dir.clone()
     };
-    if let Err(error) = remember_last_account(&data_dir, account) {
-        log::warn(&format!("could not remember the signed-in account: {error}"));
+    let account_owned = account.to_owned();
+    let load_dir = data_dir.clone();
+    let loaded = if !account_owned.is_empty() && !presentation::active() {
+        let load_account = account_owned.clone();
+        tokio::task::spawn_blocking(move || load_account_library_from_disk(&load_dir, &load_account))
+            .await
+            .ok()
+    } else {
+        None
+    };
+    {
+        let mut guard = managed.lock();
+        guard.install_library_account(&account_owned, loaded);
+    }
+    match tokio::task::spawn_blocking(move || remember_last_account(&data_dir, &account_owned)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn(&format!("could not remember the signed-in account: {error}")),
+        Err(error) => log::warn(&format!("could not remember the signed-in account: {error}")),
     }
 }
 
@@ -2145,9 +2229,7 @@ fn forward_position_heartbeat(snapshot: &mut AppState, heartbeat: PositionHeartb
 /// were withheld from it is owed one playhead: the newest withheld heartbeat,
 /// projected to `now` the way the window projects between heartbeats. `None`
 /// when nothing was withheld — the window's own projection then runs from an
-/// exact anchor, a full state or a heartbeat it did hear. Only Windows reports
-/// the state (see `report_window_state`); elsewhere it is never minimized here.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// exact anchor, a full state or a heartbeat it did hear.
 fn record_window_minimized(snapshot: &mut AppState, minimized: bool, now: std::time::Instant) -> Option<u32> {
     snapshot.window_minimized = minimized;
     if minimized { return None; }
@@ -2168,11 +2250,10 @@ fn projected_playhead(playback: &PlaybackState, at: std::time::Instant, now: std
     if playback.duration_ms > 0 { projected.min(playback.duration_ms) } else { projected }
 }
 
-/// Called from the native window-state watcher. A restored window whose
-/// heartbeats were withheld hears the shell's projection of the newest one,
-/// as the scalar `position` a heartbeat would have been: no engine round trip
-/// and no queue.
-#[cfg(windows)]
+/// Called from the native window-state watcher (and visibility updates on
+/// non-Windows). A restored window whose heartbeats were withheld hears the
+/// shell's projection of the newest one, as the scalar `position` a heartbeat
+/// would have been: no engine round trip and no queue.
 pub(crate) fn window_minimized_changed(app: &AppHandle, minimized: bool) {
     let Some(state) = app.try_state::<Mutex<AppState>>() else { return };
     let Some(position_ms) = record_window_minimized(&mut state.lock(), minimized, std::time::Instant::now())
@@ -2184,11 +2265,11 @@ pub(crate) fn window_minimized_changed(app: &AppHandle, minimized: bool) {
 
 /// Restore may fetch the library before its first ready state is publishable.
 /// Deliver that account's latest cache only after the UI has seen its identity.
-fn publish_library_account(app: &AppHandle) {
+async fn publish_library_account(app: &AppHandle) {
     let managed = app.state::<Mutex<AppState>>();
     if managed.lock().library_identity_published { return; }
     let persistence = managed.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let payload = {
         let mut guard = managed.lock();
         if guard.library_identity_published { return; }
@@ -2239,7 +2320,7 @@ async fn refresh_library(
     let result = fetch_library(state, client).await?;
     if !result.applied { return Ok(()); }
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     if !library_generation_is_current(&state.lock(), result.generation) { return Ok(()); }
     if state.lock().library_identity_published {
         let _ = app.emit("library", json!({"playlists": result.playlists, "playlist_tree": result.playlist_tree}));
@@ -2300,12 +2381,12 @@ async fn reconcile_memberships(app: &AppHandle, state: &Mutex<AppState>, client:
         return;
     }
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (dir, entries) = {
         let guard = state.lock();
         (guard.library_dir(), guard.memberships.clone())
     };
-    save_membership(&dir, &entries);
+    let _ = tokio::task::spawn_blocking(move || save_membership(&dir, &entries)).await;
     let _ = app.emit("memberships_changed", json!({"saved_tracks": liked}));
 }
 
@@ -2316,7 +2397,7 @@ async fn refresh_memberships(state: &Mutex<AppState>, client: &EngineClient, pla
     // persistence lock keeps this snapshot ordered with a successful delete.
     let persistence = state.lock().playlist_persistence.clone();
     let (work, generation) = {
-        let _serialize = persistence.lock();
+        let _serialize = persistence.lock().await;
         let mut guard = state.lock();
         let qualifying: Vec<(String, String)> = guard
             .playlists
@@ -2459,7 +2540,7 @@ fn spawn_refresh_playlist(app: AppHandle, id: String, cause: RefreshCause) {
                     // just read may predate the newest committed edit; the
                     // queued pass below speaks instead of this payload.
                     let persistence = state.lock().playlist_persistence.clone();
-                    let _serialize = persistence.lock();
+                    let _serialize = persistence.lock().await;
                     let current = {
                         let guard = state.lock();
                         library_generation_is_current(&guard, result.generation)
@@ -2472,7 +2553,7 @@ fn spawn_refresh_playlist(app: AppHandle, id: String, cause: RefreshCause) {
                 }
                 Ok(PlaylistFetched::Unchanged(Some(held))) => {
                     let persistence = state.lock().playlist_persistence.clone();
-                    let _serialize = persistence.lock();
+                    let _serialize = persistence.lock().await;
                     let current = {
                         let guard = state.lock();
                         library_generation_is_current(&guard, held.generation)
@@ -2614,7 +2695,7 @@ async fn fetch_library(
     };
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (dir, cache) = {
         let mut guard = state.lock();
         if !library_generation_is_current(&guard, generation) {
@@ -2642,18 +2723,11 @@ async fn fetch_library(
         guard.playlists = playlists.clone();
         guard.playlists_fetched_at = Some(fetched_at);
         guard.library_fresh = true;
-        (
-            guard.library_dir(),
-            changed.then(|| PlaylistListCache {
-                version: 1,
-                fetched_at: Some(fetched_at),
-                me_id: guard.me_id.clone(),
-                playlists: playlists.clone(),
-                playlist_tree: playlist_tree.clone(),
-            }),
-        )
+        (guard.library_dir(), changed.then(|| library_list_cache(&guard)))
     };
-    if let Some(cache) = cache { save_playlist_list(&dir, &cache); }
+    if let Some(cache) = cache {
+        let _ = tokio::task::spawn_blocking(move || save_playlist_list(&dir, &cache)).await;
+    }
     Ok(LibraryFetchResult {
         playlists,
         playlist_tree,
@@ -2728,9 +2802,12 @@ async fn fetch_playlist(
             let Some(held_key) = held_key else {
                 return Err("the engine vouched for rows that were never offered".to_owned());
             };
-            return Ok(PlaylistFetched::Unchanged(adopt_unchanged_playlist(
-                app, state, client, id, generation, playlist_generation, cache_generation, &held_key, read,
-            )));
+            return Ok(PlaylistFetched::Unchanged(
+                adopt_unchanged_playlist(
+                    app, state, client, id, generation, playlist_generation, cache_generation, &held_key, read,
+                )
+                .await,
+            ));
         }
     };
     let tracks_key = browse.tracks_key.clone();
@@ -2740,7 +2817,7 @@ async fn fetch_playlist(
     }
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (dir, list_cache, tracks_bytes, membership) = {
         let mut guard = state.lock();
         guard.finish_library_import()?;
@@ -2767,30 +2844,30 @@ async fn fetch_playlist(
             .flatten();
         (
             guard.library_dir(),
-            should_persist_library.then(|| PlaylistListCache {
-                version: 1,
-                fetched_at: guard.playlists_fetched_at,
-                me_id: guard.me_id.clone(),
-                playlists: guard.playlists.clone(),
-                playlist_tree: guard.playlist_tree.clone(),
-            }),
+            should_persist_library.then(|| library_list_cache(&guard)),
             tracks_bytes,
             membership,
         )
     };
-    if let Some(bytes) = tracks_bytes {
-        // A large cache write does not belong on an async worker. `block_in_place`
-        // rather than `spawn_blocking` because the persistence guard above has
-        // to stay held until the bytes land: the unfollow path serializes its
-        // own removal under the same guard, and a refresh that captured the
-        // removed row before it must not overtake it on disk.
-        tokio::task::block_in_place(|| write_tracks_cache_bytes(&dir, &bytes));
+    let emit_membership = membership.is_some();
+    if tracks_bytes.is_some() || list_cache.is_some() || membership.is_some() {
+        // Offload cache writes onto the blocking pool while holding the async
+        // persistence mutex so unfollows/deletes serialize in one disk order
+        // without blocking Tokio workers.
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(bytes) = tracks_bytes {
+                write_tracks_cache_bytes(&dir, &bytes);
+            }
+            if let Some(list_cache) = list_cache {
+                save_playlist_list(&dir, &list_cache);
+            }
+            if let Some(entries) = membership {
+                save_membership(&dir, &entries);
+            }
+        })
+        .await;
     }
-    if let Some(list_cache) = list_cache {
-        save_playlist_list(&dir, &list_cache);
-    }
-    if let Some(entries) = membership {
-        save_membership(&dir, &entries);
+    if emit_membership {
         // Hovering the mark must not wait for the next track change: an add
         // to the playing playlist lights it up within one event round trip.
         let _ = app.emit("memberships_changed", json!({"saved_tracks": false}));
@@ -2811,7 +2888,7 @@ async fn fetch_playlist(
 /// revision covers — are persisted when they moved. Nothing else is written
 /// or emitted: the rows, the library entry and the membership all stand.
 #[allow(clippy::too_many_arguments)]
-fn adopt_unchanged_playlist(
+async fn adopt_unchanged_playlist(
     app: &AppHandle,
     state: &Mutex<AppState>,
     client: &EngineClient,
@@ -2825,7 +2902,7 @@ fn adopt_unchanged_playlist(
     let mut cached_ids = read.cached_ids;
     client.reconcile_cached_ids(&mut cached_ids, cache_generation);
     let persistence = state.lock().playlist_persistence.clone();
-    let _serialize = persistence.lock();
+    let _serialize = persistence.lock().await;
     let (update, dir, bytes, detail) = {
         let mut guard = state.lock();
         if let Err(error) = guard.finish_library_import() {
@@ -2847,7 +2924,7 @@ fn adopt_unchanged_playlist(
         (update, guard.library_dir(), bytes, detail)
     };
     if let Some(bytes) = bytes {
-        tokio::task::block_in_place(|| write_tracks_cache_bytes(&dir, &bytes));
+        let _ = tokio::task::spawn_blocking(move || write_tracks_cache_bytes(&dir, &bytes)).await;
     }
     if !update.marked.is_empty() {
         app.state::<Arc<PlaybackRouter>>().apply_cache_marks(false, &[], &update.marked);

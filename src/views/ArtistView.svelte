@@ -548,8 +548,10 @@
     });
   }
 
-  function playTop(i) {
-    if (top.length) api.playQueue(top, i, `artist:${artist?.id ?? ""}`).catch(() => {});
+  function playTop(i, automaticStart = false) {
+    if (top.length) {
+      api.playQueue(top, i, `artist:${artist?.id ?? ""}`, automaticStart ? { automaticStart: true } : undefined).catch(() => {});
+    }
   }
 
   async function shuffleTop() {
@@ -949,7 +951,7 @@
          sections immediately below it, both of which already carry their own
          count beside their own heading. -->
     <div class="actions" style="margin-top:var(--s6)">
-      <button class="play-lg" title="Play popular songs" onclick={() => playTop(0)} disabled={!top.length}>
+      <button class="play-lg" title="Play popular songs" onclick={() => playTop(0, true)} disabled={!top.length}>
         <Icon name="play" size={22} />
       </button>
       <button class="btn-round lg" title="Shuffle" aria-label="Shuffle popular songs" onclick={shuffleTop} disabled={!top.length}>

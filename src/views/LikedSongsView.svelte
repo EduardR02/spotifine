@@ -101,7 +101,7 @@
 
   function playOrToggle() {
     if (playingThis) togglePlay();
-    else playFrom(0);
+    else if (tracks.length) api.playQueue(tracks, 0, "liked", { automaticStart: true }).catch(() => {});
   }
 </script>
 

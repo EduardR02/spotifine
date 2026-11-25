@@ -605,8 +605,10 @@
   function placeSpeedMenu() {
     const rect = speedButton?.getBoundingClientRect();
     if (!rect) return;
+    const min = Math.min(148, window.innerWidth / 2);
+    const max = Math.max(min, window.innerWidth - 148);
     speedAnchor = {
-      left: rect.left + rect.width / 2,
+      left: Math.min(max, Math.max(min, rect.left + rect.width / 2)),
       bottom: window.innerHeight - rect.top + 8,
     };
   }
@@ -634,16 +636,24 @@
     const node = speedMenu;
     node?.showPopover?.();
     const reposition = () => placeSpeedMenu();
-    window.addEventListener("resize", reposition);
-    /* Light dismiss closes the popover without telling the component. */
-    const onToggle = (event) => {
-      if (event.newState === "closed") speedOpen = false;
+    const onPointerDown = (event) => {
+      if (node?.contains(event.target) || speedButton?.contains(event.target)) return;
+      speedOpen = false;
     };
-    node?.addEventListener("toggle", onToggle);
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      speedOpen = false;
+      speedButton?.focus();
+    };
+    window.addEventListener("resize", reposition);
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown, true);
     return () => {
       window.removeEventListener("resize", reposition);
-      node?.removeEventListener("toggle", onToggle);
-      node?.hidePopover?.();
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown, true);
+      if (node?.matches?.(":popover-open")) node.hidePopover();
     };
   });
 </script>
@@ -902,7 +912,7 @@
       </button>
       <div
         class="speed-menu glass-overlay"
-        popover="auto"
+        popover="manual"
         bind:this={speedMenu}
         style:left="{speedAnchor.left}px"
         style:bottom="{speedAnchor.bottom}px"

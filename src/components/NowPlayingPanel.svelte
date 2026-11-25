@@ -82,8 +82,6 @@
   const videoShown = $derived(Boolean(shown.loop));
   /** The cover-or-Canvas choice, there only while there is one. */
   const canSwap = $derived(Boolean(current) && shown.swap);
-  /** The head holds that choice and, on Windows, the window's controls. */
-  const hasHead = $derived(canSwap || drawsWindowControls);
 
   /* The haze lays out differently when the video covers the panel: what is
      under it is never seen. Written from an effect so every path in and out
@@ -490,7 +488,7 @@
       {/each}
     </div>
 
-    <div class="np-scroll" bind:this={scrollEl} use:scrollbar={{ top: hasHead ? 56 : 0 }}>
+    <div class="np-scroll" bind:this={scrollEl} use:scrollbar={{ top: 56 }}>
       <section class="np-hero">
         <div class="np-art" class:away={videoShown || !artCover}>
           {#if artCover}
@@ -595,23 +593,21 @@
     </div>
   {/if}
 
-  {#if hasHead}
-    <!-- Its empty part moves the window: the panel is the window's top
-         right corner. -->
-    <header class="np-head" class:glass-strip={headOver} data-tauri-drag-region="deep">
-      {#if canSwap}
-        <button
-          class="np-swap glass-plate"
-          type="button"
-          title={videoShown ? "Show the cover art" : "Show the Canvas animation"}
-          onclick={swapSurface}
-        >
-          <Icon name="swap" size={11} />{videoShown ? "Cover" : "Canvas"}
-        </button>
-      {/if}
-      {#if drawsWindowControls}<WindowControls />{/if}
-    </header>
-  {/if}
+  <!-- Its empty part moves the window: the panel is the window's top
+       right corner, including on macOS when no Canvas toggle is shown. -->
+  <header class="np-head" class:glass-strip={headOver} data-tauri-drag-region="deep">
+    {#if canSwap}
+      <button
+        class="np-swap glass-plate"
+        type="button"
+        title={videoShown ? "Show the cover art" : "Show the Canvas animation"}
+        onclick={swapSurface}
+      >
+        <Icon name="swap" size={11} />{videoShown ? "Cover" : "Canvas"}
+      </button>
+    {/if}
+    {#if drawsWindowControls}<WindowControls />{/if}
+  </header>
 </aside>
 
 {#snippet identity()}

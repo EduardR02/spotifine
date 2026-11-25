@@ -62,52 +62,77 @@ fn reconcile_autostart_preference(app: &tauri::AppHandle, settings: &mut app::Ap
     }
 }
 
-/// Native Windows state also gates background work: WebView2 can keep its
-/// document visible and focused after the HWND has been minimized. Resize
-/// covers minimize/restore as well as every maximize path, without polling.
-#[cfg(windows)]
+/// Native window state also gates background work: WebView2 can keep its
+/// document visible and focused after the HWND has been minimized, and macOS
+/// needs miniaturize/hide tracking to stop emitting 2s position heartbeats.
 fn report_window_state(window: tauri::WebviewWindow) {
     use std::cell::Cell;
-    use tauri::Emitter;
 
-    #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
-    struct WindowState {
-        maximized: bool,
-        minimized: bool,
-    }
+    #[cfg(windows)]
+    {
+        use tauri::Emitter;
 
-    // The shell's own background work follows the same state: a window that
-    // starts minimized must not wait for its first resize to be known as one.
-    if let Ok(minimized) = window.is_minimized() {
-        commands::window_minimized_changed(window.app_handle(), minimized);
-    }
-    let last = Cell::new(None);
-    let handle = window.clone();
-    window.on_window_event(move |event| {
-        if !matches!(event, tauri::WindowEvent::Resized(_)) {
-            return;
+        #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+        struct WindowState {
+            maximized: bool,
+            minimized: bool,
         }
-        let Ok(maximized) = handle.is_maximized() else {
-            return;
-        };
-        let Ok(minimized) = handle.is_minimized() else {
-            return;
-        };
-        let state = WindowState { maximized, minimized };
-        let previous: Option<WindowState> = last.replace(Some(state));
-        if previous != Some(state) {
-            let _ = handle.emit("window-state", state);
+
+        // The shell's own background work follows the same state: a window that
+        // starts minimized must not wait for its first resize to be known as one.
+        if let Ok(minimized) = window.is_minimized() {
+            commands::window_minimized_changed(window.app_handle(), minimized);
         }
-        if previous.map(|previous| previous.minimized) != Some(minimized) {
-            commands::window_minimized_changed(handle.app_handle(), minimized);
-            if minimized {
-                tray::minimized(handle.app_handle());
+        let last = Cell::new(None);
+        let handle = window.clone();
+        window.on_window_event(move |event| {
+            if !matches!(event, tauri::WindowEvent::Resized(_)) {
+                return;
             }
-        }
-    });
+            let Ok(maximized) = handle.is_maximized() else {
+                return;
+            };
+            let Ok(minimized) = handle.is_minimized() else {
+                return;
+            };
+            let state = WindowState { maximized, minimized };
+            let previous: Option<WindowState> = last.replace(Some(state));
+            if previous != Some(state) {
+                let _ = handle.emit("window-state", state);
+            }
+            if previous.map(|previous| previous.minimized) != Some(minimized) {
+                commands::window_minimized_changed(handle.app_handle(), minimized);
+                if minimized {
+                    tray::minimized(handle.app_handle());
+                }
+            }
+        });
+    }
+
+    #[cfg(not(windows))]
+    {
+        let initial = window.is_minimized().unwrap_or(false)
+            || !window.is_visible().unwrap_or(true);
+        commands::window_minimized_changed(window.app_handle(), initial);
+        let last = Cell::new(Some(initial));
+        let handle = window.clone();
+        window.on_window_event(move |event| {
+            if !matches!(
+                event,
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Focused(_)
+            ) {
+                return;
+            }
+            let minimized = handle.is_minimized().unwrap_or(false)
+                || !handle.is_visible().unwrap_or(true);
+            if last.replace(Some(minimized)) != Some(minimized) {
+                commands::window_minimized_changed(handle.app_handle(), minimized);
+            }
+        });
+    }
 }
 
-fn shutdown_for_exit(app: &tauri::AppHandle) {
+pub(crate) fn shutdown_for_exit(app: &tauri::AppHandle) {
     if let Some(client) = app.try_state::<Arc<EngineClient>>() {
         client.shutdown_engine();
     }
@@ -140,6 +165,7 @@ pub fn run() {
     }
     let commands: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
         commands::check_for_update,
+        commands::relaunch_app,
         commands::play,
         commands::set_window_visible,
         commands::pause,
@@ -255,23 +281,39 @@ pub fn run() {
             reconcile_autostart_preference(app.handle(), &mut startup_settings);
             #[cfg(windows)]
             let tray_ready = tray::setup(app.handle(), startup_settings.minimize_to_tray);
-            #[cfg(not(windows))]
-            let tray_ready = false;
             if let Some(window) = app.get_webview_window("main") {
-                if startup_settings.start_minimized {
-                    if let Err(error) = window.minimize() {
-                        log::warn(&format!(
-                            "could not minimize the main window at startup: {error}"
-                        ));
+                #[cfg(windows)]
+                {
+                    if startup_settings.start_minimized {
+                        if let Err(error) = window.minimize() {
+                            log::warn(&format!(
+                                "could not minimize the main window at startup: {error}"
+                            ));
+                        }
+                    }
+                    // Keep the configured hidden window iconic for tray startup.
+                    // A missing icon or failed minimize must leave it reachable.
+                    let start_in_tray = tray_ready && startup_settings.start_minimized
+                        && window.is_minimized().unwrap_or(false);
+                    if !start_in_tray {
+                        if let Err(error) = window.show() {
+                            log::warn(&format!("could not show the main window at startup: {error}"));
+                        }
                     }
                 }
-                // Keep the configured hidden window iconic for tray startup.
-                // A missing icon or failed minimize must leave it reachable.
-                let start_in_tray = tray_ready && startup_settings.start_minimized
-                    && window.is_minimized().unwrap_or(false);
-                if !start_in_tray {
+                #[cfg(not(windows))]
+                {
+                    // macOS requires ordering/showing the window before calling
+                    // `minimize()`, and never calling `show()` afterward.
                     if let Err(error) = window.show() {
                         log::warn(&format!("could not show the main window at startup: {error}"));
+                    }
+                    if startup_settings.start_minimized {
+                        if let Err(error) = window.minimize() {
+                            log::warn(&format!(
+                                "could not minimize the main window at startup: {error}"
+                            ));
+                        }
                     }
                 }
             } else {
@@ -283,7 +325,6 @@ pub fn run() {
             let mut state = AppState::new(data_dir());
             state.select_last_account();
             app.manage(Mutex::new(state));
-            #[cfg(windows)]
             if let Some(window) = app.get_webview_window("main") {
                 report_window_state(window);
             }

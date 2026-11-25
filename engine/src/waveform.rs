@@ -28,14 +28,18 @@ const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// Audio format preference order, aligned with playback's `Bitrate::Bitrate320`
+/// selection so uncached waveform extraction downloads and caches the exact
+/// file playback will use instead of polluting the persistent audio cache with
+/// a throwaway 96 kbps copy and triggering false `Downloaded` badges.
 const SUPPORTED_FORMATS: &[(AudioFileFormat, usize)] = &[
-    (AudioFileFormat::OGG_VORBIS_96, 12 * 1_024),
-    (AudioFileFormat::MP3_96, 12 * 1_024),
-    (AudioFileFormat::OGG_VORBIS_160, 20 * 1_024),
-    (AudioFileFormat::MP3_160, 20 * 1_024),
-    (AudioFileFormat::MP3_256, 32 * 1_024),
     (AudioFileFormat::OGG_VORBIS_320, 40 * 1_024),
+    (AudioFileFormat::OGG_VORBIS_160, 20 * 1_024),
+    (AudioFileFormat::OGG_VORBIS_96, 12 * 1_024),
     (AudioFileFormat::MP3_320, 40 * 1_024),
+    (AudioFileFormat::MP3_256, 32 * 1_024),
+    (AudioFileFormat::MP3_160, 20 * 1_024),
+    (AudioFileFormat::MP3_96, 12 * 1_024),
 ];
 
 #[derive(Debug)]
@@ -1300,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn selector_prefers_any_cached_supported_file_then_lowest_rate() {
+    fn selector_prefers_any_cached_supported_file_then_playback_format() {
         let scratch = ScratchDir::new();
         let cache = Cache::new(
             None::<&Path>,
@@ -1314,12 +1318,15 @@ mod tests {
         let mut files = AudioFiles::default();
         files.insert(AudioFileFormat::OGG_VORBIS_96, low);
         files.insert(AudioFileFormat::OGG_VORBIS_320, high);
-        let high_path = cache.file_path(high).unwrap();
-        fs::create_dir_all(high_path.parent().unwrap()).unwrap();
-        fs::write(&high_path, b"cached").unwrap();
-        assert_eq!(select_file(&files, &cache).unwrap().1, high);
-        fs::remove_file(high_path).unwrap();
+        // Any already-cached file is reused without downloading another copy.
+        let low_path = cache.file_path(low).unwrap();
+        fs::create_dir_all(low_path.parent().unwrap()).unwrap();
+        fs::write(&low_path, b"cached").unwrap();
         assert_eq!(select_file(&files, &cache).unwrap().1, low);
+        // When nothing is cached, select the playback format (OGG_VORBIS_320)
+        // so the cached file matches what playback will open.
+        fs::remove_file(low_path).unwrap();
+        assert_eq!(select_file(&files, &cache).unwrap().1, high);
     }
 
     #[test]

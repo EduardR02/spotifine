@@ -20,10 +20,6 @@
   let definitionGeneration = 0, waveformGeneration = 0, previewGeneration = 0, keySequence = 0;
   let previewRequest = $state(null), previewQueueAwaiting = $state(null), previewQueueIdentity = $state("");
   let previewCutsSource = null, previewCutsSignature = "", previewCuts = [];
-  // The backend invocation outlives the optimistic editor generation: route
-  // teardown must be able to wait for a command that is no longer allowed to
-  // paint this component.
-  let previewInvocation = null;
   let previewContext = null;
 
   function keyed(range, prefix) {
@@ -447,7 +443,6 @@
     }
     const record = { promise: invocation, settled: false };
     context.invocation = record;
-    previewInvocation = invocation;
     invocation.then(
       () => {
         record.settled = true;
@@ -486,7 +481,6 @@
       actionError = String(reason || "Could not preview this edit.");
     } finally {
       if (context?.invocation === record) context.invocation = null;
-      if (previewInvocation === invocation) previewInvocation = null;
     }
   }
 

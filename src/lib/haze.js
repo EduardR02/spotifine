@@ -529,7 +529,7 @@ const STAT_BINS = 4096;
  * (exposureOf) and the share of it too grey to have a hue of its own.
  * @param rect [x0, y0, x1, y1], the picture in the source
  */
-export function sourceStats(src, rect) {
+function sourceStats(src, rect) {
   const [x0, y0, x1, y1] = rect;
   const d = src.data;
   const hist = new Uint32Array(STAT_BINS);
@@ -1437,7 +1437,7 @@ export function parseEdge(filter, tint) {
 }
 
 /** The gathered twin of a frost (RGBA bytes), as RGBA bytes: see parseEdge. */
-export function gatherOf(frost, edge) {
+function gatherOf(frost, edge) {
   const out = new Uint8ClampedArray(frost.length);
   const m = saturateMatrix(edge.saturate), k = edge.gain, a = edge.alpha, t = edge.tint;
   const at = [a * t[0], a * t[1], a * t[2]];

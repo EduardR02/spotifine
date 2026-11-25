@@ -27,7 +27,7 @@
       : (playback.upcoming ?? []),
   );
   const upNext = $derived(rows.slice(1));
-  const upNextTotal = $derived(formatTotal(upNext.map((qi) => queue[qi])));
+  const upNextTotal = $derived(formatTotal(upNext.map((qi) => queue[qi]).filter(Boolean)));
 
   /* The queue row is the one track row the shared TrackList does not render:
      its trailing cell is a reorder/remove cluster rather than a menu. Its five
@@ -234,10 +234,9 @@
     else clampWindow(length);
   });
 
+  // Re-measure when the row plan changes without rebuilding the scroll
+  // listener and ResizeObserver on every track advance or reorder.
   $effect(() => {
-    // Re-runs when the row plan's identity, its length, or the mounted body
-    // changes; deliberately does not depend on firstRow/lastRow, which change
-    // on every scroll frame.
     const list = rows;
     list.length;
     if (!bodyEl) return;
@@ -250,22 +249,28 @@
       lastRow = list.length;
       return;
     }
-    let queued = false;
+    untrack(() => measure(scroller));
+  });
+
+  $effect(() => {
+    if (!bodyEl) return;
+    const scroller = bodyEl.closest(".scroll");
+    if (!scroller) return;
+    let scrollFrame = 0;
     const onScroll = () => {
-      if (queued) return;
-      queued = true;
-      requestAnimationFrame(() => {
-        queued = false;
+      if (scrollFrame) return;
+      scrollFrame = requestAnimationFrame(() => {
+        scrollFrame = 0;
         measure(scroller);
       });
     };
     scroller.addEventListener("scroll", onScroll, { passive: true });
     const ro = new ResizeObserver(() => measure(scroller));
     ro.observe(scroller);
-    measure(scroller);
     return () => {
       scroller.removeEventListener("scroll", onScroll);
       ro.disconnect();
+      if (scrollFrame) cancelAnimationFrame(scrollFrame);
     };
   });
 </script>

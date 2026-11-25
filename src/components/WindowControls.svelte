@@ -2,13 +2,10 @@
   import Icon from "./Icon.svelte";
   import {
     frame,
-    watchFrame,
     minimizeWindow,
     toggleMaximizeWindow,
     closeWindow,
   } from "../lib/window-frame.svelte.js";
-
-  $effect(() => watchFrame());
 </script>
 
 <!-- Minimize, maximize and close for the frameless Windows window: the

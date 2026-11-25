@@ -33,14 +33,14 @@ login in your browser.
 
 - **Windows:** download `Spotifine-windows-x64-setup.exe` from
   [Releases](../../releases) and run it.
-- **macOS 14+ (Apple Silicon):** download `Spotifine-macos-arm64.zip` from
-  [Releases](../../releases), extract `Spotifine.app` and open it. The app is
-  ad-hoc signed, not notarized, so Gatekeeper may ask you to approve it. Only
-  do that for builds you trust.
+- **macOS 14+ (Apple Silicon):** install with Homebrew (`brew install --cask eduardr02/tap/spotifine`),
+  or download `Spotifine-macos-arm64.zip` from [Releases](../../releases),
+  extract `Spotifine.app`, and open it. The app is ad-hoc signed, not notarized,
+  so Gatekeeper may ask you to approve it. Only do that for builds you trust.
 
-Spotifine checks for updates once a day while it runs. When a release is
-available, the download arrow by your account installs it and restarts the
-app. You can still check manually in Settings.
+Spotifine checks for updates once a day while running. When a new version is
+available, a download button appears next to Settings to install it and restart.
+You can also check manually in Settings.
 
 ## Not affiliated with Spotify
 
@@ -71,14 +71,10 @@ changes, playback follows it. It can launch at login, minimized if you want.
 On Windows, turn on **Minimize to tray** in Settings to move the minimized
 window out of the taskbar. Click the tray icon to reopen it; Close still quits.
 
-Playlists can be created, renamed, deleted and reordered, and tracks added or
-removed by drag and drop or in bulk by rules (artist, album, title, length),
-with a preview of exactly which entries go. Playlists can be pinned to the top
-of the library, and folders are kept.
-
-Drag and drop songs to add to a playlist or reorder them.
-Browse the **Recommended** section below a playlist to see up to five pages
-of ten suggestions, depending on how many Spotify returns.
+Playlists can be created, renamed, deleted, pinned, and organized in folders.
+Songs can be added or reordered by drag and drop, cleaned up in bulk by rules
+(artist, album, title, length) with a preview of what goes, and browsed with
+Spotify's playlist recommendations underneath.
 
 Some extra things I added because we control playback here:
 
@@ -91,23 +87,9 @@ Some extra things I added because we control playback here:
   listening history is not imported.
 - A mark on songs that are already in the local audio cache.
 
-Spotify listening history and personalization are on by default, like in
-Spotify's own client. **Listening history & personalization** in Settings can
-turn them off. Only audio rendered to the output counts, not paused time,
-seek jumps, preload, or editor previews. The local history above is separate
-and is never uploaded retroactively.
-
-Turning this off cancels pending listening reports; turning it back on starts
-fresh. This isn't Spotify's account-wide Private Session or anonymous streaming:
-Spotify still receives the requests needed to play music. Delivery uses
-Spotify's undocumented event receiver and a bounded memory queue, so a crash
-or interrupted connection can lose unsent events. History updates can be delayed.
-Spotify controls how these events affect recommendations; Wrapped and royalty
-accounting aren't guaranteed.
-
-If the preference is saved but the running player cannot confirm the change,
-Settings keeps the saved value and shows a restart warning. Restart Spotifine
-before relying on that change.
+Spotify listening history and personalization are on by default, and can be
+turned off in Settings (**Listening history & personalization**). Only audio
+actually played counts, and the local history above stays on your machine.
 
 Canvas, the short looping video some songs have, is an account setting on
 Spotify's side. Spotifine shows it whenever it's on for your account.
@@ -139,45 +121,15 @@ authorization for the same account, not another account.
    asks once more, for permission to see and control your playback.
 
 The player bar then shows a device button. Your queue stays in charge on the
-other device, and that device's own controls work with it. Editing the queue
-while it plays elsewhere can make it rebuffer for a moment. Other devices play
+other device, and that device's own controls work with it. Other devices play
 Spotify's original audio, so playback speed and song edits only apply on this
 computer.
 
-### Playback timing
-
-Ordinary local pause/resume retains the decoder, queued audio and processing
-state. It does not deliberately reload the song or wait for a fresh download
-window. The same three-second compressed-data read-ahead policy is used on
-Windows and macOS; it is not three seconds of output latency. Ready player
-commands are handled before the next potentially blocking decode or output write.
-An already-running read can still wait for missing network or disk data.
-
-The native output buffer is chosen by the platform and driver. CoreAudio's
-start/stop calls are synchronous; Windows queues those calls to an audio worker.
-If controls feel delayed on a Mac, compare the same cached song through built-in
-output with EQ/virtual output disabled, then enabled, then through Bluetooth.
-Record the approximate time and keep
-`~/Library/Application Support/Spotifine/logs/playback_engine.log`: its
-`transport:` lines distinguish an ordinary resume from a new load or recovery.
-Do not delete the cache or history to diagnose a delay.
-
-### When a track won't start
-
-The playback message distinguishes Spotify refusing an audio key from not
-answering the request. Spotifine retries for a limited time without skipping the
-track. If retries stop, try the same track in the official Spotify app after a
-refusal, or check your connection if there was no reply.
-
-For a report, include the Spotifine version, approximate time, and the matching
-`audio key` lines from `playback_engine.log`. On Windows it is in
-`%LOCALAPPDATA%\Spotifine\logs`; on macOS it is in
-`~/Library/Application Support/Spotifine/logs`. Redact account identifiers
-before sharing a log.
-
 ## Limitations
 
-Windows and macOS 14 or later only, and you need Spotify Premium.
+Windows and macOS 14 or later only, and you need Spotify Premium. Note that
+Spotify currently blocks `librespot` audio keys on some accounts (mostly newer
+or recently migrated ones), which prevents playback even with Premium.
 
 No lossless. Spotify has it and the official app plays it, but this client isn't
 offered it: the track metadata we get back lists AAC 24 and Ogg Vorbis
@@ -203,23 +155,9 @@ bun tauri build
 
 The installer lands in `target/release/bundle/nsis/` on Windows, and the app in
 `target/release/bundle/macos/` on macOS. For development, build the playback
-engine once with `bun run build:engine`, then run `bun tauri dev`. The checks
-are listed in `AGENTS.md`.
-
-For fast repeat installers, keep `target/release/` intact: Cargo needs its
-dependency artifacts and fingerprints, not just the two executables. If disk
-space is tight, remove `target/debug/` first when no build is running. Vite
-preserves unchanged assets so packaging the same frontend does not force a
-Rust rebuild. The private engine crate has no product version; for a release,
-bump `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`,
-and update the workspace lockfile.
-
-Push the matching `vX.Y.Z` tag to run the [release workflow](../../actions/workflows/release.yml).
-Do not publish a release by hand. The workflow builds, tests, and packages
-both platforms, uploads the signed assets and `latest.json` to a draft, then
-publishes it. Until then, update checks keep seeing the previous release.
-Main-branch changes to build configuration seed the Rust dependency caches;
-release jobs can read them but do not write to them.
+engine once with `bun run build:engine`, then run `bun tauri dev`. Pushing a
+`vX.Y.Z` tag runs the [release workflow](../../actions/workflows/release.yml)
+to build, test, sign, and publish both platforms.
 
 Your login and caches stay on your computer, under `%LOCALAPPDATA%\Spotifine`
 on Windows or `~/Library/Application Support/Spotifine` on macOS. The

@@ -125,10 +125,8 @@ fn parse_following(payload: &[u8]) -> Result<Vec<ArtistRef>, String> {
 
 /// Every artist the signed-in account follows, in the service's own order.
 pub async fn followed_artists(session: &Session) -> Result<Vec<ArtistRef>, String> {
-    let endpoint = format!(
-        "/user-profile-view/v3/profile/{user}/following",
-        user = session.username(),
-    );
+    let user = crate::browse::profile_username_path(&session.username())?;
+    let endpoint = format!("/user-profile-view/v3/profile/{user}/following");
     let payload = crate::browse::spclient_read(|| async {
         session.spclient().request(&Method::GET, &endpoint, None, None).await
     }).await

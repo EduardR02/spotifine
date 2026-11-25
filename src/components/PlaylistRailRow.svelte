@@ -1,5 +1,5 @@
 <script>
-  import { navigate, libraryKind } from "../lib/state.svelte.js";
+  import { navigate, libraryKind, isWritablePlaylist } from "../lib/state.svelte.js";
   import { railDrag, trackDrag } from "../lib/dnd.svelte.js";
   import Cover from "./Cover.svelte";
   import Icon from "./Icon.svelte";
@@ -7,12 +7,13 @@
      dropped onto this one joins it there. `onpress` starts the rail's own
      drag; a row that cannot move (a filtered list) passes none. */
   let { playlist, active = false, playing = false, pinned = false, depth = 0, parent = null, onmenu, onpress = null, observeCover } = $props();
+  const writable = $derived(isWritablePlaylist(playlist));
 </script>
 
 <button class="lib-row" class:active class:playing
-  class:no-drop={trackDrag.active && trackDrag.sourcePlaylistId === playlist.id}
+  class:no-drop={trackDrag.active && (!writable || trackDrag.sourcePlaylistId === playlist.id)}
   class:drag-source={railDrag.item?.kind === "playlist" && railDrag.item.id === playlist.id}
-  data-pid={playlist.id} data-parent={parent ?? ""}
+  data-pid={writable ? playlist.id : undefined} data-parent={parent ?? ""}
   use:observeCover={playlist.id}
   style:padding-left={`${8 + depth * 16}px`}
   aria-haspopup="menu"
@@ -22,7 +23,7 @@
   onkeydown={(event) => onmenu?.(event, playlist)}>
   <Cover src={playlist.cover_url} srcs={playlist.cover_urls ?? []} id={playlist.id} name={playlist.name} size={32} />
   <span class="lib-name">{playlist.name}</span>
-  {#if trackDrag.active}
+  {#if trackDrag.active && writable}
     <span class="lib-drop-hint" aria-hidden="true"><Icon name="plus" size={13} /></span>
   {:else}
     <span class="lib-tail">

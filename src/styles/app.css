@@ -1030,19 +1030,22 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    The other is the same type dimmed — no pill, no underline, no segmented
    track: two words at 11px are already a small enough object that a container
    around them would be the loudest thing in the rail. */
-/* Keep the actions on the right at their full hit size. Only the tab labels
-   can shrink if the platform font needs more room. */
-.lib-modes { display: flex; min-width: 0; align-items: center; gap: var(--s1); min-height: 24px; }
-/* Sentence case matches the filter placeholder and keeps three collections
-   readable in the rail without relying on Windows font metrics. */
+/* Size the tabs and separators so all three labels fit on one row without
+   shrinking or truncating under wider macOS system font metrics. */
+.lib-modes { display: flex; flex: none; align-items: center; min-height: 24px; }
+/* Sentence case at 11px keeps three collections readable in the rail across
+   both Windows and macOS fonts without layout shift when switching tabs. */
 .lib-mode {
-  min-width: 0;
+  flex: none;
   font-family: var(--font-small);
-  font-size: var(--t-11); font-weight: var(--w-semi);
+  font-size: 11px; font-weight: var(--w-semi); letter-spacing: -0.01em;
   color: var(--fg-3); white-space: nowrap;
   transition: color var(--d1) var(--ease);
 }
-.lib-mode > span { display: block; overflow: hidden; text-overflow: ellipsis; }
+/* SF Pro Text at 600 weight runs ~10-14% wider than Segoe UI Variable Small;
+   stepping half a pixel down matches its horizontal footprint across both rail
+   widths without wrapping or truncating. */
+:root[data-os="mac"] .lib-mode { font-size: 10.5px; }
 .lib-mode:hover { color: var(--label); }
 /* Two clear steps of the same type rather than a highlight: the selected word
    is the heading, so it takes the emphasised label token, and the other sits a
@@ -1050,12 +1053,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    have OPENED, and a foam heading here would compete with the selection it is
    sitting above. */
 .lib-mode.on { color: var(--label-hi); }
-/* One dot between them, so the pair reads as one control rather than as a
-   heading with a stray word after it. Drawn on the separator itself, which
-   costs no element: `gap` already spaces the words. */
-.lib-mode + .lib-mode { position: relative; padding-left: var(--s1); }
+/* One centered dot between tabs, drawn on the separator so it costs no extra
+   element and keeps spacing tight and symmetric. */
+.lib-mode + .lib-mode { position: relative; padding-left: 8px; }
 .lib-mode + .lib-mode::before {
-  content: ""; position: absolute; left: 0; top: 50%;
+  content: ""; position: absolute; left: 3px; top: 50%;
   width: 2px; height: 2px; margin-top: -1px; border-radius: var(--rf);
   background: var(--fg-3);
 }
@@ -2246,7 +2248,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* Zero-size, unpainted, unhittable. It only needs a position in the scrolled
    content for the observer to watch — same device as `.topbar-sentinel`. */
 .tl-head-sentinel { height: 0; pointer-events: none; }
-.tl-sort-btn {
+.tl-sort-btn, .tl-head-label {
   display: inline-flex; align-items: center; gap: var(--s1);
   min-width: 0; max-width: 100%; height: calc(100% - var(--s1));
   color: inherit; text-transform: inherit; letter-spacing: inherit;
@@ -2255,9 +2257,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
      first thing to collide, and two overlapping tracked-out caps labels read
      as a rendering fault rather than as a tight layout. */
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.tl-sort-btn {
   transition: color var(--d1) var(--ease);
 }
-.tl-head > .tl-sort-btn:first-child { justify-content: flex-end; }
+.tl-head > :is(.tl-sort-btn, .tl-head-label):first-child { justify-content: flex-end; }
 /* One cell, two controls — the head for a title cell that now carries the
    artists on its second line. It shrinks as one track, and `Artist` is what
    gives way first: it is the secondary of the pair, and "TITLE" alone still
@@ -2266,7 +2270,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: flex; align-items: center; gap: var(--s2);
   min-width: 0; height: 100%; overflow: hidden;
 }
-.tl-title-head > .tl-sort-btn { flex: 0 1 auto; }
+.tl-title-head > :is(.tl-sort-btn, .tl-head-label) { flex: 0 1 auto; }
 .tl-artist-sort { flex-shrink: 1000; }
 .tl-head-sep {
   flex: none; width: 3px; height: 3px; border-radius: 50%;
@@ -3757,7 +3761,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
     --tint-melt: transparent;
   }
   .np-panel { --frost-video: none; }
-  .topbar, .tl-head { background: var(--bg-1); }
   .wash .tag, .banner .tag { background: rgba(255, 255, 255, 0.16); }
   .topbar, .tl-head, .np-head, .wash .tag, .banner .tag {
     -webkit-backdrop-filter: none;
@@ -3884,11 +3887,11 @@ html.dragging-track .tl-row:hover .c-more button { opacity: 0; }
    row under a rose hairline, and the source playlist of a MOVE dims and
    refuses the cursor — dropping a song back where it came from is not an
    action, and the UI should say so before the release. --- */
-.lib-list.droppable .lib-row[data-pid]:hover {
+.lib-list.droppable .lib-row[data-pid]:not(.no-drop):hover {
   background: var(--raise-2);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rose-ink) 45%, transparent);
 }
-.lib-list.droppable .lib-row[data-pid]:hover .lib-name { color: var(--rose-ink); }
+.lib-list.droppable .lib-row[data-pid]:not(.no-drop):hover .lib-name { color: var(--rose-ink); }
 .lib-drop-hint {
   font-family: var(--font-number);
   font-size: var(--t-13);

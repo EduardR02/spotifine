@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, retrySearch, playback, togglePlay } from "../lib/state.svelte.js";
+  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, retrySearch, playback, togglePlay, session } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById, cardPlay } from "../lib/play.js";
   import { coverTone, cardTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
@@ -150,12 +150,20 @@
      again. Reading is wrapped because a webview with storage disabled
      throws on access rather than returning null, and a search page must
      not fail to render over a history list. */
-  const RECENTS_KEY = "sr.recent-searches";
-  const OPENED_KEY = "sr.search-opened";
+  const RECENTS_PREFIX = "sr.recent-searches";
+  const OPENED_PREFIX = "sr.search-opened";
   const RECENTS_MAX = 8;
   const OPENED_MAX = 8;
 
+  function storageKey(prefix, account) {
+    return account ? `${prefix}.${encodeURIComponent(account)}` : "";
+  }
+  const validRecent = (s) => typeof s === "string" && s.trim();
+  const validOpened = (e) => e && typeof e.id === "string" && typeof e.name === "string" && TOP_LABEL[e.kind] &&
+    (e.kind !== "track" || typeof e.track?.uri === "string");
+
   function readList(key, max, valid) {
+    if (!key) return [];
     try {
       const raw = JSON.parse(localStorage.getItem(key) ?? "[]");
       return Array.isArray(raw) ? raw.filter(valid).slice(0, max) : [];
@@ -164,6 +172,7 @@
     }
   }
   function writeList(key, list) {
+    if (!key) return;
     try {
       localStorage.setItem(key, JSON.stringify(list));
     } catch {
@@ -171,17 +180,23 @@
     }
   }
 
-  let recents = $state(readList(RECENTS_KEY, RECENTS_MAX, (s) => typeof s === "string" && s.trim()));
-  let opened = $state(readList(OPENED_KEY, OPENED_MAX, (e) => e && typeof e.id === "string" && typeof e.name === "string" && TOP_LABEL[e.kind] &&
-    (e.kind !== "track" || typeof e.track?.uri === "string")));
+  let recents = $state([]);
+  let opened = $state([]);
+
+  $effect(() => {
+    session.accountEpoch;
+    const account = session.username;
+    recents = readList(storageKey(RECENTS_PREFIX, account), RECENTS_MAX, validRecent);
+    opened = readList(storageKey(OPENED_PREFIX, account), OPENED_MAX, validOpened);
+  });
 
   function writeRecents(next) {
     recents = next.slice(0, RECENTS_MAX);
-    writeList(RECENTS_KEY, recents);
+    writeList(storageKey(RECENTS_PREFIX, session.username), recents);
   }
   function writeOpened(next) {
     opened = next.slice(0, OPENED_MAX);
-    writeList(OPENED_KEY, opened);
+    writeList(storageKey(OPENED_PREFIX, session.username), opened);
   }
 
   /* A query typed in steps comes back once per pause — "just a", then "just

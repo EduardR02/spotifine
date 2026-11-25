@@ -235,10 +235,10 @@ pub struct AppState {
     playlist_refresh_sequence: u64,
     /// Serializes playlist state mutation with its rebuildable cache write.
     /// Async fetches may finish out of order; holding this outside the
-    /// AppState lock lets disk I/O proceed without blocking state readers while
-    /// still making memory and disk observe one completion order.
+    /// AppState lock lets off-thread disk I/O proceed without blocking state
+    /// readers or Tokio workers while keeping memory and disk in one order.
     #[serde(skip)]
-    pub(crate) playlist_persistence: Arc<Mutex<()>>,
+    pub(crate) playlist_persistence: Arc<tokio::sync::Mutex<()>>,
     /// True while a background library refresh (with retries) is running.
     #[serde(skip)]
     pub library_fetching: bool,
@@ -320,7 +320,7 @@ impl AppState {
             tracks_cache: Vec::new(),
             data_dir,
             playlist_refreshing: HashMap::new(),
-            playlist_persistence: Arc::new(Mutex::new(())),
+            playlist_persistence: Arc::new(tokio::sync::Mutex::new(())),
             playlist_refresh_sequence: 0,
             library_fetching: false,
             library_refresh_queued: false,
@@ -389,13 +389,24 @@ impl AppState {
     }
 
     pub(crate) fn library_dir(&self) -> PathBuf {
-        use sha1::{Digest, Sha1};
-        self.data_dir.join("library").join(format!("{:x}", Sha1::digest(self.me_id.as_bytes())))
+        library_dir_for(&self.data_dir, &self.me_id)
     }
 
     /// Account namespaces retain offline data across disconnects without ever
     /// borrowing another account's library or listening history.
     pub(crate) fn select_library_account(&mut self, account: &str) -> bool {
+        if self.me_id == account { return false; }
+        let loaded = (!account.is_empty() && !crate::presentation::active())
+            .then(|| load_account_library_from_disk(&self.data_dir, account));
+        self.install_library_account(account, loaded)
+    }
+
+    /// Installs an account namespace using disk data already loaded off-thread.
+    pub(crate) fn install_library_account(
+        &mut self,
+        account: &str,
+        loaded: Option<LoadedAccountLibrary>,
+    ) -> bool {
         if self.me_id == account { return false; }
         self.account_generation = self.account_generation.wrapping_add(1);
         self.library_generation = self.library_generation.wrapping_add(1);
@@ -415,13 +426,16 @@ impl AppState {
         // A presentation run's library is the configured one, built in memory
         // (`presentation`): the account's stored namespace is never read.
         if account.is_empty() || crate::presentation::active() { return true; }
-        let dir = self.library_dir();
-        self.library_import_pending = true;
-        if let Err(error) = self.finish_library_import() {
-            eprintln!("Spotifine: could not preserve the previous library history: {error}");
+        if let Some(loaded) = loaded {
+            self.library_import_pending = !loaded.import_ok;
+            if let Some(cache) = loaded.list {
+                self.playlists = cache.playlists;
+                self.playlist_tree = cache.playlist_tree;
+                self.playlists_fetched_at = cache.fetched_at;
+            }
+            self.tracks_cache = loaded.tracks_cache;
+            self.memberships = loaded.memberships;
         }
-        self.tracks_cache = load_tracks_cache(&dir);
-        self.memberships = load_membership(&dir);
         true
     }
 
@@ -693,6 +707,47 @@ pub fn load_app_settings() -> AppSettings {
     effective(SETTINGS.lock().clone())
 }
 
+pub(crate) fn library_dir_for(data_dir: &Path, account: &str) -> PathBuf {
+    use sha1::{Digest, Sha1};
+    data_dir.join("library").join(format!("{:x}", Sha1::digest(account.as_bytes())))
+}
+
+pub(crate) struct LoadedAccountLibrary {
+    pub(crate) list: Option<PlaylistListCache>,
+    pub(crate) tracks_cache: Vec<PlaylistTracksEntry>,
+    pub(crate) memberships: Vec<MembershipEntry>,
+    pub(crate) import_ok: bool,
+}
+
+pub(crate) fn load_account_library_from_disk(data_dir: &Path, account: &str) -> LoadedAccountLibrary {
+    let dir = library_dir_for(data_dir, account);
+    let import_ok = match import_owned_library_list(data_dir, &dir, account) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("Spotifine: could not preserve the previous library history: {error}");
+            false
+        }
+    };
+    let list = if import_ok {
+        load_playlist_list(&dir)
+            .filter(|cache| cache.me_id == account)
+            .map(|mut cache| {
+                order_by_last_activity(&mut cache.playlists);
+                cache
+            })
+    } else {
+        None
+    };
+    let tracks_cache = load_tracks_cache(&dir);
+    let memberships = load_membership(&dir);
+    LoadedAccountLibrary {
+        list,
+        tracks_cache,
+        memberships,
+        import_ok,
+    }
+}
+
 pub fn update_app_settings(change: impl FnOnce(&mut AppSettings)) -> Result<AppSettings, String> {
     let mut guard = SETTINGS.lock();
     let mut next = guard.clone();
@@ -706,6 +761,15 @@ pub fn update_app_settings(change: impl FnOnce(&mut AppSettings)) -> Result<AppS
     write_json_atomic_result(path, &next)?;
     *guard = next.clone();
     Ok(effective(next))
+}
+
+/// Offloads settings persistence (`std::fs` + `sync_all`) onto the blocking pool.
+pub async fn update_app_settings_async(
+    change: impl FnOnce(&mut AppSettings) + Send + 'static,
+) -> Result<AppSettings, String> {
+    tokio::task::spawn_blocking(move || update_app_settings(change))
+        .await
+        .map_err(|error| format!("could not update settings: {error}"))?
 }
 
 fn playback_state_path(dir: &Path) -> PathBuf {

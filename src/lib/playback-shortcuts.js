@@ -2,6 +2,7 @@ const NATIVE_SPACE_TARGET = 'button, a[href], input, textarea, select, [contente
 
 /** Playback owns Space only when neither a component nor a native control does. */
 export function spaceControlsPlayback(event) {
-  return event.code === "Space" && !event.defaultPrevented
+  return event.code === "Space" && !event.defaultPrevented && !event.repeat
+    && !event.ctrlKey && !event.metaKey && !event.altKey
     && !event.target?.closest?.(NATIVE_SPACE_TARGET);
 }

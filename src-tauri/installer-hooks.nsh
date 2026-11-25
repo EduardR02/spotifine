@@ -41,6 +41,13 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
+  ; Silent (/S) upgrades skip MUI_CUSTOMFUNCTION_GUIINIT and all installer pages,
+  ; so capture any existing Run registration here before Install overwrites
+  ; SPOTIFINE_INSTALL_KEY with the new $INSTDIR.
+  ${If} $SpotifineStartupCommand == ""
+    Call SpotifineRememberStartup
+  ${EndIf}
+
   ; After a successful launch the updater exits the shell. Its engine can
   ; still be draining on pipe EOF. Wait on the installed image's actual write
   ; lock, not on every process named PlaybackEngine.exe on this machine.

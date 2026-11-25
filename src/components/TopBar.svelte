@@ -100,7 +100,11 @@
                   ? (detail.artist ? `${detail.artist.name} / Fans also like` : "")
                   : route.name === "appears-on"
                     ? (detail.artist ? `${detail.artist.name} / Appears On` : "")
-                    : route.name === "track-editor"
+                    : route.name === "artist-playlists"
+                      ? (detail.artist ? `${detail.artist.name} / Artist playlists` : "")
+                      : route.name === "discovered-on"
+                        ? (detail.artist ? `${detail.artist.name} / Discovered on` : "")
+                        : route.name === "track-editor"
                       ? (getTrackEditorTrack(route.id, route.param)?.name ?? "Track edit")
                       : ["show", "episode", "profile"].includes(route.name) &&
                           pageTitle.route === `${route.name}\u0000${route.id ?? ""}`

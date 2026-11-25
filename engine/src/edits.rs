@@ -493,9 +493,9 @@ struct RootlistJson {
 
 /// Fetches the rootlist revision bytes (decoded from the JSON base64).
 async fn rootlist_revision(session: &Session) -> Result<Vec<u8>, String> {
+    let user = crate::browse::profile_username_path(&session.username())?;
     let endpoint = format!(
         "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from=0&length=1",
-        user = session.username(),
     );
     let body = session
         .spclient()
@@ -620,13 +620,13 @@ fn parse_rootlist_page(payload: &[u8]) -> Result<(Vec<u8>, usize, Vec<RootItem>)
 /// only meaningful against exactly the list they were computed from, so a
 /// list that changes between pages is read again rather than stitched.
 async fn rootlist_snapshot(session: &Session) -> Result<(Vec<u8>, Vec<RootItem>), String> {
+    let user = crate::browse::profile_username_path(&session.username())?;
     'read: for _ in 0..3 {
         let mut revision = Vec::new();
         let mut items = Vec::new();
         for _ in 0..ROOTLIST_MAX_PAGES {
             let endpoint = format!(
                 "/playlist/v2/user/{user}/rootlist?decorate=revision&from={from}&length={ROOTLIST_PAGE}",
-                user = session.username(),
                 from = items.len(),
             );
             let body = session
@@ -667,10 +667,8 @@ async fn post_rootlist_ops(session: &Session, revision: &[u8], ops: Vec<p4::Op>)
     if let Some(delta) = changes.deltas.first_mut() {
         delta.info = protobuf::MessageField::some(change_info(session));
     }
-    let endpoint = format!(
-        "/playlist/v2/user/{user}/rootlist/changes",
-        user = session.username(),
-    );
+    let user = crate::browse::profile_username_path(&session.username())?;
+    let endpoint = format!("/playlist/v2/user/{user}/rootlist/changes");
     let body = session
         .spclient()
         .request_with_protobuf(&Method::POST, &endpoint, None, &changes)
@@ -755,10 +753,25 @@ pub async fn rename_playlist(session: &Session, id: &str, name: &str) -> Result<
     post_playlist_changes(session, id, vec![rename_op(name)], None).await
 }
 
+/// Builds rootlist removal ops matching a playlist id against both canonical
+/// `spotify:playlist:{id}` and legacy `spotify:user:{owner}:playlist:{id}`
+/// entries so unfollowing works regardless of which URI form Spotify stored.
+fn delete_playlist_ops(items: &[RootItem], id: &str) -> Vec<p4::Op> {
+    let mut uris: Vec<&str> = Vec::new();
+    for row in items {
+        if is_playlist(&row.uri, id) && !uris.contains(&row.uri.as_str()) {
+            uris.push(row.uri.as_str());
+        }
+    }
+    uris.into_iter().map(rootlist_remove_op).collect()
+}
+
 /// Unfollows (removes) a playlist from the user's rootlist.
 pub async fn delete_playlist(session: &Session, id: &str) -> Result<(), String> {
-    let uri = format!("spotify:playlist:{id}");
-    post_rootlist_changes(session, vec![rootlist_remove_op(&uri)]).await
+    playlist_uri(id)?;
+    let (revision, items) = rootlist_snapshot(session).await?;
+    let ops = delete_playlist_ops(&items, id);
+    post_rootlist_ops(session, &revision, ops).await
 }
 
 /// Adds someone else's playlist back to the library, at the top.
@@ -1269,4 +1282,18 @@ mod tests {
         assert_eq!(folder_span(&items, "123456789abcdefa"), Ok((0, 1)));
     }
 
+    #[test]
+    fn delete_playlist_matches_both_canonical_and_legacy_rootlist_uris() {
+        let items = vec![
+            RootItem { uri: "spotify:playlist:canonical123".to_owned(), timestamp: None },
+            RootItem { uri: "spotify:user:legacy%20owner:playlist:legacy456".to_owned(), timestamp: None },
+        ];
+        let canonical = only(delete_playlist_ops(&items, "canonical123")).rem.unwrap();
+        assert_eq!(canonical.items[0].uri(), "spotify:playlist:canonical123");
+
+        let legacy = only(delete_playlist_ops(&items, "legacy456")).rem.unwrap();
+        assert_eq!(legacy.items[0].uri(), "spotify:user:legacy%20owner:playlist:legacy456");
+
+        assert!(delete_playlist_ops(&items, "missing789").is_empty());
+    }
 }

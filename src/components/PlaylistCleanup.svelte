@@ -765,10 +765,12 @@
   /* Overlay glass (.glass-overlay, in the markup), which makes a modal a
      sheet. */
   .cleanup-dialog {
-    display: flex; flex-direction: column;
     width: min(860px, calc(100vw - var(--s8)));
     max-height: calc(100dvh - var(--s8));
     overflow: hidden;
+  }
+  .cleanup-dialog[open] {
+    display: flex; flex-direction: column;
   }
   /* Positioned: the body's overlay scrollbar is laid against it. */
   .cleanup-sheet { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 0; }

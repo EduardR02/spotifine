@@ -496,7 +496,7 @@ void main() {
 }`;
 
 /** Complete fragment shaders with the shared TUNING definitions. */
-export function shaderSources() {
+function shaderSources() {
   const head = `#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n${defines()}\n${COMMON}`;
   return Object.fromEntries(Object.entries(PASSES).map(([name, body]) => [name, head + body]));
 }

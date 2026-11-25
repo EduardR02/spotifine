@@ -14,9 +14,10 @@ use tokio::sync::mpsc;
 
 use crate::audio::{self, AudioSignal};
 use crate::auth::{
-    AUDIO_START_TIMEOUT, AuthFailure, ConnectedSession, OauthListener, PendingAuth, PlaybackError,
-    PlaybackHandles, bind_oauth_listener, complete_oauth, connect_cached, create_playback,
-    percent_to_volume, prepare_oauth, stored_volume_percent,
+    AUDIO_START_TIMEOUT, AuthFailure, ConnectedSession, OauthListener, PREMIUM_REQUIRED_MESSAGE,
+    PendingAuth, PlaybackError, PlaybackHandles, bind_oauth_listener, complete_oauth,
+    connect_cached, create_playback, percent_to_volume, prepare_oauth, session_is_premium,
+    stored_volume_percent,
 };
 use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
@@ -404,6 +405,12 @@ pub struct Engine {
     /// `needs_login` state; `login` consumes it so the UI opens exactly the
     /// URL the flow listens for. Regenerated per attempt.
     pending_auth: Option<PendingAuth>,
+    /// Cancellation flag for an in-flight OAuth loopback callback listener so
+    /// `logout()` and `shutdown()` release port 5588 promptly.
+    oauth_cancel: Option<Arc<AtomicBool>>,
+    /// Whether the active Spotify account has Premium playback entitlement.
+    /// Defaults to `true` until session attributes indicate a Free account.
+    account_premium: bool,
     /// The output device every player this engine builds opens. Held rather
     /// than reached for, so a machine with no output device is a state a test
     /// can put the engine in (see [`audio::SinkOpener`]) — real hardware
@@ -697,6 +704,8 @@ impl Engine {
             auth_generation: 0,
             normalisation: Arc::new(AtomicBool::new(normalisation)),
             pending_auth: None,
+            oauth_cancel: None,
+            account_premium: true,
             audio_device,
             audio_device_present,
             audio_unavailable: None,
@@ -1336,11 +1345,31 @@ impl Engine {
         if !self.state.ready || self.session.is_none() {
             return false;
         }
+        // When a lazy player is installed with no open native stream, the next
+        // playback start opens the new OS default directly — skip teardown,
+        // rebuild, and banner churn.
+        if self.player.is_some()
+            && self.audio_unavailable.is_none()
+            && !self.state.playing
+            && self.drain_stop_at.is_none()
+        {
+            let stream_closed = match crate::audio::live_output_stream_open() {
+                Some(open) => !open,
+                None => self.state.current_index.is_none() || self.current_needs_load,
+            };
+            if stream_closed {
+                return false;
+            }
+        }
+        // Switching the OS default output is not a device failure: preserve the
+        // probe backoff ladder so bursts of switch events never wedge it at 10s.
+        let previous_backoff = self.audio_probe_backoff;
         // detach_player captures the clock before stopping the old pipeline.
         self.enter_audio_unavailable(
             "the default audio output changed; switching playback".to_owned(),
             PlayerFailure::Ordinary,
         );
+        self.audio_probe_backoff = previous_backoff;
         if let Some(unavailable) = self.audio_unavailable.as_mut() {
             unavailable.retry_at = Some(Instant::now());
         }
@@ -1637,6 +1666,7 @@ impl Engine {
         // the user or the next connection is concerned.
         self.audio_unavailable = None;
         self.audio_probe_backoff = AUDIO_PROBE_BACKOFF_MIN;
+        self.account_premium = true;
         self.shuffle_pool.clear();
         self.history.clear();
         self.state.error = None;
@@ -1660,6 +1690,16 @@ impl Engine {
     /// port is bound by the time this returns, so the UI may open the browser
     /// the moment the command answers. Nothing about that ordering is left to
     /// the spawned task — it is handed a listener that is already listening.
+    fn cancel_oauth_listener(&mut self) {
+        if let Some(cancel) = self.oauth_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
+    fn is_premium_account(&self) -> bool {
+        self.account_premium && self.session.as_ref().is_none_or(session_is_premium)
+    }
+
     pub fn login(
         &mut self,
         auth_sender: &mpsc::UnboundedSender<AuthSignal>,
@@ -1670,7 +1710,7 @@ impl Engine {
         if self.auth_running {
             return Ok(true);
         }
-        let (pending, listener) = self.begin_login_flow()?;
+        let (pending, listener, cancel) = self.begin_login_flow()?;
         let generation = self.generation;
         let auth_sender = auth_sender.clone();
         let cache = self.construction_cache();
@@ -1683,6 +1723,7 @@ impl Engine {
                 temporary_directory,
                 pending,
                 listener,
+                cancel,
                 normalisation,
                 audio,
             )
@@ -1706,12 +1747,17 @@ impl Engine {
     /// button — not left in `Authenticating` waiting on a callback that has
     /// nowhere to land. Failing here also preserves the prepared attempt and
     /// the published authorize URL, so the next click is a clean retry.
-    fn begin_login_flow(&mut self) -> Result<(PendingAuth, OauthListener), String> {
+    fn begin_login_flow(
+        &mut self,
+    ) -> Result<(PendingAuth, OauthListener, Arc<AtomicBool>), String> {
         let listener = bind_oauth_listener()?;
         let pending = match self.pending_auth.take() {
             Some(pending) => pending,
             None => prepare_oauth()?,
         };
+        self.cancel_oauth_listener();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.oauth_cancel = Some(Arc::clone(&cancel));
         self.shutdown_playback();
         self.auth_running = true;
         self.generation = self.generation.wrapping_add(1);
@@ -1721,7 +1767,7 @@ impl Engine {
         self.state.playing = false;
         self.state.error = None;
         self.state.auth_url = Some(pending.auth_url.clone());
-        Ok((pending, listener))
+        Ok((pending, listener, cancel))
     }
 
     /// Clears the cached credentials and tears the session down; the state
@@ -1729,8 +1775,10 @@ impl Engine {
     /// without a restart. Idempotent: safe when no session or credentials
     /// exist.
     pub fn logout(&mut self) -> Result<bool, String> {
-        // Invalidate any in-flight authentication attempt: its completion
-        // signal must not resurrect a session after an explicit logout.
+        // Signal any in-flight OAuth listener to release port 5588 immediately,
+        // and invalidate any in-flight authentication attempt so its completion
+        // signal cannot resurrect a session after an explicit logout.
+        self.cancel_oauth_listener();
         self.auth_running = false;
         self.generation = self.generation.wrapping_add(1);
         crate::browse::clear_canvas_cache();
@@ -1766,14 +1814,20 @@ impl Engine {
             AuthSignal::Complete { generation, result } => {
                 if generation != self.generation {
                     // The attempt this answer belongs to no longer exists: the
-                    // generation moved on while `connect_cached` was in flight.
-                    // Discarding the answer is right; discarding the
-                    // bookkeeping is not — see
-                    // [`Engine::abandon_cached_authentication`].
+                    // generation moved on while auth was in flight. Shut down
+                    // its session and retire any player off the Tokio worker
+                    // thread before updating bookkeeping.
+                    if let Ok(connected) = result {
+                        connected.session.shutdown();
+                        if let Ok(handles) = connected.playback {
+                            retire_player_off_thread(handles.player);
+                        }
+                    }
                     self.abandon_cached_authentication(generation);
                     return false;
                 }
                 self.auth_running = false;
+                self.oauth_cancel = None;
                 match result {
                     Ok(connected) => {
                         let had_queue = self.state.current_index.is_some();
@@ -1795,6 +1849,8 @@ impl Engine {
                         self.state.auth_state = AuthState::Ready;
                         self.state.auth_url = None;
                         self.pending_auth = None;
+                        self.account_premium =
+                            connected.is_premium && session_is_premium(&connected.session);
                         // The session is live in both arms below, and stays
                         // live: a machine with no output device can browse,
                         // search and edit playlists, and the player is the only
@@ -1830,6 +1886,9 @@ impl Engine {
                                             self.state.error = Some(error);
                                         }
                                     }
+                                }
+                                if !self.account_premium && self.state.error.is_none() {
+                                    self.state.error = Some(PREMIUM_REQUIRED_MESSAGE.to_owned());
                                 }
                                 self.forward_player_events(
                                     handles.events,
@@ -1889,6 +1948,9 @@ impl Engine {
                     self.audio_probe_generation = None;
                 }
                 if !self.player_rebuild_is_current(generation, normalisation) {
+                    if let Ok(handles) = result {
+                        retire_player_off_thread(handles.player);
+                    }
                     return false;
                 }
                 let handles = match result {
@@ -2660,26 +2722,35 @@ impl Engine {
             }
             PlayerSignal::Closed { generation } if self.player_generation == Some(generation) => {
                 if self.state.ready {
-                    self.state.ready = false;
-                    self.state.auth_state = AuthState::Error;
-                    self.state.playing = false;
                     self.finalize_listening(false);
-                    self.state.error = Some(
-                        "the local audio player stopped unexpectedly; request status to retry"
-                            .to_owned(),
-                    );
-                    self.play_request_id = None;
-                    self.loading_failed = false;
-                    self.last_track_change = None;
-                    self.recent_track_changes.clear();
-                    self.recent_unavailable.clear();
-                    self.player = None;
-                    self.player_generation = None;
-                    self.mixer = None;
-                    self.invalidate_audio_signals();
-                    if let Some(session) = self.session.take() {
-                        audio::set_listening_counter(self.audio_revision, None);
-                        session.shutdown();
+                    audio::set_listening_counter(self.audio_revision, None);
+                    self.state.playing = false;
+                    if self
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| !session.is_invalid())
+                    {
+                        // The Spotify session is still live; rebuild only the
+                        // local player automatically via the device probe.
+                        self.enter_audio_unavailable(
+                            "Playback stopped unexpectedly; restarting audio player.".to_owned(),
+                            PlayerFailure::Ordinary,
+                        );
+                    } else {
+                        self.detach_player();
+                        self.generation = self.generation.wrapping_add(1);
+                        self.recent_unavailable.clear();
+                        if let Some(session) = self.session.take() {
+                            session.shutdown();
+                        }
+                        self.state.ready = false;
+                        self.state.auth_state = AuthState::Authenticating;
+                        self.state.error = Some(
+                            "Playback stopped unexpectedly; reconnecting to Spotify.".to_owned(),
+                        );
+                        self.awaiting_transport_retry = true;
+                        self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
+                        self.next_reconnect = Some(Instant::now() + self.reconnect_backoff);
                     }
                     true
                 } else {
@@ -2844,6 +2915,7 @@ impl Engine {
         }
     }
     pub fn shutdown(&mut self) {
+        self.cancel_oauth_listener();
         self.auth_running = false;
         self.generation = self.generation.wrapping_add(1);
         self.shutdown_playback();
@@ -2853,7 +2925,7 @@ impl Engine {
         // different file with a different clock.
         self.flush_pending_volume();
         // Files that browses found on disk since the last cache event.
-        crate::cache_index::save_if_dirty();
+        crate::cache_index::save_if_dirty_sync();
         self.state.ready = false;
         self.state.playing = false;
     }
@@ -4294,9 +4366,21 @@ impl Engine {
 
     /// A missing key isn't evidence of a bad track or cache entry. Keep the
     /// row and the session, with a bounded retry only while the user wants play.
+    /// Non-Premium accounts fail fast with zero retries on key refusal.
     fn hold_current_for_key(&mut self, request: u64, track_id: SpotifyUri, failure: AudioKeyFailure) -> bool {
         self.end_failed_load();
         self.clear_error();
+        if failure == AudioKeyFailure::Refused && !self.is_premium_account() {
+            self.state.playing = false;
+            self.retry_current_at = None;
+            self.key_retries = 0;
+            self.key_hold = None;
+            self.state.error = Some(PREMIUM_REQUIRED_MESSAGE.to_owned());
+            eprintln!(
+                "transport: audio key track={track_id} request={request} reason={failure} outcome=premium_required",
+            );
+            return true;
+        }
         let attempt = self.key_retries + 1;
         let exhausted = self.key_retries >= KEY_RETRY_LIMIT;
         self.key_hold = Some(KeyHold { failure, exhausted });
@@ -4997,6 +5081,17 @@ impl Engine {
     }
 }
 
+/// Stops and drops a retired `Player` off the Tokio command loop so its
+/// synchronous thread join never stalls async workers.
+fn retire_player_off_thread(player: Arc<Player>) {
+    player.stop();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || drop(player));
+    } else {
+        std::thread::spawn(move || drop(player));
+    }
+}
+
 /// The first rows or order revision of a process.
 ///
 /// A revision is the shell's and the webview's only way to tell an omitted
@@ -5202,7 +5297,7 @@ mod tests {
         remap_current_index_after_move, sequential_automatic_index, track_change_wait, with_preview_edit,
     };
     use crate::audio::{self, OutputError};
-    use crate::auth::{PlaybackError, create_playback, percent_to_volume};
+    use crate::auth::{PREMIUM_REQUIRED_MESSAGE, PlaybackError, create_playback, percent_to_volume};
     use crate::customization::TrackEditStore;
     use crate::io::ProtocolWriter;
     use crate::spotify_listening::LoadId;
@@ -6137,6 +6232,7 @@ mod tests {
         ConnectedSession {
             session,
             playback: Ok(playback_handles(player)),
+            is_premium: true,
         }
     }
 
@@ -9187,6 +9283,87 @@ mod tests {
         assert_eq!(engine.playback_error(), Some("No reply to the audio key request. Press Play to retry."));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn free_account_fails_fast_on_refused_audio_key_without_retrying() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = five_track_state();
+        engine.state.playing = true;
+        engine.account_premium = false;
+
+        assert!(withhold_key(&mut engine, 77, AudioKeyFailure::Refused));
+        assert!(!engine.state.playing, "playback stops immediately for non-Premium accounts");
+        assert!(engine.retry_current_at.is_none(), "no retry timer is armed");
+        assert_eq!(engine.key_retries, 0, "retry ladder is not climbed");
+        assert_eq!(engine.playback_error(), Some(PREMIUM_REQUIRED_MESSAGE));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_auth_complete_shuts_down_session_and_retires_player() {
+        let (mut engine, _buffer) = test_engine();
+        let probe = SinkProbe::new();
+        let (player, session) = probe_player(&probe);
+        engine.generation = 5;
+        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(!engine.on_auth_signal(
+            AuthSignal::Complete {
+                generation: 4,
+                result: Ok(connected_handles(player, session.clone())),
+            },
+            player_sender,
+        ));
+        assert!(session.is_invalid(), "stale session must be shut down instead of leaked");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_lazy_sink_skips_default_output_switch_teardown_and_backoff_does_not_escalate() {
+        let device = TestAudioDevice::present();
+        let (mut engine, _) =
+            test_engine_with_audio(PathBuf::new(), device.opener(), device.presence());
+        let probe = SinkProbe::new();
+        let (player, session) = probe_player(&probe);
+        engine.state = playback_state(240_000);
+        engine.state.playing = false;
+        engine.current_needs_load = true;
+        engine.player = Some(player);
+        engine.session = Some(session);
+
+        assert!(
+            !engine.on_default_output_changed(),
+            "idle lazy sink must skip teardown and banner on OS default switch"
+        );
+        assert!(engine.player.is_some());
+        assert!(engine.state.error.is_none());
+
+        // Active playback switches without escalating the probe backoff ladder.
+        engine.state.playing = true;
+        engine.current_needs_load = false;
+        let initial_backoff = engine.audio_probe_backoff;
+        assert!(engine.on_default_output_changed());
+        assert_eq!(engine.audio_probe_backoff, initial_backoff);
+        assert!(engine.on_default_output_changed());
+        assert_eq!(engine.audio_probe_backoff, initial_backoff);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unexpected_player_close_rebuilds_player_when_session_is_alive() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.player_generation = Some(0);
+        let session = engine.session.clone().expect("live session");
+
+        assert!(engine.on_player_signal(PlayerSignal::Closed { generation: 0 }));
+        assert!(!engine.state.playing);
+        assert!(engine.state.ready, "session remains ready for browsing");
+        assert!(!session.is_invalid(), "live session is kept for player rebuild");
+        assert!(engine.audio_unavailable.is_some(), "device probe is armed to rebuild player");
+        assert_eq!(
+            engine.state.error.as_deref(),
+            Some("Playback stopped unexpectedly; restarting audio player.")
+        );
+    }
+
     /// A withheld key says nothing about the track or its cached audio, so it
     /// neither counts toward the failure breaker nor touches the cache, however
     /// long Spotify keeps it up. An unavailable track still does both.
@@ -10990,7 +11167,7 @@ mod tests {
             .auth_url
             .clone()
             .expect("needs_login publishes a url");
-        let (pending, _listener) = engine.begin_login_flow().expect("flow begins");
+        let (pending, _listener, _cancel) = engine.begin_login_flow().expect("flow begins");
         assert_eq!(
             pending.auth_url, published,
             "the flow must use the published URL"
@@ -11006,7 +11183,7 @@ mod tests {
         let _serialized = crate::auth::lock_oauth_port();
         let mut engine = test_engine().0;
         engine.state.auth_state = spotifine_common::protocol::AuthState::NeedsLogin;
-        let (pending, _listener) = engine.begin_login_flow().expect("flow begins");
+        let (pending, _listener, _cancel) = engine.begin_login_flow().expect("flow begins");
         assert!(
             pending
                 .auth_url
@@ -11030,7 +11207,7 @@ mod tests {
         let mut engine = test_engine().0;
         engine.enter_needs_login();
 
-        let (_pending, listener) = engine.begin_login_flow().expect("flow begins");
+        let (_pending, listener, cancel) = engine.begin_login_flow().expect("flow begins");
 
         assert_eq!(listener.address().to_string(), "127.0.0.1:5588");
         assert!(
@@ -11039,6 +11216,9 @@ mod tests {
         );
         std::net::TcpStream::connect("127.0.0.1:5588")
             .expect("a redirect arriving now would be accepted, not refused");
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(engine.logout().expect("logout succeeds"));
+        assert!(cancel.load(Ordering::Acquire), "logout must signal the OAuth listener to exit");
     }
 
     /// A port this application cannot have is a dead end, because the redirect
@@ -11234,7 +11414,7 @@ mod tests {
         // The click's own bookkeeping. `login` adds only the spawn of the flow,
         // which a test must not start: it waits on the loopback callback for
         // twenty minutes.
-        let (_pending, _listener) = engine.begin_login_flow().expect("the flow starts");
+        let (_pending, _listener, _cancel) = engine.begin_login_flow().expect("the flow starts");
         assert!(engine.auth_running, "the flow owns the flag now");
         let flow_generation = engine.auth_generation;
         assert_ne!(flow_generation, attempt, "and answers under a newer one");
@@ -11414,6 +11594,7 @@ mod tests {
                 result: Ok(ConnectedSession {
                     session: session.clone(),
                     playback: Err(message),
+                    is_premium: true,
                 }),
             },
             player_sender,

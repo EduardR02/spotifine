@@ -17,6 +17,10 @@
 
   const nodes = $derived(parseBiography(source));
   let expanded = $state(false);
+  $effect.pre(() => {
+    source;
+    expanded = false;
+  });
   /* Whether there is anything to expand. Measured on the collapsed element —
      a clamp that has nothing to hide must not offer a "Read more" that does
      nothing when pressed, and the only honest test is the rendered height. */

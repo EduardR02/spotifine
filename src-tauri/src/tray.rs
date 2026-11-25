@@ -7,7 +7,7 @@ use tauri::{
     AppHandle, Manager,
 };
 
-use crate::{app::{update_app_settings, AppSettings}, log, media_keys, playback_router::Action, restore_main_window};
+use crate::{app::{update_app_settings_async, AppSettings}, log, media_keys, playback_router::Action, restore_main_window};
 
 const ID: &str = "main-tray";
 const OPEN: &str = "tray-open";
@@ -100,27 +100,59 @@ pub fn minimized(app: &AppHandle) {
     }
 }
 
-// Run on the UI thread as one operation: both a concurrent minimize and a
-// second setting change must see a usable icon or a reachable taskbar window.
-pub fn set_enabled(app: &AppHandle, enabled: bool) -> Result<AppSettings, String> {
-    let had_icon = app.tray_by_id(ID).is_some();
-    if enabled && !had_icon {
-        install(app).map_err(|error| format!("Could not create the notification area icon: {error}"))?;
-    } else if !enabled && had_icon {
-        if let Some(window) = app.get_webview_window("main") {
-            if !window.is_visible().map_err(|e| e.to_string())? {
-                window.show().map_err(|e| e.to_string())?;
+static TOGGLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// Serializes concurrent toggles while keeping UI-thread icon/window operations
+// separate from blocking disk persistence (`sync_all`). Both a concurrent
+// minimize and a second toggle always see a usable icon or reachable window.
+pub async fn set_enabled(app: &AppHandle, enabled: bool) -> Result<AppSettings, String> {
+    let _toggle = TOGGLE_LOCK.lock().await;
+    let had_icon = {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = app.clone();
+        app.run_on_main_thread(move || {
+            let result = (|| -> Result<bool, String> {
+                let had_icon = handle.tray_by_id(ID).is_some();
+                if enabled && !had_icon {
+                    install(&handle)
+                        .map_err(|error| format!("Could not create the notification area icon: {error}"))?;
+                } else if !enabled && had_icon {
+                    if let Some(window) = handle.get_webview_window("main") {
+                        if !window.is_visible().map_err(|e| e.to_string())? {
+                            window.show().map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+                Ok(had_icon)
+            })();
+            let _ = tx.send(result);
+        })
+        .map_err(|error| error.to_string())?;
+        rx.await.map_err(|error| error.to_string())??
+    };
+
+    let persisted = update_app_settings_async(move |settings| settings.minimize_to_tray = enabled).await;
+
+    let succeeded = persisted.is_ok();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = app.clone();
+    if app
+        .run_on_main_thread(move || {
+            if !succeeded {
+                if enabled && !had_icon {
+                    handle.remove_tray_by_id(ID);
+                }
+            } else if enabled {
+                hide_if_minimized(&handle);
+            } else if had_icon {
+                handle.remove_tray_by_id(ID);
             }
-        }
+            let _ = tx.send(());
+        })
+        .is_ok()
+    {
+        let _ = rx.await;
     }
-    let settings = update_app_settings(|settings| settings.minimize_to_tray = enabled)
-        .inspect_err(|_| {
-            if enabled && !had_icon { app.remove_tray_by_id(ID); }
-        })?;
-    if enabled {
-        hide_if_minimized(app);
-    } else if had_icon {
-        app.remove_tray_by_id(ID);
-    }
-    Ok(settings)
+
+    persisted
 }

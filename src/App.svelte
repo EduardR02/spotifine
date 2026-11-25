@@ -565,7 +565,7 @@
         </div>
       {/if}
 
-      {#if isLoggedOut()}
+      {#if isLoggedOut() && route.name !== "settings"}
         <LoginView />
       {:else if route.name === "library"}
         <LibraryView />
@@ -656,9 +656,12 @@
     font-size: var(--t-12);
   }
   .error-text {
-    min-width: 0; /* a long engine error must ellipsis, not widen the pane */
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    min-width: 0;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+    user-select: text;
+  }
+  .error-banner .btn-round {
+    flex-shrink: 0;
   }
 </style>

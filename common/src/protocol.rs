@@ -61,7 +61,7 @@ pub struct TrackWaveform {
     pub peaks_base64: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct TrackRef {
     pub id: String,
@@ -1032,7 +1032,7 @@ pub struct RadioBrowse {
 /// Optional recommendations displayed below a playlist. This payload is
 /// intentionally separate from [`PlaylistBrowse`] so opening a playlist has
 /// zero radio-Apollo cost.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PlaylistRecommendations {
     pub playlist_id: String,
@@ -1106,7 +1106,7 @@ pub struct ArtistReleases {
     pub appears_on: Vec<AlbumRef>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ArtistReleaseCounts {
     pub albums: usize,
@@ -1136,7 +1136,7 @@ pub struct ArtistCataloguePage {
 /// One city in an artist's listener ranking. Every field comes from the
 /// artist-overview document; absent listener counts are omitted rather than
 /// represented as zero.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ArtistTopCity {
     pub city: String,
@@ -1252,7 +1252,7 @@ pub struct ArtistBrowse {
     pub overview: Option<ArtistOverview>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct LikedSongsPage {
     pub tracks: Vec<TrackRef>,
@@ -1278,7 +1278,7 @@ pub struct LikedUrisPage {
 /// finished in `url`; the songwriter id namespace is not the artist one.
 /// `subroles` are the service's own labels (`"composer"`, `"lyricist"`,
 /// `"producer"`, `"main artist"`, ...) and may be empty.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CreditArtist {
     pub id: String,
@@ -1339,7 +1339,7 @@ pub struct ShowRef {
     pub cover_url: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct EpisodeRef {
     /// Playback identity, title, artwork and availability live only in `track`.

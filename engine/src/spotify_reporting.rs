@@ -190,7 +190,8 @@ impl SpotifyReporter {
             self.check_account()?;
             self.sequence = self.sequence.checked_add(1)
                 .ok_or("Spotify listening sequence exhausted")?;
-            let stream = stream_message(report, &audio_id, &self.app_session_id)?;
+            let is_premium = crate::auth::session_is_premium(&self.session);
+            let stream = stream_message(report, &audio_id, &self.app_session_id, is_premium)?;
             let payload = event_request(
                 &self.session, &stream, &self.app_session_id, &self.sequence_id,
                 self.sequence, report.ended_at, self.clock.elapsed(),
@@ -328,7 +329,12 @@ fn wire(encode: impl FnOnce(&mut CodedOutputStream<'_>) -> protobuf::Result<()>)
     Ok(bytes)
 }
 
-fn stream_message(report: &PlaybackReport, audio_id: &[u8], app_session_id: &[u8; 16]) -> Result<Vec<u8>, String> {
+fn stream_message(
+    report: &PlaybackReport,
+    audio_id: &[u8],
+    app_session_id: &[u8; 16],
+    is_premium: bool,
+) -> Result<Vec<u8>, String> {
     let start = timestamp(report.started_at)?;
     let end = timestamp(report.ended_at)?;
     let played = milliseconds(report.played)?;
@@ -377,8 +383,7 @@ fn stream_message(report: &PlaybackReport, audio_id: &[u8], app_session_id: &[u8
         out.write_int64(37, REPORTING_CORE_VERSION)?;
         // Receiver compatibility labels; source_start/end still identify us.
         out.write_string(38, "full")?;
-        // This is an assumption flag: this standalone renderer requires Premium.
-        out.write_bool(39, true)?;
+        out.write_bool(39, is_premium)?;
         out.write_int32(40, 0)?;
         out.write_bool(42, false)?;
         out.write_bool(43, false)?;

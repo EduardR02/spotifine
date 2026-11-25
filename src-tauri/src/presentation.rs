@@ -342,7 +342,7 @@ pub(crate) mod tests {
     /// library (`browse_followed_artists`, `browse_saved_shows`) or refuse the
     /// account's own profile (`browse_profile`).
     const ANSWERED: &[&str] = &[
-        "check_for_update", "play", "set_window_visible", "pause", "next", "previous", "seek",
+        "check_for_update", "relaunch_app", "play", "set_window_visible", "pause", "next", "previous", "seek",
         "set_volume", "set_shuffle", "set_repeat", "set_playback_speed", "play_queue",
         "play_playlist_row",
         "preview_track_edit", "restore_preview", "play_queue_index", "add_queue", "add_queue_batch",

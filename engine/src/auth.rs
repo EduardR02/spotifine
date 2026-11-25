@@ -105,6 +105,32 @@ pub struct PlaybackHandles {
 /// no output device has a session that browses, searches and edits playlists
 /// exactly as well as one with a device; the player is all that is missing, and
 /// nothing about the account or the network is in question.
+pub const PREMIUM_REQUIRED_MESSAGE: &str = "Spotify Premium is required for playback.";
+
+/// Classifies whether an account's `type` / `catalogue` user attributes show
+/// a Spotify Premium subscription. When neither attribute is present (for
+/// example, before AP product info arrives or on an offline test session),
+/// this defaults to `true` so Premium accounts are never falsely rejected.
+pub fn account_is_premium(account_type: Option<&str>, catalogue: Option<&str>) -> bool {
+    let account_type = account_type.map(str::trim).filter(|value| !value.is_empty());
+    let catalogue = catalogue.map(str::trim).filter(|value| !value.is_empty());
+    match (account_type, catalogue) {
+        (None, None) => true,
+        (t, c) => {
+            t.is_some_and(|value| value.eq_ignore_ascii_case("premium"))
+                || c.is_some_and(|value| value.eq_ignore_ascii_case("premium"))
+        }
+    }
+}
+
+/// Whether the connected Spotify session carries Premium playback entitlement.
+pub fn session_is_premium(session: &Session) -> bool {
+    account_is_premium(
+        session.get_user_attribute("type").as_deref(),
+        session.get_user_attribute("catalogue").as_deref(),
+    )
+}
+
 pub struct ConnectedSession {
     pub session: Session,
     /// `Ok` is a player. `Err` is a machine with no output device to open —
@@ -113,6 +139,9 @@ pub struct ConnectedSession {
     /// Every other playback failure arrives as an [`AuthFailure`] instead,
     /// with the session shut down.
     pub playback: Result<PlaybackHandles, String>,
+    /// Whether Spotify's session attributes reported a Premium subscription at
+    /// connect time (see [`session_is_premium`]).
+    pub is_premium: bool,
 }
 
 /// Why player construction did not produce a player.
@@ -225,6 +254,7 @@ fn device_step_failure(
 pub struct PendingAuth {
     client: BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>,
     verifier: PkceCodeVerifier,
+    csrf: CsrfToken,
     pub auth_url: String,
 }
 
@@ -238,7 +268,7 @@ pub fn prepare_oauth() -> Result<PendingAuth, String> {
         .iter()
         .map(|scope| Scope::new((*scope).to_owned()))
         .collect();
-    let (auth_url, _csrf) = client
+    let (auth_url, csrf) = client
         .authorize_url(CsrfToken::new_random)
         .add_scopes(request_scopes)
         .set_pkce_challenge(pkce_challenge)
@@ -246,6 +276,7 @@ pub fn prepare_oauth() -> Result<PendingAuth, String> {
     Ok(PendingAuth {
         client,
         verifier: pkce_verifier,
+        csrf,
         auth_url: auth_url.to_string(),
     })
 }
@@ -318,30 +349,39 @@ pub async fn connect_cached(
     session_config.tmp_dir = temporary_directory;
     let session = Session::new(session_config, Some(cache.clone()));
     match session.connect(credentials, false).await {
-        Ok(()) => match create_playback_latest(session.clone(), cache, normalisation, audio).await {
-            Ok(playback) => Ok(ConnectedSession {
-                session,
-                playback: Ok(playback),
-            }),
-            // The device is the machine's problem, not the account's: the
-            // session is left running and the engine retries the device. A
-            // device whose open hung is the same answer with a different retry
-            // clock, which the engine derives from the probe's own typed
-            // result.
-            Err(error @ (PlaybackError::NoOutputDevice(_) | PlaybackError::DeviceOpenBlocked(_))) => {
-                Ok(ConnectedSession {
+        Ok(()) => {
+            let playback = create_playback_latest(session.clone(), cache, normalisation, audio).await;
+            let is_premium = session_is_premium(&session);
+            if !is_premium {
+                eprintln!("auth: connected Spotify account is not Premium; playback requires Spotify Premium");
+            }
+            match playback {
+                Ok(playback) => Ok(ConnectedSession {
                     session,
-                    playback: Err(error.message().to_owned()),
-                })
+                    playback: Ok(playback),
+                    is_premium,
+                }),
+                // The device is the machine's problem, not the account's: the
+                // session is left running and the engine retries the device. A
+                // device whose open hung is the same answer with a different retry
+                // clock, which the engine derives from the probe's own typed
+                // result.
+                Err(error @ (PlaybackError::NoOutputDevice(_) | PlaybackError::DeviceOpenBlocked(_))) => {
+                    Ok(ConnectedSession {
+                        session,
+                        playback: Err(error.message().to_owned()),
+                        is_premium,
+                    })
+                }
+                // Unchanged from when playback construction was one string: a
+                // player that cannot be built at all is reported as a login
+                // problem, session torn down, exactly as a refusal is.
+                Err(PlaybackError::Fatal(message)) => {
+                    session.shutdown();
+                    Err(AuthFailure::Rejected(message))
+                }
             }
-            // Unchanged from when playback construction was one string: a
-            // player that cannot be built at all is reported as a login
-            // problem, session torn down, exactly as a refusal is.
-            Err(PlaybackError::Fatal(message)) => {
-                session.shutdown();
-                Err(AuthFailure::Rejected(message))
-            }
-        },
+        }
         Err(error) => {
             let failure = classify_connect_error(&error);
             eprintln!("{failure}");
@@ -409,13 +449,15 @@ pub async fn complete_oauth(
     temporary_directory: PathBuf,
     pending: PendingAuth,
     listener: OauthListener,
+    cancel: Arc<AtomicBool>,
     normalisation: Arc<AtomicBool>,
     audio: SinkOpener,
 ) -> Result<ConnectedSession, String> {
     eprintln!("Browse to: {}", pending.auth_url);
-    let access_token = tokio::task::spawn_blocking(move || run_oauth_flow(pending, listener))
-        .await
-        .map_err(|error| format!("Spotify OAuth worker failed: {error}"))??;
+    let access_token =
+        tokio::task::spawn_blocking(move || run_oauth_flow(pending, listener, cancel))
+            .await
+            .map_err(|error| format!("Spotify OAuth worker failed: {error}"))??;
 
     let mut session_config = SessionConfig::default();
     session_config.tmp_dir = temporary_directory;
@@ -427,10 +469,16 @@ pub async fn complete_oauth(
         session.shutdown();
         return Err(format!("Spotify authentication failed: {error}"));
     }
-    match create_playback_latest(session.clone(), cache, normalisation, audio).await {
+    let playback = create_playback_latest(session.clone(), cache, normalisation, audio).await;
+    let is_premium = session_is_premium(&session);
+    if !is_premium {
+        eprintln!("auth: connected Spotify account is not Premium; playback requires Spotify Premium");
+    }
+    match playback {
         Ok(playback) => Ok(ConnectedSession {
             session,
             playback: Ok(playback),
+            is_premium,
         }),
         // Signing in on a machine with no output device used to fail the whole
         // flow, which is a strange thing to tell someone whose password was
@@ -441,6 +489,7 @@ pub async fn complete_oauth(
             Ok(ConnectedSession {
                 session,
                 playback: Err(error.message().to_owned()),
+                is_premium,
             })
         }
         Err(PlaybackError::Fatal(message)) => {
@@ -453,8 +502,15 @@ pub async fn complete_oauth(
 /// Blocking OAuth half of [`complete_oauth`]: loopback listener + token
 /// exchange. Runs on the blocking pool so the async engine loop is never
 /// stalled by the callback wait.
-fn run_oauth_flow(pending: PendingAuth, listener: OauthListener) -> Result<String, String> {
-    let code = wait_for_oauth_code(listener)?;
+fn run_oauth_flow(
+    pending: PendingAuth,
+    listener: OauthListener,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    let code = wait_for_oauth_code(listener, &pending.csrf, &cancel)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err("Spotify sign-in was cancelled".to_owned());
+    }
     let http_client = reqwest::blocking::Client::new();
     let response = pending
         .client
@@ -517,9 +573,15 @@ fn oauth_failed_response() -> String {
 /// who presses Cancel at Spotify is redirected here with `?error=access_denied`
 /// and deserves a page rather than a tab that hangs until the browser gives up
 /// on a connection nobody ever wrote to.
-fn wait_for_oauth_code(listener: OauthListener) -> Result<AuthorizationCode, String> {
+fn wait_for_oauth_code(
+    listener: OauthListener,
+    expected_state: &CsrfToken,
+    cancel: &AtomicBool,
+) -> Result<AuthorizationCode, String> {
     wait_for_oauth_code_within(
         listener,
+        expected_state,
+        cancel,
         OAUTH_LISTENER_TIMEOUT,
         OAUTH_CALLBACK_READ_TIMEOUT,
     )
@@ -542,11 +604,16 @@ fn wait_for_oauth_code(listener: OauthListener) -> Result<AuthorizationCode, Str
 /// deadline below, which only ever bounded `accept`.
 fn wait_for_oauth_code_within(
     listener: OauthListener,
+    expected_state: &CsrfToken,
+    cancel: &AtomicBool,
     total: Duration,
     read_timeout: Duration,
 ) -> Result<AuthorizationCode, String> {
     let deadline = Instant::now() + total;
     loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("Spotify sign-in was cancelled".to_owned());
+        }
         if Instant::now() >= deadline {
             return Err("Spotify login timed out; click Log in to start again".to_owned());
         }
@@ -562,10 +629,13 @@ fn wait_for_oauth_code_within(
                         | io::ErrorKind::TimedOut
                 ) =>
             {
+                if cancel.load(Ordering::Acquire) {
+                    return Err("Spotify sign-in was cancelled".to_owned());
+                }
                 if Instant::now() >= deadline {
                     return Err("Spotify login timed out; click Log in to start again".to_owned());
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
             Err(error) => return Err(format!("Spotify OAuth callback failed: {error}")),
@@ -595,6 +665,10 @@ fn wait_for_oauth_code_within(
             Ok(_) => {}
         }
 
+        if cancel.load(Ordering::Acquire) {
+            return Err("Spotify sign-in was cancelled".to_owned());
+        }
+
         let Some(path) = request_line.split_whitespace().nth(1) else {
             continue;
         };
@@ -605,7 +679,7 @@ fn wait_for_oauth_code_within(
             // those would end an attempt that has not happened yet.
             continue;
         }
-        let outcome = extract_oauth_code(path);
+        let outcome = extract_oauth_code(path, expected_state.secret());
 
         let response = if outcome.is_ok() {
             oauth_success_response()
@@ -635,13 +709,27 @@ fn wait_for_oauth_code_within(
 /// Reads the authorization code out of the redirect path, or says what came
 /// instead. A cancelled sign-in arrives as `?error=access_denied`; naming it
 /// keeps the engine's `NeedsLogin` message honest about whose decision ended
-/// the attempt.
-fn extract_oauth_code(request_path: &str) -> Result<AuthorizationCode, String> {
+/// the attempt. Validates the callback's `state` parameter against the CSRF
+/// token issued for this sign-in attempt.
+fn extract_oauth_code(
+    request_path: &str,
+    expected_state: &str,
+) -> Result<AuthorizationCode, String> {
     let redirect = format!("http://127.0.0.1{request_path}");
     let url = Url::parse(&redirect)
         .map_err(|error| format!("malformed Spotify OAuth callback: {error}"))?;
-    if let Some(code) = url.query_pairs().find(|(key, _)| key == "code") {
-        return Ok(AuthorizationCode::new(code.1.into_owned()));
+    if let Some((_, code)) = url.query_pairs().find(|(key, _)| key == "code") {
+        let state = url
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value);
+        if state.as_deref() != Some(expected_state) {
+            return Err(
+                "Spotify OAuth callback state did not match this sign-in attempt; click Log in to start again"
+                    .to_owned(),
+            );
+        }
+        return Ok(AuthorizationCode::new(code.into_owned()));
     }
     match url.query_pairs().find(|(key, _)| key == "error") {
         Some((_, reason)) if reason == "access_denied" => {
@@ -872,7 +960,7 @@ pub fn stored_volume_percent(cache: &Cache) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OAUTH_REDIRECT_URI, PlaybackError,
+        CsrfToken, OAUTH_REDIRECT_URI, PlaybackError, account_is_premium,
         bind_oauth_listener, device_step_failure, extract_oauth_code, lock_oauth_port,
         oauth_callback_path, oauth_failed_response, oauth_listener_addr,
         oauth_success_response, player_config, prepare_oauth, std_mpsc, wait_for_oauth_code_within,
@@ -880,6 +968,8 @@ mod tests {
     use crate::audio::OutputError;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     #[test]
@@ -954,24 +1044,44 @@ mod tests {
 
     #[test]
     fn oauth_callback_code_extracts_from_the_redirect_path() {
-        let code = extract_oauth_code("/login?code=abc123&state=xyz").expect("code present");
+        let code = extract_oauth_code("/login?code=abc123&state=xyz", "xyz").expect("code present");
         assert_eq!(code.secret(), "abc123");
 
+        // Missing or mismatched CSRF state must be rejected.
+        let wrong_state = extract_oauth_code("/login?code=abc123&state=other", "xyz")
+            .expect_err("mismatched CSRF state must be rejected");
+        assert!(wrong_state.contains("state"), "unexpected state error: {wrong_state}");
+        extract_oauth_code("/login?code=abc123", "xyz")
+            .expect_err("missing CSRF state must be rejected");
+
         // A denied callback is a completed failure, not a silence.
-        extract_oauth_code("/login?error=access_denied&state=xyz")
+        extract_oauth_code("/login?error=access_denied&state=xyz", "xyz")
             .expect_err("a denied callback carries no code");
         let refused =
-            extract_oauth_code("/login?error=server_error").expect_err("an error is not a code");
+            extract_oauth_code("/login?error=server_error", "xyz").expect_err("an error is not a code");
         assert!(
             refused.contains("server_error"),
             "unexpected refusal message: {refused}"
         );
 
-        assert!(extract_oauth_code("/login").is_err());
+        assert!(extract_oauth_code("/login", "xyz").is_err());
         assert!(
-            extract_oauth_code("not a path").is_err(),
+            extract_oauth_code("not a path", "xyz").is_err(),
             "a malformed request line must not parse as a callback"
         );
+    }
+
+    #[test]
+    fn account_is_premium_identifies_free_accounts_without_rejecting_unknown_sessions() {
+        assert!(account_is_premium(None, None));
+        assert!(account_is_premium(Some("premium"), Some("premium")));
+        assert!(account_is_premium(Some("PREMIUM"), None));
+        assert!(account_is_premium(None, Some("premium")));
+        assert!(account_is_premium(Some("family"), Some("premium")));
+        assert!(!account_is_premium(Some("free"), Some("free")));
+        assert!(!account_is_premium(Some("open"), Some("shuffle")));
+        assert!(!account_is_premium(Some("free"), None));
+        assert!(!account_is_premium(None, Some("ad-supported")));
     }
 
     /// The port is fixed by the registered redirect URI, so a taken one is a
@@ -1016,11 +1126,16 @@ mod tests {
     fn a_connection_that_is_not_the_callback_does_not_end_the_sign_in() {
         let _serialized = lock_oauth_port();
         let listener = bind_oauth_listener().expect("the callback port is free");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flow_cancel = Arc::clone(&cancel);
         let flow = std::thread::spawn(move || {
             // Short clocks, same behaviour: the redirect still has to be found
             // behind two connections that are not it.
+            let expected = CsrfToken::new("xyz".to_owned());
             wait_for_oauth_code_within(
                 listener,
+                &expected,
+                &flow_cancel,
                 Duration::from_secs(10),
                 Duration::from_millis(150),
             )
@@ -1051,6 +1166,31 @@ mod tests {
             "the tab must be answered with the success page: {response}"
         );
         drop(silent);
+    }
+
+    #[test]
+    fn cancelling_the_oauth_listener_releases_the_callback_port_promptly() {
+        let _serialized = lock_oauth_port();
+        let listener = bind_oauth_listener().expect("the callback port is free");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flow_cancel = Arc::clone(&cancel);
+        let flow = std::thread::spawn(move || {
+            let expected = CsrfToken::new("xyz".to_owned());
+            wait_for_oauth_code_within(
+                listener,
+                &expected,
+                &flow_cancel,
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+            )
+        });
+        cancel.store(true, Ordering::Release);
+        let error = flow
+            .join()
+            .expect("cancelled listener thread exits promptly")
+            .expect_err("cancelled login returns an error");
+        assert!(error.contains("cancelled"), "unexpected error: {error}");
+        bind_oauth_listener().expect("port 5588 is immediately re-bindable after cancel");
     }
 
     #[test]

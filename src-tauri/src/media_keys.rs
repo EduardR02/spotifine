@@ -52,7 +52,14 @@ impl Transport {
         Self {
             playing: state.playing,
             position_ms: state.position_ms,
-            rate: if cfg!(windows) && state.buffering { 0.0 } else { state.audible_playback_speed },
+            rate: if cfg!(windows) {
+                if state.buffering { 0.0 } else { state.audible_playback_speed }
+            } else {
+                // Non-Windows souvlaki always advances a playing timeline at 1.0x;
+                // matching the OS clock rate ensures drift at non-1.0x speeds is
+                // corrected instead of suppressed.
+                1.0
+            },
         }
     }
 }

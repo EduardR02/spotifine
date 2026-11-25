@@ -8,7 +8,7 @@
 //! The router keeps an occurrence cursor, never a second durable queue.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,9 @@ use crate::types::{PlaybackEvent, PlaybackState, Track};
 
 /// Spotify starts at most 100 `uris` from one play request.
 const WINDOW: usize = 100;
+/// Cap sequential `POST /me/player/queue` calls on a foreign queue so a huge
+/// batch cannot hammer Spotify's rate limits.
+const MAX_SPOTIFY_QUEUE_BATCH: usize = 50;
 /// A track change extends the window once fewer entries than this remain.
 const LOW_WATER: usize = 10;
 /// Spotify can keep reporting the previous item for a few seconds after a
@@ -445,6 +448,10 @@ impl PlaybackRouter {
 
     pub fn is_remote(&self) -> bool { self.core.remote.lock().is_some() }
 
+    /// Monotonic counter bumped on remote session transitions and publishes so
+    /// the local state consumer never omits `queue`/`upcoming` after handback.
+    pub fn remote_generation(&self) -> u64 { self.core.remote_generation.load(Ordering::Relaxed) }
+
     /// Turning devices off first brings playback on a device back here,
     /// paused, through the one hand-back path; the grant is left alone.
     pub async fn set_devices_enabled(&self, app: &AppHandle, enabled: bool) {
@@ -513,6 +520,9 @@ struct Core {
     visible: AtomicBool,
     /// Whether Spotify devices are on at all.
     enabled: AtomicBool,
+    /// Bumped whenever remote output publishes or transitions so the local
+    /// consumer resets its delta cache on remote->local handback.
+    remote_generation: AtomicU64,
 }
 
 impl Default for Core {
@@ -520,6 +530,7 @@ impl Default for Core {
         Self {
             operation: AsyncMutex::new(()), remote: Mutex::new(None), changed: Notify::new(),
             visible: AtomicBool::new(true), enabled: AtomicBool::new(true),
+            remote_generation: AtomicU64::new(0),
         }
     }
 }
@@ -555,6 +566,7 @@ impl Core {
         remote.rebase();
         let include_queue = remote.published_queue != Some(remote.state.queue_revision);
         let include_order = remote.published_order != Some(remote.state.order_revision);
+        self.remote_generation.fetch_add(1, Ordering::Relaxed);
         host.emit("state", PlaybackEvent::new(&remote.state, include_queue, include_order));
         remote.published_queue = Some(remote.state.queue_revision);
         remote.published_order = Some(remote.state.order_revision);
@@ -817,6 +829,7 @@ impl Core {
         let needs_pause = kind != Kind::Prepared || self.remote.lock().as_ref().is_some_and(|remote| remote.pause_dirty || remote.start_intent.is_some());
         let stopped = if needs_pause { self.command(host, Method::PUT, "pause", &[], None).await } else { Ok(()) };
         let Some(remote) = self.remote.lock().take() else { return Ok(()); };
+        self.remote_generation.fetch_add(1, Ordering::Relaxed);
         self.changed.notify_one();
         // Resume here where the device was only if it played the engine's
         // order. Anything the phone started leaves the local queue alone.
@@ -863,9 +876,28 @@ impl Core {
     }
 
     async fn run<H: Host>(&self, host: &H, action: Action) -> Result<(), String> {
-        let _operation = self.operation.lock().await;
+        let operation = self.operation.lock().await;
         self.prepare_operation(host).await?;
         let kind = self.remote.lock().as_ref().map(Remote::kind);
+        if kind == Some(Kind::Foreign) {
+            match &action {
+                Action::Add(track, _) => {
+                    let result = self.queue_on_spotify_unlocked(host, operation, std::slice::from_ref(track)).await;
+                    let _operation = self.operation.lock().await;
+                    let current_kind = self.remote.lock().as_ref().map(Remote::kind);
+                    self.finish_operation(host, current_kind, &result);
+                    return result;
+                }
+                Action::AddBatch(tracks, _) => {
+                    let result = self.queue_on_spotify_unlocked(host, operation, tracks).await;
+                    let _operation = self.operation.lock().await;
+                    let current_kind = self.remote.lock().as_ref().map(Remote::kind);
+                    self.finish_operation(host, current_kind, &result);
+                    return result;
+                }
+                _ => {}
+            }
+        }
         let result = match kind {
             None => host.local(action).await,
             Some(kind) => self.run_remote(host, kind, action).await,
@@ -954,8 +986,7 @@ impl Core {
             Action::Queue(queue, index, context, automatic, paused) => self.play_queue(host, queue, index, context, automatic, paused).await,
             Action::Index(index) if foreign => self.play_foreign_row(host, index).await,
             Action::Index(index) => self.jump(host, index).await,
-            Action::Add(track, _) if foreign => self.queue_on_spotify(host, std::slice::from_ref(&track)).await,
-            Action::AddBatch(tracks, _) if foreign => self.queue_on_spotify(host, &tracks).await,
+            Action::Add(_, _) | Action::AddBatch(_, _) if foreign => unreachable!("foreign queue additions run unlocked in Core::run"),
             Action::Add(track, context) => self.edit(host, kind, EngineOp::Add(&track, &context)).await,
             Action::AddBatch(tracks, _) if tracks.is_empty() => Ok(()),
             Action::AddBatch(tracks, context) => self.edit(host, kind, EngineOp::AddBatch(&tracks, &context)).await,
@@ -1546,13 +1577,57 @@ impl Core {
     }
 
     /// Spotify plays its own queue before the rest of whatever it plays.
-    async fn queue_on_spotify<H: Host>(&self, host: &H, tracks: &[Track]) -> Result<(), String> {
-        for track in tracks { validate_remote_track(track)?; }
+    /// Releases `self.operation` across the sequential HTTP loop so transport
+    /// commands and returning to This computer are never blocked behind a batch.
+    async fn queue_on_spotify_unlocked<H: Host>(
+        &self,
+        host: &H,
+        operation: tokio::sync::MutexGuard<'_, ()>,
+        tracks: &[Track],
+    ) -> Result<(), String> {
+        if tracks.is_empty() {
+            return Ok(());
+        }
+        if tracks.len() > MAX_SPOTIFY_QUEUE_BATCH {
+            return Err(format!(
+                "At most {MAX_SPOTIFY_QUEUE_BATCH} tracks can be queued at once on a Spotify device playing its own queue"
+            ));
+        }
         for track in tracks {
-            self.command(host, Method::POST, "queue", &[("uri", track.uri.clone())], None).await?;
+            validate_remote_track(track)?;
+        }
+        let (device_id, paths) = {
+            let guard = self.remote.lock();
+            let remote = guard.as_ref().ok_or(RELEASED)?;
+            let device_id = remote.state.output_device_id.clone();
+            let paths = tracks
+                .iter()
+                .map(|track| remote.device_path("queue", &[("uri", track.uri.clone())]))
+                .collect::<Result<Vec<_>, _>>()?;
+            (device_id, paths)
+        };
+        drop(operation);
+        for path in paths {
+            let same_foreign = self.remote.lock().as_ref().is_some_and(|remote| {
+                remote.kind() == Kind::Foreign && remote.state.output_device_id == device_id
+            });
+            if !same_foreign {
+                return Err(RELEASED.into());
+            }
+            host.spotify(Method::POST, path, None).await?;
+        }
+        let _operation = self.operation.lock().await;
+        let same_foreign = self.remote.lock().as_ref().is_some_and(|remote| {
+            remote.kind() == Kind::Foreign && remote.state.output_device_id == device_id
+        });
+        if !same_foreign {
+            return Err(RELEASED.into());
         }
         let queue = self.spotify_queue(host).await?;
         if let Some(remote) = self.remote.lock().as_mut() {
+            if remote.kind() != Kind::Foreign || remote.state.output_device_id != device_id {
+                return Err(RELEASED.into());
+            }
             let current = remote.state.current_index.and_then(|row| remote.state.queue.get(row)).cloned();
             let offset = usize::from(current.is_some());
             remote.state.queue = current.into_iter().chain(queue.iter().filter_map(|item| track_from_player(item).ok())).collect();

@@ -25,6 +25,7 @@ use futures_util::future::BoxFuture;
 use librespot_core::{
     Error, FileId, Session, SpotifyId, SpotifyUri,
     audio_key::{AudioKey, AudioKeyError},
+    cache::Cache,
 };
 use tempfile::NamedTempFile;
 use tokio::sync::oneshot;
@@ -110,6 +111,13 @@ pub async fn audio_key(
 /// request for it goes to Spotify.
 pub fn forget_audio_key(session: &Session, track_uri: &SpotifyUri, file_id: FileId) {
     forget(&KEYS, key_store(session, track_uri).as_deref(), file_id);
+}
+
+/// Drops a kept audio key from memory and disk when its cached audio file is
+/// evicted by the LRU size bound.
+pub(super) fn forget_cached_audio_key(cache: &Cache, file_id: FileId) {
+    let store = cache_root(cache).map(|root| root.join("keys"));
+    forget(&KEYS, store.as_deref(), file_id);
 }
 
 /// Called by [`super::clear_cached_audio`] while it holds the epoch lock; the

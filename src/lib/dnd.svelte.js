@@ -17,7 +17,7 @@
  * Svelte — moving one transform per frame must not re-render anything.
  */
 
-import { api, library, promotePlaylist } from "./state.svelte.js";
+import { api, isWritablePlaylist, library, promotePlaylist, ui } from "./state.svelte.js";
 
 export const trackDrag = $state({
   active: false,
@@ -145,6 +145,7 @@ function hold(kind, ctx, e) {
   window.addEventListener("pointerup", onPressUp);
   window.addEventListener("pointercancel", onPressCancel);
   window.addEventListener("keydown", onPressKey, true);
+  window.addEventListener("blur", onWindowBlur);
 }
 
 /**
@@ -189,6 +190,11 @@ function releaseListeners() {
   window.removeEventListener("pointerup", onPressUp);
   window.removeEventListener("pointercancel", onPressCancel);
   window.removeEventListener("keydown", onPressKey, true);
+  window.removeEventListener("blur", onWindowBlur);
+}
+
+function onWindowBlur() {
+  if (press) endDrag(false);
 }
 
 function onPressMove(e) {
@@ -506,9 +512,9 @@ function endDrag(commit) {
       }
     } else if (p.dropRow) {
       const pid = p.dropRow.dataset.pid;
-      if (pid !== d.sourcePlaylistId) {
-        commitToPlaylist(pid, d.uri);
-        pulse(p.dropRow);
+      const target = library.find((pl) => pl.id === pid);
+      if (pid && pid !== d.sourcePlaylistId && isWritablePlaylist(target)) {
+        commitToPlaylist(target, d.uri, p.dropRow);
         outcome = "playlist";
       }
     }
@@ -531,6 +537,7 @@ function endDrag(commit) {
 }
 
 let releaseGuardTimer = 0;
+let disarmReleaseGuard = null;
 
 /**
  * A drag that ends over what it started on leaves the browser primed to
@@ -544,7 +551,7 @@ let releaseGuardTimer = 0;
  * space can never eat the user's NEXT intentional click.
  */
 function suppressReleaseClick() {
-  clearTimeout(releaseGuardTimer);
+  disarmReleaseGuard?.();
   const swallow = (e) => {
     disarm();
     e.preventDefault();
@@ -553,25 +560,28 @@ function suppressReleaseClick() {
   const disarm = () => {
     document.removeEventListener("click", swallow, true);
     clearTimeout(releaseGuardTimer);
+    if (disarmReleaseGuard === disarm) disarmReleaseGuard = null;
   };
+  disarmReleaseGuard = disarm;
   document.addEventListener("click", swallow, true);
   releaseGuardTimer = setTimeout(disarm, 400);
 }
 
 /**
  * Copy onto a sidebar playlist. Deliberately an ADD, never a move: dragging
- * out of a playlist leaves the original in place. Failures stay silent like
- * every other fire-and-forget playlist edit — the next reconciliation paints
- * the server's truth.
+ * out of a playlist leaves the original in place. Pulses only on resolved
+ * success and reports failures to the app error banner.
  */
-function commitToPlaylist(pid, uri) {
-  const target = library.find((p) => p.id === pid);
-  api.addPlaylistTracks(pid, [uri])
+function commitToPlaylist(target, uri, rowEl) {
+  api.addPlaylistTracks(target.id, [uri])
     .then(() => {
-      if (target) promotePlaylist(target.id);
-      api.touchPlaylistActivity(pid).catch(() => {});
+      if (rowEl?.isConnected) pulse(rowEl);
+      promotePlaylist(target.id);
+      api.touchPlaylistActivity(target.id).catch(() => {});
     })
-    .catch(() => {});
+    .catch((reason) => {
+      ui.error = `Could not add to ${target.name}. ${reason instanceof Error ? reason.message : String(reason ?? "")}`.trim();
+    });
 }
 
 /** Brief accent wash on the playlist row that received the drop. WAAPI, not

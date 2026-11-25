@@ -88,7 +88,7 @@
       togglePlay();
       return;
     }
-    if (tracks.length) api.playQueue(tracks, 0, `radio:${route.id ?? ""}`).catch(() => {});
+    if (tracks.length) api.playQueue(tracks, 0, `radio:${route.id ?? ""}`, { automaticStart: true }).catch(() => {});
   }
 
   async function shufflePlay() {
