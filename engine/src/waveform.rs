@@ -12,8 +12,8 @@ use librespot_audio::{AudioDecrypt, AudioFile, KeySource, StreamLoaderController
 use librespot_core::{FileId, Session, SpotifyId, SpotifyUri, cache::Cache};
 use librespot_metadata::audio::{AudioFileFormat, AudioFiles, AudioItem};
 use librespot_playback::decoder::{AudioDecoder, SymphoniaDecoder};
-use renderer_engine::atomic::replace_file_atomically;
-use renderer_engine::protocol::TrackWaveform;
+use spotifine_common::atomic::replace_file_atomically;
+use spotifine_common::protocol::TrackWaveform;
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
 use tokio::sync::{Semaphore, mpsc};

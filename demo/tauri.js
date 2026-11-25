@@ -5,6 +5,7 @@ import { invoke as answer, listen as subscribe } from "./bridge.js";
 
 /* @tauri-apps/api/core */
 export const invoke = answer;
+export const isTauri = () => false;
 /** The app's artwork is the demo's own files, next to the page. */
 export const convertFileSrc = (path) => new URL(path, document.baseURI).href;
 

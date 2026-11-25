@@ -56,7 +56,7 @@ use http::Method;
 use librespot_core::Session;
 use serde::Deserialize;
 
-use renderer_engine::protocol::ArtistRef;
+use spotifine_common::protocol::ArtistRef;
 
 
 const ARTIST_URI_PREFIX: &str = "spotify:artist:";

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use renderer_engine::protocol::{MAX_REQUEST_BYTES, PlaylistRowReply, PlaylistRows, QueueReceipt};
+use spotifine_common::protocol::{MAX_REQUEST_BYTES, PlaylistRowReply, PlaylistRows, QueueReceipt};
 use serde::de::value::{CowStrDeserializer, MapAccessDeserializer};
 use serde::de::{DeserializeSeed, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -192,12 +192,12 @@ impl MarkFence {
 }
 
 /// The rows of a reply payload that carry a download mark: every
-/// [`TrackRef`](renderer_engine::protocol::TrackRef), wherever it sits, is
+/// [`TrackRef`](spotifine_common::protocol::TrackRef), wherever it sits, is
 /// handed to `visit`. Every type [`parse_data`] reads declares this, so a
 /// payload that gains rows has to say where they are; one without rows keeps
 /// the empty default.
 trait CachedClaims {
-    fn claims(&mut self, _visit: &mut dyn FnMut(&mut renderer_engine::protocol::TrackRef)) {}
+    fn claims(&mut self, _visit: &mut dyn FnMut(&mut spotifine_common::protocol::TrackRef)) {}
 }
 
 struct PendingRequest {
@@ -627,6 +627,8 @@ impl PersistenceSchedule {
 enum PersistCommand {
     Dirty(u64),
     Clear(mpsc::Sender<Result<(), String>>),
+    #[cfg(windows)]
+    Checkpoint(mpsc::Sender<Result<(), String>>),
     Shutdown {
         generation: u64,
         result_tx: mpsc::Sender<Result<(), String>>,
@@ -815,7 +817,7 @@ mod claims {
     //! Where each reply payload keeps its rows. `TrackRef` is the only
     //! protocol type with a download mark.
     use super::CachedClaims;
-    use renderer_engine::protocol::*;
+    use spotifine_common::protocol::*;
 
     type Visit<'a> = &'a mut dyn FnMut(&mut TrackRef);
 
@@ -885,7 +887,7 @@ mod claims {
     }
 
     // Payloads without rows.
-    impl CachedClaims for renderer_engine::protocol::ConnectDevice {}
+    impl CachedClaims for spotifine_common::protocol::ConnectDevice {}
     impl CachedClaims for TrackWaveform {}
     impl CachedClaims for LibraryNode {}
     impl CachedClaims for UserProfile {}
@@ -1011,6 +1013,10 @@ impl EngineClient {
 
     /// The reader's canonical snapshot, fresher than the UI's asynchronous copy.
     pub fn current_state(&self) -> Option<PlaybackState> { self.last_state.lock().clone() }
+
+    pub(crate) fn is_playing(&self) -> bool {
+        self.observed_state.lock().as_ref().is_some_and(|state| state.playing)
+    }
 
     pub fn cache_generation(&self) -> u64 { self.cache_generation.load(Ordering::Acquire) }
 
@@ -1608,8 +1614,8 @@ impl EngineClient {
     pub async fn preview_track_edit(
         &self,
         track: &Track,
-        cuts: &[renderer_engine::protocol::TimeRange],
-        loop_range: Option<renderer_engine::protocol::LoopRange>,
+        cuts: &[spotifine_common::protocol::TimeRange],
+        loop_range: Option<spotifine_common::protocol::LoopRange>,
         position_ms: u32,
         preview_lease_id: u64,
     ) -> Result<(), String> {
@@ -1770,7 +1776,7 @@ impl EngineClient {
         limit: usize,
         query: &str,
         sort: &str,
-    ) -> Result<renderer_engine::protocol::HistoryPage, String> {
+    ) -> Result<spotifine_common::protocol::HistoryPage, String> {
         let reply = self
             .request(
                 "get_history",
@@ -1787,7 +1793,7 @@ impl EngineClient {
     pub async fn get_track_waveform(
         &self,
         track_id: &str,
-    ) -> Result<renderer_engine::protocol::TrackWaveform, String> {
+    ) -> Result<spotifine_common::protocol::TrackWaveform, String> {
         let reply = self
             .request_cancelling("get_track_waveform", json!({"track_id": track_id}), Some(track_id))
             .await?;
@@ -1805,7 +1811,7 @@ impl EngineClient {
     }
 
     /// On-demand LAN discovery; native endpoints remain inside the engine.
-    pub async fn discover_connect_devices(&self) -> Result<Vec<renderer_engine::protocol::ConnectDevice>, String> {
+    pub async fn discover_connect_devices(&self) -> Result<Vec<spotifine_common::protocol::ConnectDevice>, String> {
         let reply = self.request("discover_connect_devices", Value::Null).await?;
         parse_data(reply, "discover_connect_devices")
     }
@@ -1890,7 +1896,7 @@ impl EngineClient {
     pub async fn browse_playlist_tree(
         &self,
         length: usize,
-    ) -> Result<Vec<renderer_engine::protocol::LibraryNode>, String> {
+    ) -> Result<Vec<spotifine_common::protocol::LibraryNode>, String> {
         let reply = self
             .request("browse_playlist_tree", json!({"length": length}))
             .await?;
@@ -1900,14 +1906,14 @@ impl EngineClient {
     pub async fn browse_show(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::ShowBrowse, String> {
+    ) -> Result<spotifine_common::protocol::ShowBrowse, String> {
         let reply = self.request("browse_show", json!({"id": id})).await?;
         parse_data(reply, "browse_show")
     }
 
     pub async fn browse_show_episodes(
         &self, id: &str, episode_ids: &[String],
-    ) -> Result<Vec<renderer_engine::protocol::EpisodeRef>, String> {
+    ) -> Result<Vec<spotifine_common::protocol::EpisodeRef>, String> {
         let reply = self.request("browse_show_episodes", json!({ "id": id, "episode_ids": episode_ids })).await?;
         parse_data(reply, "browse_show_episodes")
     }
@@ -1915,7 +1921,7 @@ impl EngineClient {
     pub async fn browse_episode(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::EpisodeRef, String> {
+    ) -> Result<spotifine_common::protocol::EpisodeRef, String> {
         let reply = self.request("browse_episode", json!({"id": id})).await?;
         parse_data(reply, "browse_episode")
     }
@@ -1923,8 +1929,8 @@ impl EngineClient {
     pub async fn browse_profile(
         &self,
         username: &str,
-        known_playlists: &[renderer_engine::protocol::PlaylistRef],
-    ) -> Result<renderer_engine::protocol::UserProfile, String> {
+        known_playlists: &[spotifine_common::protocol::PlaylistRef],
+    ) -> Result<spotifine_common::protocol::UserProfile, String> {
         let reply = self
             .request("browse_profile", json!({"username": username, "known_playlists": known_playlists}))
             .await?;
@@ -1933,8 +1939,8 @@ impl EngineClient {
 
     pub async fn browse_playlist_covers(
         &self,
-        playlists: &[renderer_engine::protocol::PlaylistRef],
-    ) -> Result<Vec<renderer_engine::protocol::PlaylistRef>, String> {
+        playlists: &[spotifine_common::protocol::PlaylistRef],
+    ) -> Result<Vec<spotifine_common::protocol::PlaylistRef>, String> {
         let reply = self.request("browse_playlist_covers", json!({"playlists": playlists})).await?;
         parse_data(reply, "browse_playlist_covers")
     }
@@ -1945,7 +1951,7 @@ impl EngineClient {
         &self,
         id: &str,
         tracks_key: Option<&str>,
-    ) -> Result<renderer_engine::protocol::PlaylistRead, String> {
+    ) -> Result<spotifine_common::protocol::PlaylistRead, String> {
         let reply = self.request("browse_playlist", json!({"id": id, "tracks_key": tracks_key})).await?;
         parse_data(reply, "browse_playlist")
     }
@@ -1953,21 +1959,21 @@ impl EngineClient {
     pub async fn browse_playlist_membership(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::PlaylistMembership, String> {
+    ) -> Result<spotifine_common::protocol::PlaylistMembership, String> {
         parse_data(self.request("browse_playlist_membership", json!({"id": id})).await?, "browse_playlist_membership")
     }
 
     pub async fn queue_metadata(
         &self,
         context: Option<&str>,
-    ) -> Result<renderer_engine::protocol::QueueMetadata, String> {
+    ) -> Result<spotifine_common::protocol::QueueMetadata, String> {
         parse_data(self.request("queue_metadata", json!({"context": context})).await?, "queue_metadata")
     }
 
     pub async fn browse_radio(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::RadioBrowse, String> {
+    ) -> Result<spotifine_common::protocol::RadioBrowse, String> {
         let reply = self.request("browse_radio", json!({"id": id})).await?;
         parse_data(reply, "browse_radio")
     }
@@ -1975,7 +1981,7 @@ impl EngineClient {
     pub async fn browse_playlist_recommendations(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::PlaylistRecommendations, String> {
+    ) -> Result<spotifine_common::protocol::PlaylistRecommendations, String> {
         let reply = self
             .request("browse_playlist_recommendations", json!({"id": id}))
             .await?;
@@ -1985,7 +1991,7 @@ impl EngineClient {
     pub async fn browse_track(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::TrackRef, String> {
+    ) -> Result<spotifine_common::protocol::TrackRef, String> {
         let reply = self.request("browse_track", json!({"id": id})).await?;
         parse_data(reply, "browse_track")
     }
@@ -1993,7 +1999,7 @@ impl EngineClient {
     pub async fn browse_album(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::AlbumBrowse, String> {
+    ) -> Result<spotifine_common::protocol::AlbumBrowse, String> {
         let reply = self.request("browse_album", json!({"id": id})).await?;
         parse_data(reply, "browse_album")
     }
@@ -2001,7 +2007,7 @@ impl EngineClient {
     pub async fn browse_artist(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::ArtistBrowse, String> {
+    ) -> Result<spotifine_common::protocol::ArtistBrowse, String> {
         let reply = self.request("browse_artist", json!({"id": id})).await?;
         parse_data(reply, "browse_artist")
     }
@@ -2010,7 +2016,7 @@ impl EngineClient {
         &self,
         id: &str,
         name: &str,
-    ) -> Result<Option<renderer_engine::protocol::SongwriterPlaylist>, String> {
+    ) -> Result<Option<spotifine_common::protocol::SongwriterPlaylist>, String> {
         let reply = self
             .request("browse_artist_songwriter", json!({"id": id, "name": name}))
             .await?;
@@ -2023,7 +2029,7 @@ impl EngineClient {
         release_types: &[String],
         offset: usize,
         limit: usize,
-    ) -> Result<renderer_engine::protocol::ArtistCataloguePage, String> {
+    ) -> Result<spotifine_common::protocol::ArtistCataloguePage, String> {
         let reply = self
             .request(
                 "browse_artist_catalogue",
@@ -2036,7 +2042,7 @@ impl EngineClient {
     pub async fn browse_liked_songs(
         &self,
         cursor: Option<&str>,
-    ) -> Result<renderer_engine::protocol::LikedSongsPage, String> {
+    ) -> Result<spotifine_common::protocol::LikedSongsPage, String> {
         let reply = self
             .request("browse_liked_songs", json!({"cursor": cursor}))
             .await?;
@@ -2048,7 +2054,7 @@ impl EngineClient {
     pub async fn browse_liked_uris(
         &self,
         cursor: Option<&str>,
-    ) -> Result<renderer_engine::protocol::LikedUrisPage, String> {
+    ) -> Result<spotifine_common::protocol::LikedUrisPage, String> {
         let reply = self
             .request("browse_liked_uris", json!({"cursor": cursor}))
             .await?;
@@ -2058,7 +2064,7 @@ impl EngineClient {
     pub async fn browse_track_credits(
         &self,
         id: &str,
-    ) -> Result<renderer_engine::protocol::TrackCredits, String> {
+    ) -> Result<spotifine_common::protocol::TrackCredits, String> {
         let reply = self
             .request("browse_track_credits", json!({"id": id}))
             .await?;
@@ -2068,7 +2074,7 @@ impl EngineClient {
     pub async fn browse_canvas(
         &self,
         id: &str,
-    ) -> Result<Option<renderer_engine::protocol::Canvas>, String> {
+    ) -> Result<Option<spotifine_common::protocol::Canvas>, String> {
         let reply = self.request("browse_canvas", json!({"id": id})).await?;
         parse_data(reply, "browse_canvas")
     }
@@ -2084,7 +2090,7 @@ impl EngineClient {
         &self,
         track_id: &str,
         playlist_id: Option<&str>,
-    ) -> Result<renderer_engine::protocol::TrackEditStatus, String> {
+    ) -> Result<spotifine_common::protocol::TrackEditStatus, String> {
         let reply = self
             .request(
                 "get_track_edit",
@@ -2098,9 +2104,9 @@ impl EngineClient {
         &self,
         track_id: &str,
         duration_ms: u32,
-        cuts: &[renderer_engine::protocol::TimeRange],
-        loop_range: Option<renderer_engine::protocol::LoopRange>,
-    ) -> Result<renderer_engine::protocol::TrackEditDefinition, String> {
+        cuts: &[spotifine_common::protocol::TimeRange],
+        loop_range: Option<spotifine_common::protocol::LoopRange>,
+    ) -> Result<spotifine_common::protocol::TrackEditDefinition, String> {
         let reply = self
             .request(
                 "save_track_edit",
@@ -2161,7 +2167,7 @@ impl EngineClient {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<renderer_engine::protocol::SearchBrowse, String> {
+    ) -> Result<spotifine_common::protocol::SearchBrowse, String> {
         let reply = self
             .request("browse_search", json!({"query": query, "limit": limit}))
             .await?;
@@ -2170,14 +2176,14 @@ impl EngineClient {
 
     pub async fn browse_followed_artists(
         &self,
-    ) -> Result<Vec<renderer_engine::protocol::ArtistRef>, String> {
+    ) -> Result<Vec<spotifine_common::protocol::ArtistRef>, String> {
         let reply = self.request("browse_followed_artists", json!({})).await?;
         parse_data(reply, "browse_followed_artists")
     }
 
     pub async fn browse_saved_shows(
         &self,
-    ) -> Result<Vec<renderer_engine::protocol::ShowRef>, String> {
+    ) -> Result<Vec<spotifine_common::protocol::ShowRef>, String> {
         let reply = self.request("browse_saved_shows", json!({})).await?;
         parse_data(reply, "browse_saved_shows")
     }
@@ -2185,7 +2191,7 @@ impl EngineClient {
     pub async fn create_playlist(
         &self,
         name: &str,
-    ) -> Result<renderer_engine::protocol::PlaylistRef, String> {
+    ) -> Result<spotifine_common::protocol::PlaylistRef, String> {
         let reply = self
             .request("edit_create_playlist", json!({"name": name}))
             .await?;
@@ -2237,7 +2243,7 @@ impl EngineClient {
 
     pub async fn move_library_item(
         &self,
-        item: &renderer_engine::protocol::LibraryItem,
+        item: &spotifine_common::protocol::LibraryItem,
         folder: Option<&str>,
     ) -> Result<(), String> {
         let _ = self
@@ -2282,6 +2288,20 @@ impl EngineClient {
             )
             .await?;
         Ok(())
+    }
+
+    /// Save the queue and playhead without changing transport or shutting
+    /// down the writer. ShellExecute can fail after this hook returns.
+    #[cfg(windows)]
+    pub(crate) fn checkpoint_for_update(&self) {
+        let (tx, rx) = mpsc::channel();
+        let result = self.persist_tx.send(PersistCommand::Checkpoint(tx))
+            .map_err(|error| error.to_string())
+            .and_then(|()| rx.recv().map_err(|error| error.to_string()))
+            .and_then(|result| result);
+        if let Err(error) = result {
+            log::warn(&format!("could not checkpoint playback state before update: {error}"));
+        }
     }
 
     /// Stops the engine before requesting an unthrottled final flush from the
@@ -2756,6 +2776,24 @@ fn run_persistence_writer(client: Weak<EngineClient>, receiver: Receiver<Persist
                         client.persist_generation.load(Ordering::Acquire)
                     });
                 }
+                let _ = result_tx.send(result);
+            }
+            #[cfg(windows)]
+            Some(PersistCommand::Checkpoint(result_tx)) => {
+                let result = client.upgrade().map_or(Ok(()), |client| {
+                    let generation = client.persist_generation.load(Ordering::Acquire);
+                    if let Some(snapshot) = client.playback_snapshot_for_shutdown() {
+                        save_playback_snapshot(&snapshot)?;
+                        // A normal write must not base a sidecar on the old
+                        // snapshot after this unthrottled overwrite.
+                        schedule = PersistenceSchedule {
+                            committed_generation: generation,
+                            ..PersistenceSchedule::default()
+                        };
+                        schedule.mark_dirty(client.persist_generation.load(Ordering::Acquire));
+                    }
+                    Ok(())
+                });
                 let _ = result_tx.send(result);
             }
             Some(PersistCommand::Shutdown {
@@ -3263,10 +3301,31 @@ mod tests {
         flush_tx.send(()).unwrap();
         returned_rx.recv().unwrap();
         exit.join().unwrap();
-        // The normal Exit event may follow the updater hook. It must be a
-        // completed no-op rather than requesting a second writer shutdown.
+        // A second shutdown must not request another writer flush.
         client.shutdown_engine();
         assert!(client.persist_thread.lock().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installer_checkpoint_does_not_freeze_live_playback() {
+        let mut client = client_with_last_state(PlaybackState {
+            auth_state: "ready".into(), position_ms: 1000, playing: true, ..PlaybackState::default()
+        });
+        let (tx, rx) = mpsc::sync_channel(1);
+        Arc::get_mut(&mut client).unwrap().persist_tx = tx;
+        let writer = std::thread::spawn(move || {
+            let PersistCommand::Checkpoint(ack) = rx.recv().unwrap() else {
+                panic!("install attempt must checkpoint, not shut down");
+            };
+            ack.send(Ok(())).unwrap();
+            assert!(matches!(rx.recv().unwrap(), PersistCommand::Dirty(_)));
+        });
+        client.checkpoint_for_update();
+        client.on_position(PositionHeartbeat { position_ms: 3000, duration_ms: 180_000 });
+        assert_eq!(client.current_state().unwrap().position_ms, 3000);
+        assert!(client.is_playing());
+        writer.join().unwrap();
     }
 
 
@@ -3510,7 +3569,7 @@ mod tests {
     /// by the shell against the same evidence when it adopts them.
     #[test]
     fn a_playlist_read_parses_into_its_variant_with_both_kinds_of_marks_fenced() {
-        use renderer_engine::protocol::PlaylistRead;
+        use spotifine_common::protocol::PlaylistRead;
         let changed = test_data(json!({"changed": {"id": "p", "uri": "spotify:playlist:p", "name": "P",
             "owner_id": "o", "owner_name": "O", "tracks_key": "k",
             "tracks": [{"id": "a", "cached": true}, {"id": "b", "cached": true}]}}));
@@ -3552,18 +3611,18 @@ mod tests {
     /// A browse-shaped test payload: just its rows.
     #[derive(serde::Deserialize)]
     struct Rows {
-        tracks: Vec<renderer_engine::protocol::TrackRef>,
+        tracks: Vec<spotifine_common::protocol::TrackRef>,
     }
 
     impl CachedClaims for Rows {
-        fn claims(&mut self, visit: &mut dyn FnMut(&mut renderer_engine::protocol::TrackRef)) {
+        fn claims(&mut self, visit: &mut dyn FnMut(&mut spotifine_common::protocol::TrackRef)) {
             for track in &mut self.tracks { visit(track) }
         }
     }
 
     /// The rows of a reply, read the way `parse_data` reads every payload:
     /// once, typed, with the reply's fence applied.
-    fn rows(reply: EngineReply) -> Vec<renderer_engine::protocol::TrackRef> {
+    fn rows(reply: EngineReply) -> Vec<spotifine_common::protocol::TrackRef> {
         parse_data::<Rows>(reply, "browse_playlist").unwrap().tracks
     }
 
@@ -4046,7 +4105,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
     #[test]
     fn missing_or_malformed_reply_payloads_fail_at_the_typed_client_boundary() {
         for data in [None, Some(Value::Null), Some(json!({"track_id": "a", "interval_ms": "bad"}))] {
-            let result = parse_data::<renderer_engine::protocol::TrackWaveform>(
+            let result = parse_data::<spotifine_common::protocol::TrackWaveform>(
                 EngineReply { ok: true, data: data.map(test_data), ..EngineReply::default() }, "get_track_waveform",
             );
             assert!(result.is_err());
@@ -5146,47 +5205,16 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
         );
     }
 
-    /// Finds a built engine binary: `SPOTIFY_ENGINE_PATH`, the workspace
-    /// target dir, or the engine package's own target dir.
-    fn find_engine() -> Option<PathBuf> {
-        if let Some(path) = std::env::var_os("SPOTIFY_ENGINE_PATH") {
-            let path = PathBuf::from(path);
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        for candidate in [
-            root.join("target").join("debug").join(ENGINE_BINARY),
-            root.join("target").join("release").join(ENGINE_BINARY),
-            root.join("engine")
-                .join("target")
-                .join("debug")
-                .join(ENGINE_BINARY),
-            root.join("engine")
-                .join("target")
-                .join("release")
-                .join(ENGINE_BINARY),
-        ] {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        None
-    }
-
     /// End-to-end wire test against the real engine: spawn, initial state
     /// line, a `status` round-trip, the unauthenticated browse error path,
     /// and a graceful shutdown.
     #[tokio::test]
     async fn engine_client_round_trips_over_the_line_protocol() {
-        let Some(exe) = find_engine() else {
-            eprintln!(
-                "skipping: {ENGINE_BINARY} is not built \
-                 (run `cargo build -p renderer-engine`)"
-            );
-            return;
-        };
+        // Exercise the packaged engine, never an unrelated debug build.
+        let exe = std::env::var_os("SPOTIFY_ENGINE_PATH").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../target/release").join(ENGINE_BINARY));
+        assert!(exe.is_file(), "missing engine at {}; run `bun run build:engine`", exe.display());
         let state_dir = std::env::temp_dir().join(format!(
             "renderer-engine-test-{}",
             std::process::id()
@@ -5344,7 +5372,7 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
 
     #[test]
     fn the_engines_own_state_line_streams_into_the_typed_state() {
-        use renderer_engine::protocol::{AuthState, RepeatMode, StateEvent, TrackRef};
+        use spotifine_common::protocol::{AuthState, RepeatMode, StateEvent, TrackRef};
         let rows = vec![TrackRef { id: "a".into(), uri: "spotify:track:a".into(), name: "Esc\"aped\n".into(),
             duration_ms: 1_000, cached: true, ..TrackRef::default() }];
         let marks = vec!["gone".to_owned()];
@@ -5416,8 +5444,8 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
             tokio::pin!(sending);
             assert!(futures_poll_once(sending.as_mut()).await.is_none());
             let line = input.try_recv().unwrap();
-            let request: renderer_engine::protocol::Request = serde_json::from_str(&line.line).unwrap();
-            let renderer_engine::protocol::Command::PlayPlaylistRow { selection, index, context, output } = request.command
+            let request: spotifine_common::protocol::Request = serde_json::from_str(&line.line).unwrap();
+            let spotifine_common::protocol::Command::PlayPlaylistRow { selection, index, context, output } = request.command
                 else { panic!("expected playlist row command") };
             assert_eq!((index, context.as_str(), output.as_str()), (1, "playlist:p", ""));
             let answer = match selection {
@@ -5443,23 +5471,23 @@ $request = [Console]::ReadLine() | ConvertFrom-Json
     fn typed_queue_requests_are_readable_by_the_engine_with_restore_guards_intact() {
         let queue = vec![Track { id: "a".into(), uri: "spotify:track:a".into(), duration_ms: 1_000,
             artist_names: vec!["A".into()], ..Track::default() }];
-        let request: renderer_engine::protocol::Request = serde_json::from_str(&build_line("r", "play_queue",
+        let request: spotifine_common::protocol::Request = serde_json::from_str(&build_line("r", "play_queue",
             QueueRequest { queue: &queue, index: 0, position_ms: 5, context: "album:x",
                 automatic_start: true, ..QueueRequest::default() })).unwrap();
         assert_eq!(request.request_id, "r");
-        let renderer_engine::protocol::Command::PlayQueue { queue: rows, position_ms, context, automatic_start, start_paused, .. }
+        let spotifine_common::protocol::Command::PlayQueue { queue: rows, position_ms, context, automatic_start, start_paused, .. }
             = request.command else { panic!("queue request must be routable"); };
         assert_eq!(rows[0].uri, queue[0].uri);
         assert_eq!((position_ms, context.as_str(), automatic_start, start_paused), (5, "album:x", true, false));
-        let request: renderer_engine::protocol::Request = serde_json::from_str(&build_line("r", "play_queue",
+        let request: spotifine_common::protocol::Request = serde_json::from_str(&build_line("r", "play_queue",
             QueueRequest { queue: &queue, start_paused: true, ..QueueRequest::default() })).unwrap();
         assert!(matches!(request.command,
-            renderer_engine::protocol::Command::PlayQueue { start_paused: true, .. }), "a paused start reaches the engine");
+            spotifine_common::protocol::Command::PlayQueue { start_paused: true, .. }), "a paused start reaches the engine");
 
-        let request: renderer_engine::protocol::Request = serde_json::from_str(&build_line("restore", "restore_queue",
+        let request: spotifine_common::protocol::Request = serde_json::from_str(&build_line("restore", "restore_queue",
             QueueRequest { queue: &queue, only_if_preview: true, preview_lease_id: Some(17),
                 resume_playing: Some(false), ..QueueRequest::default() })).unwrap();
-        let renderer_engine::protocol::Command::RestoreQueue { only_if_preview, preview_lease_id, resume_playing, .. }
+        let spotifine_common::protocol::Command::RestoreQueue { only_if_preview, preview_lease_id, resume_playing, .. }
             = request.command else { panic!("guarded restore must be routable"); };
         assert!(only_if_preview);
         assert_eq!(preview_lease_id, 17);

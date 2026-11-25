@@ -1,8 +1,8 @@
-# Cargo workspace: the Tauri shell plus the Rust playback engine.
-# `cargo build --release` at the repo root builds both.
+# Cargo workspace: the Tauri shell, playback engine, and their shared types.
+# `cargo build --release` at the repo root builds both executables.
 [workspace]
 resolver = "3"
-members = ["engine", "src-tauri"]
+members = ["common", "engine", "src-tauri"]
 exclude = ["vendor/librespot-audio", "vendor/librespot-playback"]
 
 # FileId does not identify songs versus episodes. These pinned 0.8.0 patches

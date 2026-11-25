@@ -63,7 +63,7 @@ use protobuf::Message;
 use protocol::playlist4_external as p4;
 use serde::Deserialize;
 
-use renderer_engine::protocol::PlaylistRef;
+use spotifine_common::protocol::PlaylistRef;
 
 // ---------------------------------------------------------------------------
 // pure op builders (unit-tested)
@@ -259,9 +259,9 @@ fn is_playlist(uri: &str, id: &str) -> bool {
 /// items move with it (a folder brings its whole span).
 fn item_span(
     items: &[RootItem],
-    item: &renderer_engine::protocol::LibraryItem,
+    item: &spotifine_common::protocol::LibraryItem,
 ) -> Result<(usize, usize), String> {
-    use renderer_engine::protocol::LibraryItem;
+    use spotifine_common::protocol::LibraryItem;
     match item {
         LibraryItem::Playlist { id } => items
             .iter()
@@ -410,7 +410,7 @@ fn delete_folder_ops(items: &[RootItem], id: &str) -> Result<Vec<p4::Op>, String
 /// it was in the account's own order. Already there is no op at all.
 fn move_item_ops(
     items: &[RootItem],
-    item: &renderer_engine::protocol::LibraryItem,
+    item: &spotifine_common::protocol::LibraryItem,
     folder: Option<&str>,
 ) -> Result<Vec<p4::Op>, String> {
     let (from, length) = item_span(items, item)?;
@@ -798,7 +798,7 @@ pub async fn delete_folder(session: &Session, id: &str) -> Result<(), String> {
 
 pub async fn move_library_item(
     session: &Session,
-    item: &renderer_engine::protocol::LibraryItem,
+    item: &spotifine_common::protocol::LibraryItem,
     folder: Option<&str>,
 ) -> Result<(), String> {
     let (revision, items) = rootlist_snapshot(session).await?;
@@ -1060,7 +1060,7 @@ mod tests {
 
     // -- rootlist folders -------------------------------------------------
 
-    use renderer_engine::protocol::LibraryItem;
+    use spotifine_common::protocol::LibraryItem;
 
     const OUTER: &str = "0123456789abcdef";
     const INNER: &str = "fedcba9876543210";

@@ -1,3 +1,12 @@
+## Desktop fixes
+
+- Windows can minimize to the notification area without stopping playback. Turn on **Minimize to tray** in Settings. Right-click the tray icon for Open, Play/Pause, Next, and Quit.
+- The macOS library tabs and search stay on one line, even while filtering.
+- Spotifine checks for updates daily. When one is available, use the download arrow beside Settings to install and restart.
+- If Windows can't launch the updater, Spotifine keeps running and can check for the update again.
+- Windows upgrades preserve **Launch at login**, including when setup runs the previous uninstaller first.
+- Playback errors distinguish an audio-key refusal from an unanswered request. The playback log shows each retry and whether it recovered or stopped.
+
 ## Faster pages
 
 - Albums and artists you opened in the last few hours open again at once, Back and Forward included. An artist page you come back to refreshes quietly in place.
@@ -32,7 +41,7 @@
 ## Explore without waiting
 
 - A song asks Spotify for its key once. Replays never ask again, so clicking through music doesn't run into Spotify's limit on keys.
-- If Spotify makes a new song wait, it stays selected and starts by itself, usually within half a minute. Nothing is skipped or removed from the cache.
+- If Spotify doesn't provide a new song's key, Spotifine retries without skipping the song or removing it from the cache. It stops retrying if the failure persists.
 - Clicking past songs quickly, or seeking while one loads, costs nothing extra.
 - The volume bar keeps its full length with the Now playing panel open, as long as the window has room.
 - Searching for local devices while receivers are asleep or offline shows an empty list, not a timeout error.

@@ -22,6 +22,7 @@
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import Select from "../components/Select.svelte";
   import { formatBytes } from "../lib/time.js";
+  import { os } from "../lib/window-frame.svelte.js";
   import UpdateControl from "../components/UpdateControl.svelte";
   import {
     personal, personalConnected, personalDevicesAuthorized, watchPersonal, configurePersonal,
@@ -76,6 +77,7 @@
     spotifyListening: "",
     launchAtLogin: "",
     startMinimized: "",
+    minimizeToTray: "",
     animatedCanvas: "",
     devices: "",
   });
@@ -174,6 +176,15 @@
       enabled,
       () => api.setStartMinimized(enabled),
       "Could not update start minimized.",
+    );
+  }
+
+  function updateMinimizeToTray(enabled) {
+    return updateSetting(
+      "minimizeToTray",
+      enabled,
+      () => api.setMinimizeToTray(enabled),
+      "Could not update minimize to tray.",
     );
   }
 
@@ -490,6 +501,26 @@
           />
         </div>
       </div>
+      {#if os === "windows"}
+        <div class="set-row">
+          <div>
+            <div class="k">Minimize to tray</div>
+            <div class="d" id="tray-description">Minimize to the notification area instead of the taskbar. Click the tray icon to reopen Spotifine. Closing the window still quits.</div>
+            {#if settingErrors.minimizeToTray}<div class="inline-error" role="alert">{settingErrors.minimizeToTray}</div>{/if}
+          </div>
+          <div class="set-ctl">
+            <input
+              class="set-check"
+              type="checkbox"
+              aria-label="Minimize to tray"
+              aria-describedby="tray-description"
+              checked={requestedSettings.minimizeToTray ?? appSettings?.minimize_to_tray ?? false}
+              disabled={!settingsState.loaded || !!settingBusy}
+              onchange={(event) => updateMinimizeToTray(event.currentTarget.checked)}
+            />
+          </div>
+        </div>
+      {/if}
       <div class="set-row">
         <div>
           <div class="k">Animated Canvas</div>

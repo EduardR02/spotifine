@@ -22,7 +22,7 @@ use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
 use crate::spotify_listening::LoadId;
 use crate::io::ProtocolWriter;
-use renderer_engine::protocol::{
+use spotifine_common::protocol::{
     AuthState, Command, LoopRange, PlaylistRowReply, PlaylistRows, PositionEvent, QueueReceipt,
     RepeatMode, Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
     TrackRef, VolumeEvent,
@@ -85,8 +85,8 @@ const UNAVAILABLE_BURST_WINDOW: Duration = Duration::from_secs(30);
 /// in silence. Three is the smallest limit that still lets two genuinely dead
 /// rows sit next to each other in an otherwise working queue.
 ///
-/// A withheld audio key is none of this: the track is fine, so it is held
-/// rather than counted (see [`KEY_RETRY_LADDER`]).
+/// An audio-key failure doesn't establish that a track is bad. Hold the row
+/// rather than counting it (see [`KEY_RETRY_LADDER`]).
 const UNAVAILABLE_STOP_LIMIT: usize = 3;
 
 /// How long a failed row waits before the engine loads it one more time.
@@ -98,15 +98,10 @@ const UNAVAILABLE_STOP_LIMIT: usize = 3;
 /// the retry's job is only to separate a momentary failure from a dead row.
 const LOAD_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 
-/// How long a row whose audio key Spotify withheld waits before each further
-/// attempt, the last step repeating up to [`KEY_RETRY_LIMIT`].
-///
-/// Spotify paces key requests: a burst of new tracks is answered, and then
-/// roughly one more key every half minute until the burst allowance refills.
-/// The track itself is fine, so it is held and retried rather than skipped —
-/// the row after it needs a key just the same — and the steps climb to that
-/// half minute. Any load the user asks for replaces the held row at once, so
-/// the newest click is always the one waiting.
+/// How long to wait between loads after an audio-key failure. Some refusals
+/// have cleared after a quiet period; neither a refusal nor a missing reply
+/// tells us whether this particular request will succeed later. Retry the
+/// selected row, not the rest of the queue.
 const KEY_RETRY_LADDER: [Duration; 4] = [
     Duration::from_secs(5),
     Duration::from_secs(10),
@@ -115,16 +110,31 @@ const KEY_RETRY_LADDER: [Duration; 4] = [
 ];
 
 /// How many rungs of [`KEY_RETRY_LADDER`] a held row climbs before it is held
-/// paused instead: 5 + 10 + 20 + 7 × 30 s, about four minutes. Pacing clears
-/// well within that; a key still refused after it is not coming back on its
-/// own, and asking every half minute forever would only feed the refusal.
+/// paused instead: 5 + 10 + 20 + 7 × 30 s, about four minutes of backoff.
 const KEY_RETRY_LIMIT: usize = 10;
 
-/// What the banner says while a withheld key holds the current row: playing,
-/// paused, and given up on after [`KEY_RETRY_LIMIT`].
-const KEY_WAIT_MESSAGE: &str = "Spotify needs a moment before this song can start. It starts by itself.";
-const KEY_WAIT_PAUSED_MESSAGE: &str = "Spotify needs a moment before this song can start. Press play to try again.";
-const KEY_REFUSED_MESSAGE: &str = "Spotify isn't handing out this song right now. Press play to try again.";
+/// The key service's last observable answer, retained across automatic loads
+/// until this row produces audio or the user replaces it. A player `Loading`
+/// or `Playing` event alone doesn't establish that recovery succeeded.
+#[derive(Clone, Copy)]
+struct KeyHold {
+    failure: AudioKeyFailure,
+    exhausted: bool,
+}
+
+impl KeyHold {
+    fn message(self, playing: bool) -> &'static str {
+        use AudioKeyFailure::{Refused, Unanswered};
+        match (self.failure, self.exhausted, playing) {
+            (Refused, true, _) => "Spotify refused this track's audio key. Retries stopped. Try this track in the Spotify app.",
+            (Unanswered, true, _) => "No reply to the audio key request. Retries stopped. Check your connection.",
+            (Refused, false, true) => "Spotify refused this track's audio key. Retrying.",
+            (Unanswered, false, true) => "No reply to the audio key request. Retrying.",
+            (Refused, false, false) => "Spotify refused this track's audio key. Press Play to retry.",
+            (Unanswered, false, false) => "No reply to the audio key request. Press Play to retry.",
+        }
+    }
+}
 
 /// How much of a track may be left unplayed for its end to still be the end.
 ///
@@ -328,6 +338,7 @@ pub struct Engine {
     retry_current_at: Option<Instant>,
     failure_retried: bool,
     key_retries: usize,
+    key_hold: Option<KeyHold>,
     /// Whether librespot has said the current track is close enough to its end
     /// for the next one to be worth fetching. See [`Engine::preload_next`].
     preload_armed: bool,
@@ -662,6 +673,7 @@ impl Engine {
             retry_current_at: None,
             failure_retried: false,
             key_retries: 0,
+            key_hold: None,
             preload_armed: false,
             next_reconnect: None,
             reconnect_backoff: RECONNECT_BACKOFF_MIN,
@@ -785,13 +797,13 @@ impl Engine {
         self.track_edits.list_excluded_track_ids(playlist_id)
     }
 
-    pub fn queue_metadata(&self, context: Option<&str>) -> Result<renderer_engine::protocol::QueueMetadata, String> {
+    pub fn queue_metadata(&self, context: Option<&str>) -> Result<spotifine_common::protocol::QueueMetadata, String> {
         let context = context.unwrap_or_else(|| self.current_context());
         let excluded_track_ids = match context.strip_prefix("playlist:") {
             Some(id) => self.playlist_excluded_track_ids(id)?,
             None => Vec::new(),
         };
-        Ok(renderer_engine::protocol::QueueMetadata {
+        Ok(spotifine_common::protocol::QueueMetadata {
             excluded_track_ids,
             upcoming: self.upcoming_indices(),
         })
@@ -907,7 +919,7 @@ impl Engine {
             preload_uri,
             cached_ids,
             uncached_ids,
-            error: self.state.error.as_deref(),
+            error: self.playback_error(),
         })?;
         self.emitted_rows_revision = Some(queue_revision);
         self.emitted_order_revision = Some(order_revision);
@@ -1497,6 +1509,11 @@ impl Engine {
                     | Command::RestoreQueue { .. }
                     | Command::SetQueueCursor { .. }
             ))
+    }
+
+    fn playback_error(&self) -> Option<&str> {
+        self.state.error.as_deref()
+            .or_else(|| self.key_hold.map(|hold| hold.message(self.state.playing)))
     }
 
     /// Clears the last error, unless the machine has no output device: nothing
@@ -2726,6 +2743,13 @@ impl Engine {
                     return false;
                 }
                 self.current_load_produced_audio = true;
+                if let Some(hold) = self.key_hold.take() {
+                    let track = self.state.current_uri().unwrap_or("<no current row>");
+                    eprintln!(
+                        "transport: audio key track={track} reason={} retry={}/{} outcome=recovered (decoded audio)",
+                        hold.failure, self.key_retries, KEY_RETRY_LIMIT,
+                    );
+                }
                 if let Some(id) = self.loaded_track_id.clone() {
                     if self.invalidated_cache_ids.remove(&id) {
                         for track in &mut self.state.queue {
@@ -3294,13 +3318,12 @@ impl Engine {
         // Not `state.error = None` directly: a startup restore on a machine
         // with no output device installs the queue perfectly well, and must not
         // take the message that says why there is no sound with it.
-        self.clear_error();
+        self.forget_current_failure();
         self.history.clear();
         self.play_request_id = None;
         self.loop_decoder_eof = false;
         self.loop_jump_pending = false;
         self.reset_loop_pass_for_position(self.state.position_ms);
-        self.loading_failed = false;
         self.current_needs_load = playable_index.is_some();
         self.recent_track_changes.clear();
         self.recent_unavailable.clear();
@@ -4191,6 +4214,7 @@ impl Engine {
     /// second kind from being handled, as it was, as a track that finished.
     fn fail_current_load(&mut self, track_id: SpotifyUri) -> bool {
         let burst = self.record_unavailable(Instant::now());
+        self.key_hold = None;
         self.end_failed_load();
         // `state.playing` is left alone deliberately: it is the intent the
         // retry or skip below has to carry onto whatever loads next. Every
@@ -4268,27 +4292,19 @@ impl Engine {
         true
     }
 
-    /// Spotify withheld the current row's audio key, so librespot decoded
-    /// nothing. The track is fine and the next row would need a key just the
-    /// same, so the row is held — never skipped, never counted against the
-    /// failure breaker, its cache never touched — and loaded again on
-    /// [`KEY_RETRY_LADDER`] until a key arrives or the user picks something
-    /// else, which replaces it at once. After [`KEY_RETRY_LIMIT`] rungs it is
-    /// held paused instead, for Play to try again.
-    fn hold_current_for_key(&mut self, track_id: SpotifyUri, failure: AudioKeyFailure) -> bool {
+    /// A missing key isn't evidence of a bad track or cache entry. Keep the
+    /// row and the session, with a bounded retry only while the user wants play.
+    fn hold_current_for_key(&mut self, request: u64, track_id: SpotifyUri, failure: AudioKeyFailure) -> bool {
         self.end_failed_load();
-        // Pause wins, as it does for any failed load: nothing retries behind
-        // it, and Play is the retry.
-        if !self.state.playing {
-            self.state.error = Some(KEY_WAIT_PAUSED_MESSAGE.to_owned());
-            eprintln!("transport: audio key for {track_id} {failure} while paused; holding this row");
-            return true;
-        }
-        if self.key_retries >= KEY_RETRY_LIMIT {
+        self.clear_error();
+        let attempt = self.key_retries + 1;
+        let exhausted = self.key_retries >= KEY_RETRY_LIMIT;
+        self.key_hold = Some(KeyHold { failure, exhausted });
+        if exhausted || !self.state.playing {
             self.state.playing = false;
-            self.state.error = Some(KEY_REFUSED_MESSAGE.to_owned());
+            let outcome = if exhausted { "exhausted" } else { "paused" };
             eprintln!(
-                "transport: audio key for {track_id} {failure} after {} retries; holding this row paused",
+                "transport: audio key track={track_id} request={request} reason={failure} key_attempt={attempt} outcome={outcome} retries={}/{KEY_RETRY_LIMIT}",
                 self.key_retries,
             );
             return true;
@@ -4296,10 +4312,9 @@ impl Engine {
         let wait = KEY_RETRY_LADDER[self.key_retries.min(KEY_RETRY_LADDER.len() - 1)];
         self.key_retries += 1;
         self.retry_current_at = Some(Instant::now() + wait);
-        self.state.error = Some(KEY_WAIT_MESSAGE.to_owned());
         eprintln!(
-            "transport: audio key for {track_id} {failure}; retrying this row in {} s",
-            wait.as_secs(),
+            "transport: audio key track={track_id} request={request} reason={failure} key_attempt={attempt} outcome=scheduled retry={}/{KEY_RETRY_LIMIT} delay={}s",
+            self.key_retries, wait.as_secs(),
         );
         true
     }
@@ -4329,6 +4344,7 @@ impl Engine {
         self.retry_current_at = None;
         self.failure_retried = false;
         self.key_retries = 0;
+        self.key_hold = None;
     }
 
     /// For a current row that is removed without a load replacing it: nothing
@@ -4374,14 +4390,31 @@ impl Engine {
         // afterwards: the load now in flight is the same row's retry, not a
         // new start.
         let (failure_retried, key_retries) = (self.failure_retried, self.key_retries);
-        if let Err(error) = self.load_current(true) {
+        let key_hold = self.key_hold;
+        let result = self.load_current(true);
+        if let (Some(hold), Some(track)) = (key_hold, self.state.current_uri()) {
+            let outcome = match (&result, self.play_request_id) {
+                (Err(_), _) => "dispatch_failed",
+                (Ok(()), None) => "deferred", // reconnecting; no player received a load
+                (Ok(()), Some(_)) => "fired",
+            };
+            eprintln!(
+                "transport: audio key track={track} reason={} retry={key_retries}/{KEY_RETRY_LIMIT} outcome={outcome} request={:?}",
+                hold.failure, self.play_request_id,
+            );
+        }
+        if let Err(error) = result {
             self.retry_current_at = None;
+            self.key_hold = None;
             self.state.playing = false;
             self.state.error = Some(error);
             return true;
         }
         self.failure_retried = failure_retried;
         self.key_retries = key_retries;
+        if self.play_request_id.is_some() {
+            self.key_hold = key_hold;
+        }
         true
     }
 
@@ -4845,7 +4878,7 @@ impl Engine {
                 track_id,
                 failure,
             } if self.is_current_event(play_request_id, &track_id) => {
-                self.hold_current_for_key(track_id, failure)
+                self.hold_current_for_key(play_request_id, track_id, failure)
             }
             // A failed *preload*. librespot stamps this with the play request
             // of the track currently playing but the track id of the one it
@@ -5159,8 +5192,7 @@ mod tests {
     use super::{
         AUDIO_BLOCKED_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MIN,
         AudioKeyFailure, AudioSignal, AuthFailure, AuthSignal, ConnectedSession, Engine,
-        KEY_REFUSED_MESSAGE, KEY_RETRY_LADDER, KEY_RETRY_LIMIT, KEY_WAIT_MESSAGE,
-        KEY_WAIT_PAUSED_MESSAGE, LOAD_RETRY_BACKOFF,
+        KEY_RETRY_LADDER, KEY_RETRY_LIMIT, LOAD_RETRY_BACKOFF,
         PRELOAD_WATERMARK_MS, PlaybackHandles, PlaybackSpeeds, PlaybackState, PlayerSignal,
         RECONNECT_BACKOFF_MAX,
         RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
@@ -5182,7 +5214,7 @@ mod tests {
     use librespot_playback::decoder::AudioPacket;
     use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume, softmixer::SoftMixer};
     use librespot_playback::player::{Player, PlayerEvent};
-    use renderer_engine::protocol::{AuthState, Command, LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef};
+    use spotifine_common::protocol::{AuthState, Command, LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef};
 
 
     #[test]
@@ -6123,7 +6155,7 @@ mod tests {
     fn playback_state(duration_ms: u32) -> PlaybackState {
         PlaybackState {
             ready: true,
-            auth_state: renderer_engine::protocol::AuthState::Ready,
+            auth_state: spotifine_common::protocol::AuthState::Ready,
             auth_url: None,
             playing: false,
             position_ms: 0,
@@ -6214,7 +6246,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn playlist_row_receipt_restarts_exact_occurrences_without_reinstalling_rows() {
-        use renderer_engine::protocol::PlaylistRows;
+        use spotifine_common::protocol::PlaylistRows;
         let (mut engine, _probe) = engine_with_player();
         engine.track_edits = TrackEditStore::in_memory();
         engine.state.shuffle = true;
@@ -6718,12 +6750,12 @@ mod tests {
         engine.listening_history.pretend_listened();
     }
 
-    fn history_rows(engine: &Engine) -> Vec<renderer_engine::protocol::HistoryItem> {
+    fn history_rows(engine: &Engine) -> Vec<spotifine_common::protocol::HistoryItem> {
         engine
             .history_reader()
-            .page(&renderer_engine::protocol::HistoryQuery {
+            .page(&spotifine_common::protocol::HistoryQuery {
                 limit: usize::MAX,
-                ..renderer_engine::protocol::HistoryQuery::default()
+                ..spotifine_common::protocol::HistoryQuery::default()
             })
             .unwrap()
             .items
@@ -7010,7 +7042,7 @@ mod tests {
             with_preview_edit(track.clone(), cuts.clone(), loop_range).expect("valid draft");
         assert_eq!(
             preview.effective_edit,
-            Some(renderer_engine::protocol::TrackEdit {
+            Some(spotifine_common::protocol::TrackEdit {
                 cuts: cuts.clone(),
                 loop_range,
             })
@@ -9057,8 +9089,8 @@ mod tests {
     }
 
     /// A withheld audio key holds the row and retries it on the ladder: 5, 10,
-    /// 20, then every 30 s for as long as the queue plays. The row is never
-    /// skipped, because the row after it needs a key just the same.
+    /// 20, then every 30 s up to the retry limit. The last failure determines
+    /// the banner even when consecutive attempts fail differently.
     #[tokio::test(flavor = "current_thread")]
     async fn a_withheld_key_holds_the_row_and_retries_on_the_ladder() {
         let (mut engine, _probe) = engine_with_player();
@@ -9073,7 +9105,11 @@ mod tests {
             assert_eq!(engine.state.current_index, Some(0), "attempt {attempt}: the row is held");
             assert!(engine.state.playing, "attempt {attempt}: the queue still means to play");
             assert!(engine.loading_failed);
-            assert_eq!(engine.state.error.as_deref(), Some(KEY_WAIT_MESSAGE));
+            let message = match failure {
+                AudioKeyFailure::Refused => "Spotify refused this track's audio key. Retrying.",
+                AudioKeyFailure::Unanswered => "No reply to the audio key request. Retrying.",
+            };
+            assert_eq!(engine.playback_error(), Some(message));
             let left = engine.retry_current_at.expect("a retry is armed").duration_since(Instant::now());
             assert!(left <= wait && left + Duration::from_secs(1) > wait,
                 "attempt {attempt}: waits {wait:?}, armed for {left:?}");
@@ -9087,9 +9123,17 @@ mod tests {
             let play_request_id = engine.play_request_id.expect("the retry loads the row");
             let track_id = SpotifyUri::from_uri(&engine.state.queue[0].uri).unwrap();
             engine.on_player_event(PlayerEvent::Loading { play_request_id, track_id, position_ms: 0 });
-            assert_eq!(engine.state.error.as_deref(), Some(KEY_WAIT_MESSAGE),
+            assert_eq!(engine.playback_error(), Some(message),
                 "attempt {attempt}: the message stays while the retry loads");
         }
+        let play_request_id = engine.play_request_id.unwrap();
+        engine.on_player_event(PlayerEvent::Playing {
+            play_request_id, track_id: track_uri(), position_ms: 0,
+        });
+        assert_eq!(engine.playback_error(), Some("No reply to the audio key request. Retrying."),
+            "receiving a transport echo isn't evidence that audio resumed");
+        note_audio(&mut engine);
+        assert!(engine.playback_error().is_none(), "decoded audio clears the key failure");
     }
 
     /// Whatever the user picks replaces a row held for its key at once, and
@@ -9128,13 +9172,19 @@ mod tests {
         assert!(withhold_key(&mut engine, 7, AudioKeyFailure::Refused));
         assert_eq!(engine.state.current_index, Some(0));
         assert!(engine.retry_current_at.is_none());
-        assert_eq!(engine.state.error.as_deref(), Some(KEY_WAIT_PAUSED_MESSAGE));
+        assert_eq!(engine.playback_error(), Some("Spotify refused this track's audio key. Press Play to retry."));
 
         assert_eq!(engine.play(), Ok(true));
         assert!(engine.state.playing);
         assert!(!engine.loading_failed, "Play loads the row again");
         assert!(engine.play_request_id.is_some());
-        assert!(engine.state.error.is_none());
+        assert!(engine.playback_error().is_none());
+
+        assert!(withhold_key(&mut engine, 8, AudioKeyFailure::Unanswered));
+        assert!(engine.retry_deadline().is_some());
+        assert_eq!(engine.pause(), Ok(true));
+        assert!(engine.retry_deadline().is_none(), "a user pause disarms the clock");
+        assert_eq!(engine.playback_error(), Some("No reply to the audio key request. Press Play to retry."));
     }
 
     /// A withheld key says nothing about the track or its cached audio, so it
@@ -9217,32 +9267,58 @@ mod tests {
         assert!(engine.play_request_id.is_some(), "the row loads again");
     }
 
-    /// A key still withheld after about four minutes of the ladder is not
-    /// pacing, and asking every half minute forever would only feed it. The
-    /// row is held paused instead, and Play starts the ladder over.
+    /// Backoff has a budget, independent of why the key was missing. The
+    /// final state must explain the latest failure without promising a start.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_held_row_stops_asking_after_about_four_minutes() {
-        let (mut engine, _probe) = engine_with_player();
-        engine.state = five_track_state();
-        engine.state.playing = true;
+    async fn audio_key_failures_publish_reason_and_stop_after_the_retry_budget() {
+        for (failure, retry_message, terminal_message) in [
+            (AudioKeyFailure::Refused, "Spotify refused this track's audio key. Retrying.",
+                "Spotify refused this track's audio key. Retries stopped. Try this track in the Spotify app."),
+            (AudioKeyFailure::Unanswered, "No reply to the audio key request. Retrying.",
+                "No reply to the audio key request. Retries stopped. Check your connection."),
+        ] {
+            let (mut engine, buffer) = test_engine();
+            let probe = SinkProbe::new();
+            let (player, session) = probe_player(&probe);
+            engine.player = Some(player);
+            engine.session = Some(session);
+            engine.state = five_track_state();
+            engine.state.playing = true;
+            let mut waited = Duration::ZERO;
+            for attempt in 0..KEY_RETRY_LIMIT {
+                assert!(withhold_key(&mut engine, 800 + attempt as u64, failure));
+                if attempt == 0 {
+                    engine.emit_state().unwrap();
+                    let held = take_line(&buffer);
+                    assert_eq!(held["playing"], true);
+                    assert_eq!(held["buffering"], true);
+                    assert_eq!(held["current_index"], 0);
+                    assert_eq!(held["error"], retry_message);
+                }
+                waited += KEY_RETRY_LADDER[attempt.min(KEY_RETRY_LADDER.len() - 1)];
+                fire_due_retry(&mut engine);
+            }
+            assert!(waited >= Duration::from_secs(4 * 60) && waited < Duration::from_secs(5 * 60), "{waited:?}");
 
-        let mut waited = Duration::ZERO;
-        for attempt in 0..KEY_RETRY_LIMIT {
-            assert!(withhold_key(&mut engine, 800 + attempt as u64, AudioKeyFailure::Refused));
-            waited += KEY_RETRY_LADDER[attempt.min(KEY_RETRY_LADDER.len() - 1)];
-            fire_due_retry(&mut engine);
+            assert!(withhold_key(&mut engine, 900, failure));
+            engine.emit_state().unwrap();
+            let stopped = take_line(&buffer);
+            assert_eq!(stopped["ready"], true, "playback failure isn't a sign-out");
+            assert_eq!(stopped["current_index"], 0);
+            assert_eq!(stopped["playing"], false);
+            assert_eq!(stopped["buffering"], false);
+            assert_eq!(stopped["error"], terminal_message);
+            assert!(engine.retry_current_at.is_none(), "nothing asks again on its own");
+
+            assert_eq!(engine.play(), Ok(true));
+            assert!(engine.play_request_id.is_some(), "Play tries again");
+            assert_eq!(engine.key_retries, 0, "from the bottom of the ladder");
+            engine.emit_state().unwrap();
+            let retry = take_line(&buffer);
+            assert_eq!(retry["playing"], true);
+            assert_eq!(retry["buffering"], true, "dispatch alone isn't audible recovery");
+            assert!(retry["error"].is_null());
         }
-        assert!(waited >= Duration::from_secs(4 * 60) && waited < Duration::from_secs(5 * 60), "{waited:?}");
-
-        assert!(withhold_key(&mut engine, 900, AudioKeyFailure::Refused));
-        assert!(!engine.state.playing, "the row is held paused");
-        assert_eq!(engine.state.current_index, Some(0));
-        assert!(engine.retry_current_at.is_none(), "nothing asks again on its own");
-        assert_eq!(engine.state.error.as_deref(), Some(KEY_REFUSED_MESSAGE));
-
-        assert_eq!(engine.play(), Ok(true));
-        assert!(engine.play_request_id.is_some(), "Play tries again");
-        assert_eq!(engine.key_retries, 0, "from the bottom of the ladder");
     }
 
     /// A held row that is removed takes its retry and its message with it,
@@ -9255,7 +9331,7 @@ mod tests {
         assert!(withhold_key(&mut emptied, 7, AudioKeyFailure::Refused));
         assert_eq!(emptied.remove_queue(0), Ok(true));
         assert!(emptied.state.queue.is_empty());
-        assert!(emptied.state.error.is_none(), "no message about a song that is gone");
+        assert!(emptied.playback_error().is_none(), "no message about a song that is gone");
         assert!(emptied.retry_current_at.is_none());
         assert!(!emptied.loading_failed);
 
@@ -9266,7 +9342,7 @@ mod tests {
         assert!(withhold_key(&mut stranded, 7, AudioKeyFailure::Refused));
         assert_eq!(stranded.remove_queue(0), Ok(true));
         assert_eq!(stranded.state.current_index, None);
-        assert_ne!(stranded.state.error.as_deref(), Some(KEY_WAIT_MESSAGE));
+        assert_eq!(stranded.playback_error(), Some("no eligible tracks remain for automatic playback"));
         assert!(stranded.retry_current_at.is_none());
     }
 
@@ -9408,7 +9484,7 @@ mod tests {
     fn loop_marker_reloads_when_decoder_eof_arrived_first() {
         let mut engine = playing_engine();
         engine.state.playing = true;
-        engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
+        engine.state.queue[0].effective_edit = Some(spotifine_common::protocol::TrackEdit {
             cuts: Vec::new(),
             loop_range: Some(loop_range(1_500, 2_000, 2)),
         });
@@ -9434,7 +9510,7 @@ mod tests {
     fn loop_eof_after_an_audible_marker_does_not_wait_for_a_second_marker() {
         let mut engine = playing_engine();
         engine.state.playing = true;
-        engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
+        engine.state.queue[0].effective_edit = Some(spotifine_common::protocol::TrackEdit {
             cuts: Vec::new(),
             loop_range: Some(loop_range(900, 1_000, 2)),
         });
@@ -9514,7 +9590,7 @@ mod tests {
             let mut engine = playing_engine();
             engine.state.duration_ms = 100_000;
             engine.state.queue[0].duration_ms = 100_000;
-            engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
+            engine.state.queue[0].effective_edit = Some(spotifine_common::protocol::TrackEdit {
                 cuts: Vec::new(),
                 loop_range: Some(loop_range(20_000, 40_000, 3)),
             });
@@ -9539,7 +9615,7 @@ mod tests {
             let mut engine = playing_engine();
             engine.state.duration_ms = 100_000;
             engine.state.queue[0].duration_ms = 100_000;
-            engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
+            engine.state.queue[0].effective_edit = Some(spotifine_common::protocol::TrackEdit {
                 cuts: Vec::new(),
                 loop_range: Some(loop_range(20_000, 40_000, play_count)),
             });
@@ -9567,7 +9643,7 @@ mod tests {
     #[test]
     fn stale_loop_marker_from_replaced_audio_is_ignored() {
         let mut engine = playing_engine();
-        engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
+        engine.state.queue[0].effective_edit = Some(spotifine_common::protocol::TrackEdit {
             cuts: Vec::new(),
             loop_range: Some(loop_range(20_000, 40_000, 2)),
         });
@@ -10026,7 +10102,7 @@ mod tests {
         assert!(!engine.state.playing);
         assert!(engine.state.current_index.is_none());
         assert!(engine.session.is_none());
-        assert_eq!(engine.state.auth_state, renderer_engine::protocol::AuthState::NeedsLogin);
+        assert_eq!(engine.state.auth_state, spotifine_common::protocol::AuthState::NeedsLogin);
     }
 
     /// A healthy session must cost nothing and must clear any backoff a past
@@ -10740,7 +10816,7 @@ mod tests {
         engine.state.playing = true;
 
         assert!(engine.logout().expect("logout succeeds"));
-        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin);
+        assert!(engine.state.auth_state == spotifine_common::protocol::AuthState::NeedsLogin);
         assert!(!engine.state.ready);
         assert!(!engine.state.playing);
         assert!(engine.state.current_index.is_none());
@@ -10788,7 +10864,7 @@ mod tests {
         assert!(engine.logout().expect("first logout"));
         assert!(!fixture.credentials_exist());
         assert!(engine.logout().expect("second logout is a no-op"));
-        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin);
+        assert!(engine.state.auth_state == spotifine_common::protocol::AuthState::NeedsLogin);
     }
 
     #[test]
@@ -10801,7 +10877,7 @@ mod tests {
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         engine.start_authentication(sender);
         assert!(!engine.auth_running, "no implicit flow may start");
-        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin);
+        assert!(engine.state.auth_state == spotifine_common::protocol::AuthState::NeedsLogin);
         assert!(engine.state.auth_url.is_some());
         assert!(!engine.state.playing);
         assert!(engine.state.current_index.is_none());
@@ -10824,7 +10900,7 @@ mod tests {
     #[test]
     fn login_is_a_noop_while_a_session_is_live() {
         let mut engine = playing_engine(); // ready with a player-less state
-        engine.state.auth_state = renderer_engine::protocol::AuthState::Ready;
+        engine.state.auth_state = spotifine_common::protocol::AuthState::Ready;
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(
             engine
@@ -10832,14 +10908,14 @@ mod tests {
                 .expect("login no-ops when authenticated")
         );
         assert!(!engine.auth_running);
-        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::Ready);
+        assert!(engine.state.auth_state == spotifine_common::protocol::AuthState::Ready);
     }
 
     #[test]
     fn login_is_a_noop_while_a_flow_is_already_running() {
         let mut engine = test_engine().0;
         engine.auth_running = true;
-        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
+        engine.state.auth_state = spotifine_common::protocol::AuthState::Authenticating;
         engine.state.auth_url = Some("https://accounts.spotify.com/authorize?running".to_owned());
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(
@@ -10865,7 +10941,7 @@ mod tests {
         engine.session = Some(stale_session);
         engine.state.ready = false;
         engine.auth_running = true;
-        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
+        engine.state.auth_state = spotifine_common::protocol::AuthState::Authenticating;
         let generation = engine.generation;
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
@@ -10899,7 +10975,7 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         assert_eq!(
             engine.state.auth_state,
-            renderer_engine::protocol::AuthState::NeedsLogin,
+            spotifine_common::protocol::AuthState::NeedsLogin,
             "the login flow itself must not be disturbed"
         );
     }
@@ -10919,7 +10995,7 @@ mod tests {
             pending.auth_url, published,
             "the flow must use the published URL"
         );
-        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating);
+        assert!(engine.state.auth_state == spotifine_common::protocol::AuthState::Authenticating);
         assert!(engine.auth_running);
         assert_eq!(engine.state.auth_url.as_deref(), Some(published.as_str()));
         assert!(engine.pending_auth.is_none());
@@ -10929,14 +11005,14 @@ mod tests {
     fn begin_login_flow_prepares_a_fresh_attempt_when_none_is_pending() {
         let _serialized = crate::auth::lock_oauth_port();
         let mut engine = test_engine().0;
-        engine.state.auth_state = renderer_engine::protocol::AuthState::NeedsLogin;
+        engine.state.auth_state = spotifine_common::protocol::AuthState::NeedsLogin;
         let (pending, _listener) = engine.begin_login_flow().expect("flow begins");
         assert!(
             pending
                 .auth_url
                 .starts_with("https://accounts.spotify.com/authorize?")
         );
-        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating);
+        assert!(engine.state.auth_state == spotifine_common::protocol::AuthState::Authenticating);
         assert_eq!(
             engine.state.auth_url.as_deref(),
             Some(pending.auth_url.as_str())
@@ -10984,7 +11060,7 @@ mod tests {
         assert!(error.contains("5588"), "the port must be named: {error}");
         assert_eq!(
             engine.state.auth_state,
-            renderer_engine::protocol::AuthState::NeedsLogin,
+            spotifine_common::protocol::AuthState::NeedsLogin,
             "a login that cannot start must not claim to be authenticating"
         );
         assert!(!engine.auth_running);
@@ -11000,7 +11076,7 @@ mod tests {
     #[test]
     fn failed_auth_signal_returns_to_needs_login_with_a_fresh_url() {
         let mut engine = test_engine().0;
-        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
+        engine.state.auth_state = spotifine_common::protocol::AuthState::Authenticating;
         engine.state.auth_url = Some("https://accounts.spotify.com/authorize?first".to_owned());
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(engine.on_auth_signal(
@@ -11012,7 +11088,7 @@ mod tests {
             },
             sender,
         ));
-        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin);
+        assert!(engine.state.auth_state == spotifine_common::protocol::AuthState::NeedsLogin);
         assert!(!engine.state.ready);
         assert!(!engine.auth_running);
         let retry_url = engine.state.auth_url.clone().expect("retry url published");
@@ -11034,7 +11110,7 @@ mod tests {
         let mut engine = test_engine().0;
         engine.state = playback_state(180_000);
         engine.state.ready = false;
-        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
+        engine.state.auth_state = spotifine_common::protocol::AuthState::Authenticating;
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(engine.on_auth_signal(
@@ -11048,7 +11124,7 @@ mod tests {
         ));
 
         assert!(
-            engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating,
+            engine.state.auth_state == spotifine_common::protocol::AuthState::Authenticating,
             "a network failure must not present as a logged-out session"
         );
         assert!(engine.state.auth_url.is_none(), "no login is being asked for");
@@ -11083,7 +11159,7 @@ mod tests {
         stale.shutdown();
         engine.session = Some(stale);
         engine.state.ready = false;
-        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
+        engine.state.auth_state = spotifine_common::protocol::AuthState::Authenticating;
         engine.auth_running = true;
         engine.next_reconnect = Some(Instant::now() - Duration::from_millis(1));
         let attempt = engine.generation;
@@ -11125,7 +11201,7 @@ mod tests {
         assert_ne!(engine.generation, generation, "and it is a real attempt");
         assert_eq!(
             engine.state.auth_state,
-            renderer_engine::protocol::AuthState::NeedsLogin,
+            spotifine_common::protocol::AuthState::NeedsLogin,
             "the engine is out of 'reconnecting'"
         );
         assert!(
@@ -11186,7 +11262,7 @@ mod tests {
         );
         assert_eq!(
             engine.state.auth_state,
-            renderer_engine::protocol::AuthState::Authenticating,
+            spotifine_common::protocol::AuthState::Authenticating,
             "and the flow's state was not disturbed"
         );
     }
@@ -11365,7 +11441,7 @@ mod tests {
         assert!(engine.state.ready, "the engine is up");
         assert_eq!(
             engine.state.auth_state,
-            renderer_engine::protocol::AuthState::Ready,
+            spotifine_common::protocol::AuthState::Ready,
             "a missing device is not an authentication failure"
         );
         assert!(engine.state.error.is_some(), "the unresolved output failure is visible");
@@ -11580,7 +11656,7 @@ mod tests {
         assert!(engine.state.ready);
         assert_eq!(
             engine.state.auth_state,
-            renderer_engine::protocol::AuthState::Ready
+            spotifine_common::protocol::AuthState::Ready
         );
         assert!(
             engine.state.playing,
@@ -11682,7 +11758,7 @@ mod tests {
         assert!(engine.logout().expect("logout succeeds"));
         assert_eq!(
             engine.state.auth_state,
-            renderer_engine::protocol::AuthState::NeedsLogin
+            spotifine_common::protocol::AuthState::NeedsLogin
         );
         assert!(
             engine.audio_unavailable.is_none(),

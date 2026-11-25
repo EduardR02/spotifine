@@ -16,7 +16,7 @@
     ]
   },
   "build": {
-    "beforeBuildCommand": "bun run build && bun run build:engine && codesign --force --sign - target/release/PlaybackEngine"
+    "beforeBuildCommand": "bun run build && bun run build:engine && bash dev/sign-macos-engine.sh"
   },
   "bundle": {
     "targets": ["app"],

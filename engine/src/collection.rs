@@ -33,7 +33,7 @@ use http::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 use librespot_core::Session;
 use protobuf::{CodedInputStream, CodedOutputStream};
 
-use renderer_engine::protocol::ShowRef;
+use spotifine_common::protocol::ShowRef;
 
 const COLLECTION_PROTO: &str = "application/vnd.collection-v2.spotify.proto";
 const SHOW_SET: &str = "show";

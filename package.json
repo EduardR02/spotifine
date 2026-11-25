@@ -1,6 +1,6 @@
 {
   "name": "spotifine",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "Spotifine, Spotify without the bloat (Tauri 2 + Svelte 5)",
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "dev:demo": "vite --config demo/vite.config.js",
     "build:demo": "vite build --config demo/vite.config.js",
     "test": "bun test",
-    "build:engine": "cargo build --release -p renderer-engine",
+    "build:engine": "cargo build --locked --release -p renderer-engine",
     "preview": "vite preview",
     "tauri": "tauri"
   },

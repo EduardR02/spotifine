@@ -3084,6 +3084,7 @@ export const api = {
   },
   setLaunchAtLogin: (enabled) => mutateAppSettings("set_launch_at_login", { enabled: !!enabled }),
   setStartMinimized: (enabled) => mutateAppSettings("set_start_minimized", { enabled: !!enabled }),
+  setMinimizeToTray: (enabled) => mutateAppSettings("set_minimize_to_tray", { enabled: !!enabled }),
   setAnimatedCanvas: (enabled) =>
     mutateAppSettings("set_animated_canvas", { enabled: !!enabled }),
   /* Spotify devices on or off, locally; off brings playback on a device back

@@ -951,7 +951,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 .lib { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; margin-top: var(--s3); }
 .lib-head {
-  display: flex; flex: none; flex-wrap: wrap; align-items: center;
+  display: flex; flex: none; align-items: center;
   gap: 0 var(--s1); min-height: 28px; padding: 0 var(--s2); margin-bottom: var(--s1);
 }
 .lib-head .label {
@@ -1030,18 +1030,19 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    The other is the same type dimmed — no pill, no underline, no segmented
    track: two words at 11px are already a small enough object that a container
    around them would be the loudest thing in the rail. */
-/* Reserve the tabs' intrinsic width: shrinking this group lets its text paint
-   under Search with wider system fonts. Compact separators keep the usual
-   header on one line; the head can wrap the actions if the font needs more. */
-.lib-modes { display: flex; flex: none; align-items: center; gap: var(--s1); min-height: 24px; }
+/* Keep the actions on the right at their full hit size. Only the tab labels
+   can shrink if the platform font needs more room. */
+.lib-modes { display: flex; min-width: 0; align-items: center; gap: var(--s1); min-height: 24px; }
 /* Sentence case matches the filter placeholder and keeps three collections
    readable in the rail without relying on Windows font metrics. */
 .lib-mode {
+  min-width: 0;
   font-family: var(--font-small);
   font-size: var(--t-11); font-weight: var(--w-semi);
   color: var(--fg-3); white-space: nowrap;
   transition: color var(--d1) var(--ease);
 }
+.lib-mode > span { display: block; overflow: hidden; text-overflow: ellipsis; }
 .lib-mode:hover { color: var(--label); }
 /* Two clear steps of the same type rather than a highlight: the selected word
    is the heading, so it takes the emphasised label token, and the other sits a

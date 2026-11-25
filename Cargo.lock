@@ -4175,7 +4175,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "renderer-engine"
-version = "0.2.9"
+version = "0.0.0"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -4208,6 +4208,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "spotifine-common",
  "symphonia",
  "tokio",
  "url",
@@ -4992,7 +4993,7 @@ dependencies = [
 
 [[package]]
 name = "spotifine"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "auto-launch",
  "base64 0.22.1",
@@ -5000,13 +5001,13 @@ dependencies = [
  "keyring",
  "parking_lot",
  "rand 0.8.7",
- "renderer-engine",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
  "souvlaki",
+ "spotifine-common",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -5017,6 +5018,14 @@ dependencies = [
  "tokio",
  "url",
  "windows 0.44.0",
+]
+
+[[package]]
+name = "spotifine-common"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5401,10 +5410,12 @@ dependencies = [
  "glob",
  "heck 0.5.0",
  "json-patch",
+ "quote",
  "schemars 0.8.22",
  "semver",
  "serde",
  "serde_json",
+ "tauri-codegen",
  "tauri-utils",
  "tauri-winres",
  "walkdir",

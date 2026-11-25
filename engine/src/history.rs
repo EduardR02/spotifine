@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use renderer_engine::atomic::replace_file_atomically;
-use renderer_engine::protocol::{
+use spotifine_common::atomic::replace_file_atomically;
+use spotifine_common::protocol::{
     HistoryItem, HistoryPage, HistoryQuery, HistoryRow, HistorySort, TrackRef,
 };
 use serde::{Deserialize, Serialize};
@@ -1180,7 +1180,7 @@ fn elapsed_ms(since: Option<Instant>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use renderer_engine::protocol::{TimeRange, TrackEdit};
+    use spotifine_common::protocol::{TimeRange, TrackEdit};
     use std::time::Duration;
 
     fn scratch() -> PathBuf {

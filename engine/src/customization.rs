@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use renderer_engine::atomic::replace_file_atomically;
-use renderer_engine::protocol::{
+use spotifine_common::atomic::replace_file_atomically;
+use spotifine_common::protocol::{
     LoopRange, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
 };
 

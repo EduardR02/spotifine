@@ -107,7 +107,7 @@ fn cached_image(path: &Path) -> Option<Vec<u8>> {
 
 fn write_cover(path: &Path, bytes: &[u8]) -> Result<(), String> {
     write_cover_with(path, bytes, |source, destination| {
-        renderer_engine::atomic::replace_file_atomically(source, destination, false)
+        spotifine_common::atomic::replace_file_atomically(source, destination, false)
     })
 }
 

@@ -20,7 +20,7 @@ use librespot_protocol::authentication::AuthenticationType;
 use mdns_sd::{DaemonEvent, ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent};
 use protobuf::Enum;
 use rand::RngCore;
-use renderer_engine::protocol::ConnectDevice;
+use spotifine_common::protocol::ConnectDevice;
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use tokio::sync::Mutex;

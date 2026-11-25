@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use reqwest::Method;
-use renderer_engine::protocol::{ConnectDevice, PlaylistRows, QueueReceipt};
+use spotifine_common::protocol::{ConnectDevice, PlaylistRows, QueueReceipt};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
@@ -64,10 +64,10 @@ pub struct PlayedPlaylistRow {
 }
 
 pub enum Action {
-    Play, Pause, Next, Previous, Seek(u32), Volume(u8), Shuffle(bool), Repeat(String), Speed(f32),
+    Play, Pause, Toggle, Next, Previous, Seek(u32), Volume(u8), Shuffle(bool), Repeat(String), Speed(f32),
     /// Rows, start index, context, automatic start, start paused.
     Queue(Vec<Track>, usize, String, bool, bool), Index(usize), Add(Track, String), AddBatch(Vec<Track>, String), Remove(usize), Move(usize, usize),
-    Preview(Track, Vec<renderer_engine::protocol::TimeRange>, Option<renderer_engine::protocol::LoopRange>, u32, u64),
+    Preview(Track, Vec<spotifine_common::protocol::TimeRange>, Option<spotifine_common::protocol::LoopRange>, u32, u64),
     RestorePreview(u64),
 }
 
@@ -942,6 +942,7 @@ impl Core {
             Action::Seek(position_ms) => self.seek(host, kind, position_ms).await,
             Action::Pause => self.pause(host, kind).await,
             Action::Play => self.play(host, kind).await,
+            Action::Toggle => self.toggle_remote(host, kind).await,
             Action::Next => self.next(host, kind).await,
             Action::Previous => self.previous(host, kind).await,
             Action::Shuffle(enabled) if foreign => self.foreign_setting(host, "shuffle", enabled.to_string()).await,
@@ -1027,6 +1028,29 @@ impl Core {
         }
         self.publish_transport(host);
         Ok(())
+    }
+
+    async fn toggle_remote<H: Host>(&self, host: &H, kind: Kind) -> Result<(), String> {
+        let (device, pending_intent) = {
+            let guard = self.remote.lock();
+            let remote = guard.as_ref().ok_or(RELEASED)?;
+            let intent = if remote.start_intent.is_some() {
+                Some(true)
+            } else if kind == Kind::Prepared {
+                Some(false)
+            } else {
+                remote.pending.as_ref().filter(|pending| pending.since.elapsed() < GRACE)
+                    .and_then(|pending| pending.playing)
+            };
+            (remote.state.output_device_id.clone(), intent)
+        };
+        // Hidden paused devices aren't polled. Resolve the toggle on demand,
+        // but preserve unconfirmed intent while Spotify applies our own command.
+        let playing = match pending_intent {
+            Some(playing) => playing,
+            None => Self::read_selected_player(host, &device).await?.is_some_and(|player| player.is_playing),
+        };
+        if playing { self.pause(host, kind).await } else { self.play(host, kind).await }
     }
 
     async fn next<H: Host>(&self, host: &H, kind: Kind) -> Result<(), String> {
@@ -1573,6 +1597,19 @@ impl Core {
         Ok(())
     }
 
+    async fn read_selected_player<H: Host>(host: &H, device: &str) -> Result<Option<PlayerState>, String> {
+        let player = host.spotify(Method::GET, "me/player?additional_types=track,episode".into(), None).await?
+            .map(serde_json::from_value::<PlayerState>).transpose()
+            .map_err(|_| "Spotify returned an invalid playback state".to_owned())?;
+        if player.as_ref().is_some_and(|player| player.device.id.as_deref() != Some(device)) {
+            return Err(MOVED_AWAY.into());
+        }
+        if player.as_ref().is_some_and(|player| player.device.is_restricted) {
+            return Err("Spotify does not allow controlling this device".into());
+        }
+        Ok(player)
+    }
+
     /// One reconciliation: reads the device and acts on what it reports.
     async fn sync<H: Host>(&self, host: &H) -> Result<(), String> {
         let Some(device) = self.remote.lock().as_ref().map(|remote| remote.state.output_device_id.clone()) else { return Ok(()); };
@@ -1595,15 +1632,7 @@ impl Core {
                 return Ok(());
             }
         }
-        let player = host.spotify(Method::GET, "me/player?additional_types=track,episode".into(), None).await?
-            .map(serde_json::from_value::<PlayerState>).transpose()
-            .map_err(|_| "Spotify returned an invalid playback state".to_owned())?;
-        if player.as_ref().is_some_and(|player| player.device.id.as_deref() != Some(device.as_str())) {
-            return Err(MOVED_AWAY.into());
-        }
-        if player.as_ref().is_some_and(|player| player.device.is_restricted) {
-            return Err("Spotify does not allow controlling this device".into());
-        }
+        let player = Self::read_selected_player(host, &device).await?;
         let (kind, commanded, refresh) = {
             let mut guard = self.remote.lock();
             let Some(remote) = guard.as_mut() else { return Ok(()); };
@@ -1953,6 +1982,7 @@ async fn run_local(client: &EngineClient, action: Action) -> Result<(), String> 
     match action {
         Action::Play => client.play().await,
         Action::Pause => client.pause().await,
+        Action::Toggle => if client.is_playing() { client.pause().await } else { client.play().await },
         Action::Next => client.next().await,
         Action::Previous => client.previous().await,
         Action::Seek(ms) => client.seek(ms).await,
@@ -3455,6 +3485,25 @@ mod tests {
     fn next_read(core: &Core) -> Option<Duration> {
         let visible = core.visible.load(Ordering::Relaxed);
         core.remote.lock().as_ref().filter(|remote| remote.polling).and_then(|remote| reconcile_delay(remote, visible))
+    }
+
+    #[tokio::test]
+    async fn native_toggle_reads_a_hidden_device_that_resumed_in_spotify() {
+        let (core, host) = owned(3).await;
+        core.run(&host, Action::Pause).await.unwrap();
+        host.spotify.lock().player = Some(reading("spotify:track:t0", false, 1000));
+        core.sync(&host).await.unwrap();
+        core.set_visible(false, false);
+        assert_eq!(next_read(&core), None);
+        {
+            let mut spotify = host.spotify.lock();
+            spotify.log.clear();
+            spotify.player = Some(reading("spotify:track:t0", true, 2000));
+        }
+        core.run(&host, Action::Toggle).await.unwrap();
+        assert_eq!(host.spotify.lock().reads_of("me/player"), 1);
+        assert_eq!(host.spotify.lock().writes(), ["PUT me/player/pause?device_id=phone"]);
+        assert!(!remote(&core, |remote| remote.state.playing));
     }
 
     #[tokio::test]

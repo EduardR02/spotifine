@@ -30,22 +30,27 @@ use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail, CacheStats, EpisodeDetail, HistoryPageDetail, LibraryNodeDetail, LikedSongsDetail, PlaybackEvent, PlaybackState, Playlist, PlaylistDetail, PlaylistRecommendationsDetail, ProfileDetail, RadioDetail, SearchResult, Show, ShowDetail, SongwriterPlaylist, Track, TrackCreditsDetail, TrackPlaylistRef, TrackWaveform
 };
 use parking_lot::Mutex;
-use renderer_engine::protocol::{LibraryItem, PlaylistRead};
+use spotifine_common::protocol::{LibraryItem, PlaylistRead};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// Creates the same updater resource as the plugin's check command, with the
-/// engine's durable shutdown included in Windows' pre-process-exit hook.
+/// The Windows updater exits the process directly after starting the installer.
+/// Its hook also runs on launch failure, so only checkpoint there; don't shut
+/// down the engine or destroy the windows and updater resource.
 #[tauri::command]
 pub async fn check_for_update(webview: tauri::Webview) -> Result<Option<Value>, String> {
     use tauri_plugin_updater::UpdaterExt;
-    let app = webview.app_handle().clone();
-    let updater = webview.updater_builder()
-        .on_before_exit(move || {
-            crate::shutdown_for_exit(&app);
-            app.cleanup_before_exit();
+    let updater = webview.updater_builder();
+    #[cfg(windows)]
+    let updater = {
+        let app = webview.app_handle().clone();
+        updater.on_before_exit(move || {
+            if let Some(client) = app.try_state::<Arc<EngineClient>>() {
+                client.checkpoint_for_update();
+            }
         })
-        .build().map_err(|error| error.to_string())?;
+    };
+    let updater = updater.build().map_err(|error| error.to_string())?;
     let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
         return Ok(None);
     };
@@ -148,7 +153,7 @@ pub async fn play_queue(
 #[tauri::command]
 pub async fn play_playlist_row(
     app: AppHandle, router: State<'_, Arc<PlaybackRouter>>,
-    selection: renderer_engine::protocol::PlaylistRows<Vec<Track>>, index: usize, context: String,
+    selection: spotifine_common::protocol::PlaylistRows<Vec<Track>>, index: usize, context: String,
 ) -> Result<Option<crate::playback_router::PlayedPlaylistRow>, String> {
     router.play_playlist_row(&app, selection, index, context).await
 }
@@ -158,8 +163,8 @@ pub async fn preview_track_edit(
     app: AppHandle,
     router: State<'_, Arc<PlaybackRouter>>,
     track: Track,
-    cuts: Vec<renderer_engine::protocol::TimeRange>,
-    loop_range: Option<renderer_engine::protocol::LoopRange>,
+    cuts: Vec<spotifine_common::protocol::TimeRange>,
+    loop_range: Option<spotifine_common::protocol::LoopRange>,
     position_ms: u32,
     preview_lease_id: u64,
 ) -> Result<(), String> {
@@ -237,7 +242,7 @@ pub async fn get_history(
         client
             .get_history(
                 offset.unwrap_or(0),
-                limit.unwrap_or_else(renderer_engine::protocol::default_history_page_size),
+                limit.unwrap_or_else(spotifine_common::protocol::default_history_page_size),
                 query.as_deref().unwrap_or_default(),
                 sort.as_deref().unwrap_or("recent"),
             )
@@ -274,7 +279,7 @@ pub async fn get_track_edit(
     client: State<'_, Arc<EngineClient>>,
     track_id: String,
     playlist_id: Option<String>,
-) -> Result<renderer_engine::protocol::TrackEditStatus, String> {
+) -> Result<spotifine_common::protocol::TrackEditStatus, String> {
     client
         .track_edit_status(&track_id, playlist_id.as_deref())
         .await
@@ -285,9 +290,9 @@ pub async fn save_track_edit(
     client: State<'_, Arc<EngineClient>>,
     track_id: String,
     duration_ms: u32,
-    cuts: Vec<renderer_engine::protocol::TimeRange>,
-    loop_range: Option<renderer_engine::protocol::LoopRange>,
-) -> Result<renderer_engine::protocol::TrackEditDefinition, String> {
+    cuts: Vec<spotifine_common::protocol::TimeRange>,
+    loop_range: Option<spotifine_common::protocol::LoopRange>,
+) -> Result<spotifine_common::protocol::TrackEditDefinition, String> {
     client
         .save_track_edit(&track_id, duration_ms, &cuts, loop_range)
         .await
@@ -569,7 +574,7 @@ pub async fn show_episode_index(webview: tauri::Webview, client: State<'_, Arc<E
         let mut rows = Vec::with_capacity(page.episode_ids.len());
         // Each command owns one network batch. Leaving the page stops the
         // walk before the next batch, rather than running through the archive.
-        for ids in page.episode_ids.chunks(renderer_engine::protocol::METADATA_BATCH_SIZE) {
+        for ids in page.episode_ids.chunks(spotifine_common::protocol::METADATA_BATCH_SIZE) {
             open_show(&webview, rid)?;
             rows.extend(client.browse_show_episodes(&page.id, ids).await?.into_iter().map(EpisodeDetail::from));
         }
@@ -715,7 +720,7 @@ pub async fn browse_track_credits(
 pub async fn browse_canvas(
     client: State<'_, Arc<EngineClient>>,
     id: String,
-) -> Result<Option<renderer_engine::protocol::Canvas>, String> {
+) -> Result<Option<spotifine_common::protocol::Canvas>, String> {
     client.browse_canvas(&id).await
 }
 
@@ -1417,6 +1422,23 @@ pub fn set_launch_at_login(app: AppHandle, enabled: bool) -> Result<AppSettings,
 #[tauri::command]
 pub fn set_start_minimized(enabled: bool) -> Result<AppSettings, String> {
     update_app_settings(|settings| settings.start_minimized = enabled)
+}
+
+#[tauri::command]
+pub async fn set_minimize_to_tray(app: AppHandle, enabled: bool) -> Result<AppSettings, String> {
+    #[cfg(windows)]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = app.clone();
+        app.run_on_main_thread(move || { let _ = tx.send(crate::tray::set_enabled(&handle, enabled)); })
+            .map_err(|error| error.to_string())?;
+        rx.await.map_err(|error| error.to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, enabled);
+        Err("Minimize to tray is only available on Windows.".into())
+    }
 }
 
 #[tauri::command]
@@ -2798,7 +2820,7 @@ fn adopt_unchanged_playlist(
     playlist_generation: u64,
     cache_generation: u64,
     tracks_key: &str,
-    read: renderer_engine::protocol::PlaylistUnchanged,
+    read: spotifine_common::protocol::PlaylistUnchanged,
 ) -> Option<HeldPlaylistDetail> {
     let mut cached_ids = read.cached_ids;
     client.reconcile_cached_ids(&mut cached_ids, cache_generation);

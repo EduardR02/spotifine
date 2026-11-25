@@ -1,7 +1,7 @@
 //! Shared serde types for the Tauri <-> frontend contract.
 //!
 //! Field names are the exact JSON keys the frontend consumes; they mirror
-//! the engine's protocol payloads (see `renderer_engine::protocol`)
+//! the engine's protocol payloads (see `spotifine_common::protocol`)
 //! so the engine's line-JSON state and browse messages deserialize straight
 //! into these types.
 
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use renderer_engine::protocol::{
+use spotifine_common::protocol::{
     normalize_canonical_playlist_description, AlbumBrowse, AlbumRef, ArtistBrowse,
     ArtistCataloguePage, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
     ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist, CreditRole, EpisodeRef,
@@ -1694,7 +1694,7 @@ mod tests {
     #[test]
     fn history_item_conversion_preserves_the_flat_snapshot_contract() {
         let item = EngineHistoryItem {
-            row: renderer_engine::protocol::HistoryRow {
+            row: spotifine_common::protocol::HistoryRow {
                 track_id: "track-1".into(),
                 started_at: 1_725_000_123_456,
                 ms_played: 91_000,
@@ -1726,7 +1726,7 @@ mod tests {
     #[test]
     fn history_page_conversion_keeps_the_window_and_both_counts() {
         let item = |id: &str| EngineHistoryItem {
-            row: renderer_engine::protocol::HistoryRow {
+            row: spotifine_common::protocol::HistoryRow {
                 track_id: id.to_owned(),
                 started_at: 1_725_000_000_000,
                 ms_played: 91_000,

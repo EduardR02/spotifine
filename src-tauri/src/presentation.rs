@@ -32,7 +32,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use renderer_engine::protocol::PlaylistRead;
+use spotifine_common::protocol::PlaylistRead;
 use serde::Deserialize;
 
 use crate::engine_client::EngineClient;
@@ -78,6 +78,7 @@ const REFUSED: &[&str] = &[
     "clear_cache",
     "set_audio_cache_limit",
     "set_launch_at_login",
+    "set_minimize_to_tray",
     "set_spotify_listening_enabled",
     "set_devices_enabled",
 ];

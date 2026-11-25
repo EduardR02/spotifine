@@ -160,7 +160,7 @@ pub fn save_if_dirty() {
     };
     let temporary = path.with_extension("tmp");
     let written = std::fs::write(&temporary, &bytes)
-        .and_then(|()| renderer_engine::atomic::replace_file_atomically(&temporary, &path, false));
+        .and_then(|()| spotifine_common::atomic::replace_file_atomically(&temporary, &path, false));
     if let Err(error) = written {
         eprintln!("could not save the audio cache index: {error}");
         let _ = std::fs::remove_file(&temporary);

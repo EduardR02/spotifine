@@ -6,8 +6,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use librespot_core::{FileId, Session, SpotifyUri};
 use librespot_metadata::audio::AudioFileFormat;
-use renderer_engine::spotify_reporting::{EndReason, PlaybackReport, SpotifyReporter};
 use tokio::sync::{mpsc, watch};
+
+use crate::spotify_reporting::{EndReason, PlaybackReport, SpotifyReporter};
 
 const QUEUE_CAPACITY: usize = 32;
 

@@ -38,7 +38,9 @@ login in your browser.
   ad-hoc signed, not notarized, so Gatekeeper may ask you to approve it. Only
   do that for builds you trust.
 
-Settings checks for and installs updates.
+Spotifine checks for updates once a day while it runs. When a release is
+available, the download arrow by your account installs it and restarts the
+app. You can still check manually in Settings.
 
 ## Not affiliated with Spotify
 
@@ -66,6 +68,8 @@ Audio is 320 kbps and gapless. Media keys work when the app isn't focused, and
 it shows up in Windows Quick Settings and on the lock screen. Played songs are
 cached, so replaying them uses no network. When the system's audio output
 changes, playback follows it. It can launch at login, minimized if you want.
+On Windows, turn on **Minimize to tray** in Settings to move the minimized
+window out of the taskbar. Click the tray icon to reopen it; Close still quits.
 
 Playlists can be created, renamed, deleted and reordered, and tracks added or
 removed by drag and drop or in bulk by rules (artist, album, title, length),
@@ -156,6 +160,19 @@ Record the approximate time and keep
 `transport:` lines distinguish an ordinary resume from a new load or recovery.
 Do not delete the cache or history to diagnose a delay.
 
+### When a track won't start
+
+The playback message distinguishes Spotify refusing an audio key from not
+answering the request. Spotifine retries for a limited time without skipping the
+track. If retries stop, try the same track in the official Spotify app after a
+refusal, or check your connection if there was no reply.
+
+For a report, include the Spotifine version, approximate time, and the matching
+`audio key` lines from `playback_engine.log`. On Windows it is in
+`%LOCALAPPDATA%\Spotifine\logs`; on macOS it is in
+`~/Library/Application Support/Spotifine/logs`. Redact account identifiers
+before sharing a log.
+
 ## Limitations
 
 Windows and macOS 14 or later only, and you need Spotify Premium.
@@ -187,9 +204,20 @@ The installer lands in `target/release/bundle/nsis/` on Windows, and the app in
 engine once with `bun run build:engine`, then run `bun tauri dev`. The checks
 are listed in `AGENTS.md`.
 
-Publishing a GitHub release runs the [release workflow](../../actions/workflows/release.yml),
-which builds, tests and signs both platforms and attaches the installers and
-the update files.
+For fast repeat installers, keep `target/release/` intact: Cargo needs its
+dependency artifacts and fingerprints, not just the two executables. If disk
+space is tight, remove `target/debug/` first when no build is running. Vite
+preserves unchanged assets so packaging the same frontend does not force a
+Rust rebuild. The private engine crate has no product version; for a release,
+bump `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`,
+and update the workspace lockfile.
+
+Push the matching `vX.Y.Z` tag to run the [release workflow](../../actions/workflows/release.yml).
+Do not publish a release by hand. The workflow builds, tests, and packages
+both platforms, uploads the signed assets and `latest.json` to a draft, then
+publishes it. Until then, update checks keep seeing the previous release.
+Main-branch changes to build configuration seed the Rust dependency caches;
+release jobs can read them but do not write to them.
 
 Your login and caches stay on your computer, under `%LOCALAPPDATA%\Spotifine`
 on Windows or `~/Library/Application Support/Spotifine` on macOS. The
@@ -225,9 +253,10 @@ now, but it's already light enough that I'd rather keep it easy to change.
 | Path         | What's in it                                                |
 | ------------ | ----------------------------------------------------------- |
 | `engine/`    | Playback engine: librespot, audio pipeline, browse, history  |
+| `common/`    | Shell/engine wire types and atomic file replacement          |
 | `src-tauri/` | Tauri shell: engine supervision, caches, commands            |
 | `src/`       | Svelte 5 frontend                                            |
-| `dev/`       | Development harnesses, not part of the build                 |
+| `dev/`       | Development harnesses and build helpers                      |
 
 `AGENTS.md` has the conventions the code follows, and is a better starting point
 than this file if you want to change something.

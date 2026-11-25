@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use renderer_engine::protocol::{BrowseResponse, Request, MAX_REQUEST_BYTES};
+use spotifine_common::protocol::{BrowseResponse, Request, MAX_REQUEST_BYTES};
 
 #[derive(Debug)]
 pub enum Input {
@@ -260,7 +260,7 @@ fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
 #[cfg(test)]
 mod tests {
     use super::{Input, decode_request};
-    use renderer_engine::protocol::Command;
+    use spotifine_common::protocol::Command;
 
     #[test]
     fn valid_requests_decode_directly() {

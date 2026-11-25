@@ -1,155 +1,61 @@
 name: Signed desktop release
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+    tags: ['v*']
+    # Warm dependency caches, not a second release build on every UI edit.
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '**/build.rs'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - 'bun.lock'
+      - 'src-tauri/tauri*.conf.json'
+      - 'src-tauri/installer-hooks.nsh'
+      - '.github/tauri-ci.conf.json'
+      - '.github/workflows/desktop.yml'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
 
-jobs:
-  macos:
-    runs-on: macos-15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.2
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-      - name: Verify release version
-        if: github.event_name == 'release'
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          bun -e 'const v = require("./package.json").version; const tag = process.env.RELEASE_TAG.replace(/^v/, ""); if (v !== tag || require("./src-tauri/tauri.conf.json").version !== tag) throw Error(`Release tag ${tag} must match app version ${v}`)'
-      - name: Test frontend, engine and shell
-        # The shell compiles against the built frontend and bundles the
-        # release engine, so both must exist before its tests build. Native
-        # tests run serially (AGENTS.md): the audio and cache epochs are
-        # process-global.
-        run: |
-          bun test
-          bun run build
-          bun run build:engine
-          cargo test -p renderer-engine --lib --bin PlaybackEngine -- --test-threads=1
-          cargo test -p librespot-audio -- --test-threads=1
-          cargo test -p spotifine -- --test-threads=1
-      - name: Build and sign macOS app and updater archive
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          test -n "$TAURI_SIGNING_PRIVATE_KEY"
-          bun tauri build
-          app=target/release/bundle/macos/Spotifine.app
-          test -x "$app/Contents/MacOS/Spotifine"
-          test -x "$app/Contents/Resources/PlaybackEngine"
-          codesign --verify --deep --strict "$app"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.spotifine.client
-          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 14.0
-          archive="$app.tar.gz"
-          test -s "$archive"
-          test -s "$archive.sig"
-          mkdir -p archive-check
-          tar -xzf "$archive" -C archive-check
-          codesign --verify --deep --strict archive-check/Spotifine.app
-          mkdir -p release-assets
-          ditto -c -k --sequesterRsrc --keepParent "$app" release-assets/Spotifine-macos-arm64.zip
-          cp "$archive" release-assets/Spotifine-macos-arm64.app.tar.gz
-          cp "$archive.sig" release-assets/Spotifine-macos-arm64.app.tar.gz.sig
-      - name: Smoke-launch the app and bundled engine
-        shell: bash
-        run: |
-          set -euo pipefail
-          app=target/release/bundle/macos/Spotifine.app
-          log="$HOME/Library/Application Support/Spotifine/logs/spotifine.log"
-          "$app/Contents/MacOS/Spotifine" > runner-app.log 2>&1 &
-          app_pid=$!
-          trap 'kill "$app_pid" 2>/dev/null || true' EXIT
-          for attempt in {1..20}; do
-            if test -f "$log" && grep -q 'engine spawned (pid' "$log"; then
-              exit 0
-            fi
-            if ! kill -0 "$app_pid" 2>/dev/null; then
-              cat runner-app.log
-              test ! -f "$log" || cat "$log"
-              exit 1
-            fi
-            sleep 1
-          done
-          cat runner-app.log
-          test ! -f "$log" || cat "$log"
-          exit 1
-      - uses: actions/upload-artifact@v4
-        with:
-          name: spotifine-macos
-          path: release-assets/
-          if-no-files-found: error
-          retention-days: 14
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
 
-  windows:
-    runs-on: windows-2022
+jobs:
+  desktop:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-15
+          - platform: windows
+            runner: windows-2022
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.2
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-      - name: Verify release version
-        if: github.event_name == 'release'
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          bun -e 'const v = require("./package.json").version; const tag = process.env.RELEASE_TAG.replace(/^v/, ""); if (v !== tag || require("./src-tauri/tauri.conf.json").version !== tag) throw Error(`Release tag ${tag} must match app version ${v}`)'
-      - name: Test frontend, engine and shell
-        # Same prerequisites and commands as the macOS job. This is the only
-        # place the `#[cfg(windows)]` tests run: the engine client's
-        # supervisor, its PowerShell-child pipe tests and the SMTC session.
-        shell: bash
-        run: |
-          bun test
-          bun run build
-          bun run build:engine
-          cargo test -p renderer-engine --lib --bin PlaybackEngine -- --test-threads=1
-          cargo test -p librespot-audio -- --test-threads=1
-          cargo test -p spotifine -- --test-threads=1
-      - name: Build signed NSIS updater
-        shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          test -n "$TAURI_SIGNING_PRIVATE_KEY"
-          bun tauri build
-          shopt -s nullglob
-          installers=(target/release/bundle/nsis/*-setup.exe)
-          test "${#installers[@]}" -eq 1
-          test -s "${installers[0]}"
-          test -s "${installers[0]}.sig"
-          mkdir -p release-assets
-          cp "${installers[0]}" release-assets/Spotifine-windows-x64-setup.exe
-          cp "${installers[0]}.sig" release-assets/Spotifine-windows-x64-setup.exe.sig
-      - uses: actions/upload-artifact@v4
-        with:
-          name: spotifine-windows
-          path: release-assets/
-          if-no-files-found: error
-          retention-days: 14
+    uses: ./.github/workflows/desktop.yml
+    with:
+      platform: ${{ matrix.platform }}
+      runner: ${{ matrix.runner }}
+      # Only trusted main pushes may save dependencies; tags and manual runs restore only.
+      seed-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
 
   publish:
-    if: github.event_name == 'release'
-    needs: [macos, windows]
+    if: github.ref_type == 'tag'
+    needs: desktop
+    concurrency:
+      group: desktop-release-promotion
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: spotifine-*
@@ -159,23 +65,39 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cd release-assets
           mac=Spotifine-macos-arm64.app.tar.gz
           win=Spotifine-windows-x64-setup.exe
           zip=Spotifine-macos-arm64.zip
+          assets=("$mac" "$mac.sig" "$win" "$win.sig" "$zip" latest.json)
           for file in "$mac" "$mac.sig" "$win" "$win.sig" "$zip"; do
             test -s "$file"
           done
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release.json
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           version="${RELEASE_TAG#v}"
-          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == false and .prerelease == false' release.json > /dev/null
+          # Keep /releases/latest on the previous complete release throughout
+          # the build and upload. Only draft assets may be replaced on retry.
+          if ! gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,body,assets > release.json; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "Spotifine $version" --notes-file ../RELEASE_NOTES.md
+            gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,body,assets > release.json
+          fi
+          jq -e '.isPrerelease | not' release.json > /dev/null
+          if ! jq -e '.isDraft' release.json > /dev/null; then
+            # A lost response after promotion is safe to retry, but never
+            # overwrite a public release or accept one with missing assets.
+            for asset in "${assets[@]}"; do
+              jq -e --arg name "$asset" 'any(.assets[]; .name == $name and .state == "uploaded" and .size > 0)' release.json > /dev/null
+            done
+            exit 0
+          fi
           jq -n \
             --arg version "$version" \
             --arg notes "$(jq -r '.body // ""' release.json)" \
-            --arg pub_date "$(jq -r '.published_at' release.json)" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg mac_url "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$mac" \
             --arg win_url "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$win" \
             --rawfile mac_sig "$mac.sig" \
@@ -189,7 +111,16 @@ jobs:
                 "windows-x86_64": { url: $win_url, signature: ($win_sig | rtrimstr("\n")) }
               }
             }' > latest.json
-          jq -e '.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+([+-][0-9A-Za-z.-]+)?$")' latest.json > /dev/null
-          jq -e '.pub_date != "null" and (.platforms | length == 2) and (.platforms | all(.[]; (.url | startswith("https://")) and (.signature | length > 0)))' latest.json > /dev/null
-          gh release upload "$RELEASE_TAG" "$mac" "$mac.sig" "$win" "$win.sig" "$zip" --clobber --repo "$GITHUB_REPOSITORY"
-          gh release upload "$RELEASE_TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
+          jq -e '(.platforms | length == 2) and (.platforms | all(.[]; (.url | startswith("https://")) and (.signature | length > 0)))' latest.json > /dev/null
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          # Serialize promotions across tags. A slower/older build may
+          # publish, but it cannot replace a newer update or download link.
+          latest=$(gh api graphql \
+            -f query='query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { latestRelease { tagName } } }' \
+            -f owner="${GITHUB_REPOSITORY%/*}" -f repo="${GITHUB_REPOSITORY#*/}" \
+            --jq '.data.repository.latestRelease.tagName // ""')
+          make_latest=true
+          if [[ -n "$latest" && "$(printf '%s\n' "$latest" "$RELEASE_TAG" | sort -V | tail -n 1)" != "$RELEASE_TAG" ]]; then
+            make_latest=false
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest="$make_latest"

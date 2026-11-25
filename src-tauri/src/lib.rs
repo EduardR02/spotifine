@@ -8,6 +8,8 @@ mod media_keys;
 mod personal_api;
 mod playback_router;
 mod presentation;
+#[cfg(windows)]
+mod tray;
 mod types;
 
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use engine_client::EngineClient;
 
 fn restore_main_window(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
-        log::warn("could not find the main window for the second app launch");
+        log::warn("could not find the main window to restore");
         return;
     };
     if let Err(error) = window.unminimize() {
@@ -98,12 +100,14 @@ fn report_window_state(window: tauri::WebviewWindow) {
         }
         if previous.map(|previous| previous.minimized) != Some(minimized) {
             commands::window_minimized_changed(handle.app_handle(), minimized);
+            if minimized {
+                tray::minimized(handle.app_handle());
+            }
         }
     });
 }
 
-/// Shared by normal RunEvent::Exit and the Windows updater's direct exit.
-pub(crate) fn shutdown_for_exit(app: &tauri::AppHandle) {
+fn shutdown_for_exit(app: &tauri::AppHandle) {
     if let Some(client) = app.try_state::<Arc<EngineClient>>() {
         client.shutdown_engine();
     }
@@ -126,7 +130,7 @@ pub fn run() {
             std::process::exit(2);
         }
     }
-    let mut context = tauri::generate_context!();
+    let mut context = tauri::tauri_build_context!();
     if presentation::active() {
         // A private webview: search memory, pins and every other stored
         // preference start empty, and nothing the window stores outlives it.
@@ -216,6 +220,7 @@ pub fn run() {
         commands::set_audio_cache_limit,
         commands::set_launch_at_login,
         commands::set_start_minimized,
+        commands::set_minimize_to_tray,
         commands::set_animated_canvas,
         commands::set_devices_enabled,
         commands::enable_account_canvas,
@@ -228,6 +233,9 @@ pub fn run() {
         // This MUST be the first plugin: its second-process callback runs
         // before setup, so no duplicate state or playback engine is created.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            #[cfg(windows)]
+            tray::open(app);
+            #[cfg(not(windows))]
             restore_main_window(app);
         }))
         .plugin(tauri_plugin_opener::init())
@@ -245,6 +253,10 @@ pub fn run() {
         .setup(|app| {
             let mut startup_settings = load_app_settings();
             reconcile_autostart_preference(app.handle(), &mut startup_settings);
+            #[cfg(windows)]
+            let tray_ready = tray::setup(app.handle(), startup_settings.minimize_to_tray);
+            #[cfg(not(windows))]
+            let tray_ready = false;
             if let Some(window) = app.get_webview_window("main") {
                 if startup_settings.start_minimized {
                     if let Err(error) = window.minimize() {
@@ -253,13 +265,14 @@ pub fn run() {
                         ));
                     }
                 }
-                // The configured window starts hidden. Minimize preserves that
-                // visibility flag, so show it afterward in its iconic state
-                // rather than briefly showing a normal window first.
-                if let Err(error) = window.show() {
-                    log::warn(&format!(
-                        "could not show the main window at startup: {error}"
-                    ));
+                // Keep the configured hidden window iconic for tray startup.
+                // A missing icon or failed minimize must leave it reachable.
+                let start_in_tray = tray_ready && startup_settings.start_minimized
+                    && window.is_minimized().unwrap_or(false);
+                if !start_in_tray {
+                    if let Err(error) = window.show() {
+                        log::warn(&format!("could not show the main window at startup: {error}"));
+                    }
                 }
             } else {
                 log::warn("could not find the main window at startup");

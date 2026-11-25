@@ -1,16 +1,20 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { realBridge } from "./dev/real-bridge.js";
+import { stagedBuildOutput } from "./dev/staged-build-output.js";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+
+// Matches "frontendDist": "../build" in src-tauri/tauri.conf.json
+const outDir = "build";
 
 // https://vite.dev/config/
 export default defineConfig({
   base: './',
   // realBridge is dev-server only (apply: "serve"): the UI harness reads the
   // owner's running app through it. See dev/real-bridge.js.
-  plugins: [svelte(), realBridge()],
+  plugins: [svelte(), realBridge(), stagedBuildOutput(outDir)],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
@@ -35,7 +39,6 @@ export default defineConfig({
     },
   },
   build: {
-    // Matches "frontendDist": "../build" in src-tauri/tauri.conf.json
-    outDir: "build",
+    outDir,
   },
 });

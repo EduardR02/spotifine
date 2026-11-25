@@ -36,13 +36,11 @@ const KEYS_POISON_MSG: &str = "audio key mutex poisoned";
 /// Why Spotify did not hand over an audio key.
 ///
 /// Spotify's answer carries a code (`error audio key 0 1`, `0 2`), but
-/// librespot-core only logs it, so a refusal is all that can be told apart
-/// here. It is also all that matters to a caller: either way the track is
-/// fine, and asking again later is what works.
+/// librespot-core only logs it. A refusal proves the service answered with
+/// an error, not why it declined or whether a later request will succeed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioKeyFailure {
-    /// Spotify answered and declined. This is how its pacing of key requests
-    /// shows itself.
+    /// Spotify answered with an audio-key error.
     Refused,
     /// No answer arrived in time, or the connection went first.
     Unanswered,
@@ -98,7 +96,11 @@ pub async fn audio_key(
         let session = session.clone();
         async move {
             session.audio_key().request(track, file_id).await
-                .map_err(|error| AudioKeyFailure::of(&error))
+                .map_err(|error| {
+                    let failure = AudioKeyFailure::of(&error);
+                    warn!("Audio key request: track={track} file={file_id} reason={failure} error={error}");
+                    failure
+                })
         }
     };
     obtain(&KEYS, key_store(session, track_uri), file_id, epoch, fetch, |flight| session.spawn(flight)).await

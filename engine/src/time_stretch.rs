@@ -1,5 +1,5 @@
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
-use renderer_engine::protocol::{TimeRange, TrackEdit};
+use spotifine_common::protocol::{TimeRange, TrackEdit};
 
 const CHANNELS: usize = NUM_CHANNELS as usize;
 /// OLA analysis window (Chromium AudioRendererAlgorithm: 20 ms).
@@ -948,7 +948,7 @@ fn full_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use renderer_engine::protocol::LoopRange;
+    use spotifine_common::protocol::LoopRange;
 
     fn stereo_tone(frames: usize, frequency: f32, right_scale: f32) -> Vec<f32> {
         let mut samples = Vec::with_capacity(frames * CHANNELS);

@@ -18,6 +18,9 @@
     "targets": ["nsis"],
     "resources": {
       "../target/release/PlaybackEngine.exe": "PlaybackEngine.exe"
+    },
+    "windows": {
+      "nsis": { "installerHooks": "installer-hooks.nsh" }
     }
   }
 }

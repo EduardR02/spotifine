@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use renderer_engine::protocol::normalize_canonical_playlist_description;
+use spotifine_common::protocol::normalize_canonical_playlist_description;
 
 use crate::types::{
     align_artist_ids, cover_urls_from_tracks, CacheStats, CacheUsage,
@@ -36,6 +36,7 @@ pub struct AppSettings {
     pub audio_cache_limit_mb: u64,
     pub launch_at_login: bool,
     pub start_minimized: bool,
+    pub minimize_to_tray: bool,
     pub animated_canvas: bool,
     /// Track-gain volume normalisation in the engine. Also handed to the live
     /// engine over the protocol on change, so only the *initial* value comes
@@ -58,6 +59,7 @@ impl Default for AppSettings {
             audio_cache_limit_mb: DEFAULT_AUDIO_CACHE_LIMIT_MB,
             launch_at_login: false,
             start_minimized: false,
+            minimize_to_tray: false,
             animated_canvas: true,
             normalisation: false,
             spotify_listening_enabled: true,
@@ -1542,7 +1544,7 @@ fn write_json_atomic_result<T: Serialize>(path: PathBuf, value: &T) -> Result<()
 
 fn write_bytes_atomic_result(path: PathBuf, bytes: &[u8]) -> Result<(), String> {
     write_bytes_atomic_with(path, bytes, |source, destination| {
-        renderer_engine::atomic::replace_file_atomically(source, destination, true)
+        spotifine_common::atomic::replace_file_atomically(source, destination, true)
     })
 }
 
@@ -2007,6 +2009,7 @@ mod tests {
         assert_eq!(settings.audio_cache_limit_mb, 2048);
         assert!(!settings.launch_at_login);
         assert!(!settings.start_minimized);
+        assert!(!settings.minimize_to_tray);
     }
 
     fn membership(id: &str, revision: &str, uris: &[&str]) -> MembershipEntry {

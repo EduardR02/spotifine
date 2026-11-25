@@ -28,7 +28,7 @@ use librespot_playback::convert::Converter;
 use librespot_playback::decoder::{AudioPacket, AudioPacketPosition};
 use librespot_playback::player::DecoderTransition;
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
-use renderer_engine::protocol::TrackEdit;
+use spotifine_common::protocol::TrackEdit;
 use tokio::sync::mpsc;
 
 use crate::resample::Resampler;
@@ -1880,7 +1880,7 @@ mod tests {
     #[test]
     fn an_inflight_decoder_read_cannot_consume_or_report_a_staged_target() {
         use librespot_playback::decoder::{AudioDecoder, DecoderError, DecoderResult};
-        use renderer_engine::protocol::TimeRange;
+        use spotifine_common::protocol::TimeRange;
         struct BlockedDecoder {
             entered: std::sync::mpsc::Sender<()>,
             release: std::sync::mpsc::Receiver<()>,
@@ -2577,7 +2577,7 @@ mod tests {
         let config = PipelineConfig {
             edit: Some(TrackEdit {
                 cuts: Vec::new(),
-                loop_range: Some(renderer_engine::protocol::LoopRange {
+                loop_range: Some(spotifine_common::protocol::LoopRange {
                     start_ms: 0, end_ms: 100, play_count: 2,
                 }),
             }),

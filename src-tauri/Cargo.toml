@@ -1,6 +1,6 @@
 [package]
 name = "spotifine"
-version = "0.2.9"
+version = "0.2.10"
 description = "Spotifine, Spotify without the bloat"
 authors = ["you"]
 edition = "2021"
@@ -25,7 +25,7 @@ name = "Spotifine"
 path = "src/main.rs"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = ["codegen"] }
 
 [dependencies]
 tauri = { version = "2", features = ["custom-protocol"] }
@@ -46,9 +46,10 @@ keyring = { version = "3.6", default-features = false, features = ["windows-nati
 url = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
-renderer-engine = { path = "../engine" }
+spotifine-common = { path = "../common" }
 
 [target.'cfg(windows)'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
 windows = { version = "0.44", features = ["Foundation", "Media", "Win32_Foundation", "Win32_System_WinRT"] }
 auto-launch = "=0.5.0"
 

@@ -4,7 +4,7 @@
 //! consumer. Windows attaches SMTC to the main HWND; macOS attaches to the
 //! application event loop without a window handle. Button presses are
 //! forwarded to the selected output through the central playback router.
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -20,9 +20,6 @@ use crate::types::PlaybackState;
 use crate::playback_router::{Action, PlaybackRouter};
 use tauri::{AppHandle, Manager};
 
-/// Last-known playing flag, so the overlay's toggle button maps to the right
-/// engine command even though its press arrives on a foreign thread.
-static PLAYING: AtomicBool = AtomicBool::new(false);
 static POSITION_MS: AtomicU64 = AtomicU64::new(0);
 static DURATION_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -318,7 +315,7 @@ fn handle_event(event: MediaControlEvent, app: &AppHandle) {
     let action = match event {
         E::Play => Action::Play,
         E::Pause | E::Stop => Action::Pause,
-        E::Toggle => if PLAYING.load(Ordering::Relaxed) { Action::Pause } else { Action::Play },
+        E::Toggle => Action::Toggle,
         E::Next => Action::Next,
         E::Previous => Action::Previous,
         E::SetPosition(position) => Action::Seek(absolute_seek_target(duration_ms(position.0))),
@@ -327,7 +324,12 @@ fn handle_event(event: MediaControlEvent, app: &AppHandle) {
         E::Seek(_) => return,
         _ => return,
     };
-    let router = app.state::<Arc<PlaybackRouter>>().inner().clone();
+    dispatch(app, action);
+}
+
+pub(crate) fn dispatch(app: &AppHandle, action: Action) {
+    let Some(router) = app.try_state::<Arc<PlaybackRouter>>() else { return };
+    let router = router.inner().clone();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _ = router.run(&app, action).await;
@@ -430,7 +432,6 @@ fn clear_windows_metadata(hwnd: usize) -> windows::core::Result<()> {
 /// send; the owning thread deduplicates metadata against the previous track.
 pub fn update_state(state: &PlaybackState) {
     let track = state.current_index.and_then(|index| state.queue.get(index));
-    record_intent(&PLAYING, state.playing, track.is_some());
     POSITION_MS.store(state.position_ms as u64, Ordering::Relaxed);
     let duration_ms = track.map_or(0, |track| track_duration(state.duration_ms, track.duration_ms));
     DURATION_MS.store(duration_ms as u64, Ordering::Relaxed);
@@ -440,7 +441,7 @@ pub fn update_state(state: &PlaybackState) {
 }
 
 /// What the media session shows for one full state. Pure: the producer's
-/// intent and playhead atomics are [`update_state`]'s to keep.
+/// playhead atomics are [`update_state`]'s to keep.
 fn update_for(state: &PlaybackState) -> Update {
     let Some(track) = state.current_index.and_then(|index| state.queue.get(index)) else {
         return Update::Stopped;
@@ -466,17 +467,11 @@ pub fn update_position(position_ms: u32) {
 
 /// Clears transport and metadata immediately while the engine is unavailable.
 pub fn update_disconnected() {
-    PLAYING.store(false, Ordering::Relaxed);
     POSITION_MS.store(0, Ordering::Relaxed);
     DURATION_MS.store(0, Ordering::Relaxed);
     if let Some(sender) = UPDATES.get() {
         let _ = sender.send(Update::Stopped);
     }
-}
-
-/// Only producers update current intent; draining historical OS updates does not.
-fn record_intent(playing: &AtomicBool, intent: bool, playable: bool) {
-    playing.store(intent && playable, Ordering::Relaxed);
 }
 
 fn track_duration(compiled_ms: u32, source_ms: u32) -> u32 {
@@ -549,25 +544,6 @@ mod tests {
         assert_eq!(playback.len(), 3, "held and resumed clocks need no heartbeat publications");
         assert!(playback.iter().all(|value| matches!(value, MediaPlayback::Playing { .. })),
             "buffering cannot turn the user's playing intent into Pause/Resume");
-    }
-
-    #[test]
-    fn draining_old_stop_does_not_overwrite_newer_producer_toggle_intent() {
-        let playing = AtomicBool::new(false);
-        let mut metadata = None;
-        let mut timeline = None;
-        let mut rate = Some(1.0);
-        record_intent(&playing, false, false);
-        record_intent(&playing, true, true);
-        let mut stopped = false;
-        publish_stopped(&mut metadata, &mut timeline, &mut rate, |value| {
-            stopped = matches!(value, MediaPlayback::Stopped);
-            Ok::<_, ()>(())
-        }).unwrap();
-        assert!(stopped);
-        assert!(playing.load(Ordering::Relaxed), "Toggle still derives Pause from the newest producer");
-        record_intent(&playing, true, false);
-        assert!(!playing.load(Ordering::Relaxed), "a no-playable boundary stops intent synchronously");
     }
 
     #[test]

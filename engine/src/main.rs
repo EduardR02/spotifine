@@ -14,6 +14,7 @@ mod io;
 mod output_device;
 mod resample;
 mod spotify_listening;
+mod spotify_reporting;
 mod time_stretch;
 mod waveform;
 
@@ -28,7 +29,7 @@ use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use librespot_core::Session;
-use renderer_engine::protocol::{Command, HistoryQuery, PlaylistRead, Response, TrackWaveform};
+use spotifine_common::protocol::{Command, HistoryQuery, PlaylistRead, Response, TrackWaveform};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use waveform::WaveformService;

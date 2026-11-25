@@ -16,6 +16,7 @@
 <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="10.6" cy="10.6" r="6.4"/><path d="m15.6 15.6 5 5"/></symbol>
 <symbol id="i-queue" viewBox="0 0 24 24" fill="currentColor"><rect x="3.4" y="6.2" width="11" height="1.9" rx=".9"/><rect x="3.4" y="11.1" width="8" height="1.9" rx=".9"/><rect x="3.4" y="16" width="5" height="1.9" rx=".9"/><path d="M16.8 9.3v5.4c0 .6.6 1 1.2.7l4.7-2.7a.8.8 0 0 0 0-1.4L18 8.6c-.6-.3-1.2.1-1.2.7Z"/></symbol>
 <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4 17 7M7 17l-1.6 1.6"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v12m-4.5-4.5 4.5 4.5 4.5-4.5M5 18v2.5h14V18"/></symbol>
 <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></symbol>
 <!-- Play and pause are one pair, drawn to the same box: 16 units tall, soft
      all round. Pause is two slim bars with fully round ends, a bar's width

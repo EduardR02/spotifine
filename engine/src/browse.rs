@@ -64,7 +64,7 @@ use librespot_protocol::extension_kind::ExtensionKind;
 use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 
-use renderer_engine::protocol::{
+use spotifine_common::protocol::{
     AlbumRef, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity,
     Canvas, CreditArtist, CreditRole, EpisodeRef, LibraryNode, PlaylistRead, PlaylistRecommendations, PlaylistRef, PlaylistUnchanged,
     RadioBrowse, ShowBrowse, ShowRef, SongwriterPlaylist, TrackCredits, TrackRef,
@@ -2398,7 +2398,7 @@ fn parse_playlist_membership_page(payload: &[u8]) -> Result<PlaylistMembershipPa
 }
 
 fn append_playlist_membership_page(
-    membership: &mut renderer_engine::protocol::PlaylistMembership,
+    membership: &mut spotifine_common::protocol::PlaylistMembership,
     page: PlaylistMembershipPage,
     offset: usize,
 ) -> Result<(usize, bool), String> {
@@ -2424,9 +2424,9 @@ fn append_playlist_membership_page(
 pub async fn playlist_membership_browse(
     session: &Session,
     id: &str,
-) -> Result<renderer_engine::protocol::PlaylistMembership, String> {
+) -> Result<spotifine_common::protocol::PlaylistMembership, String> {
     playlist_uri(id)?;
-    let mut membership = renderer_engine::protocol::PlaylistMembership {
+    let mut membership = spotifine_common::protocol::PlaylistMembership {
         id: id.to_owned(),
         ..Default::default()
     };
@@ -2636,7 +2636,7 @@ pub async fn playlist_browse(
         cover_urls: playlist_track_cover_urls(&tracks),
         track_count: u32::try_from(playlist.length).ok(),
     }, true);
-    Ok(PlaylistRead::Changed(renderer_engine::protocol::PlaylistBrowse {
+    Ok(PlaylistRead::Changed(spotifine_common::protocol::PlaylistBrowse {
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
         name: playlist.name().to_owned(),
@@ -2671,7 +2671,7 @@ fn playlist_attributes_cover(
 pub async fn album_browse(
     session: &Session,
     id: &str,
-) -> Result<renderer_engine::protocol::AlbumBrowse, String> {
+) -> Result<spotifine_common::protocol::AlbumBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}"))
         .map_err(|error| format!("invalid album id: {error}"))?;
     let album: Album = metadata_get(session, &uri, "album").await?;
@@ -2686,7 +2686,7 @@ pub async fn album_browse(
         Ok(counts) => apply_playcounts(&mut tracks, &counts),
         Err(error) => eprintln!("album play counts unavailable: {error}"),
     }
-    Ok(renderer_engine::protocol::AlbumBrowse {
+    Ok(spotifine_common::protocol::AlbumBrowse {
         id: id_of(&album.id),
         uri: album_uri,
         name: album.name.clone(),
@@ -3174,13 +3174,13 @@ async fn resolve_artist_release_entries(
     total: usize,
     offset: usize,
     limit: usize,
-) -> Result<renderer_engine::protocol::ArtistReleasePage, String> {
+) -> Result<spotifine_common::protocol::ArtistReleasePage, String> {
     let resolved = fetch_albums(session, page.iter().map(|(_, uri)| *uri)).await?;
     let by_id: HashMap<&str, &AlbumRef> = resolved
         .iter()
         .map(|album| (album.id.as_str(), album))
         .collect();
-    let mut releases = renderer_engine::protocol::ArtistReleases::default();
+    let mut releases = spotifine_common::protocol::ArtistReleases::default();
     for (group, uri) in page {
         let Some(album) = by_id.get(id_of(uri).as_str()).map(|album| (*album).clone()) else {
             continue;
@@ -3193,7 +3193,7 @@ async fn resolve_artist_release_entries(
         }
     }
     let end = offset.saturating_add(limit).min(total);
-    Ok(renderer_engine::protocol::ArtistReleasePage {
+    Ok(spotifine_common::protocol::ArtistReleasePage {
         releases,
         total,
         next_offset: (end < total).then_some(end),
@@ -3232,7 +3232,7 @@ fn balanced_artist_release_page<'a>(
 async fn resolve_initial_artist_release_page(
     session: &Session,
     groups: &[Vec<SpotifyUri>; 4],
-) -> Result<renderer_engine::protocol::ArtistReleasePage, String> {
+) -> Result<spotifine_common::protocol::ArtistReleasePage, String> {
     let total = groups.iter().map(|group| group.len()).sum::<usize>();
     let limit = INITIAL_ARTIST_RELEASES.min(MAX_ARTIST_RELEASE_PAGE);
     let page = balanced_artist_release_page(groups, limit);
@@ -3534,7 +3534,7 @@ pub async fn artist_songwriter_browse(
 pub async fn artist_browse(
     session: &Session,
     id: &str,
-) -> Result<renderer_engine::protocol::ArtistBrowse, String> {
+) -> Result<spotifine_common::protocol::ArtistBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
         .map_err(|error| format!("invalid artist id: {error}"))?;
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
@@ -3571,14 +3571,14 @@ pub async fn artist_browse(
     let overview =
         merge_artist_overview(&artist, query_overview.as_ref(), visual_identity.as_ref());
     let page = page?;
-    Ok(renderer_engine::protocol::ArtistBrowse {
+    Ok(spotifine_common::protocol::ArtistBrowse {
         id: id_of(&artist.id),
         uri: artist_uri,
         name: artist.name.clone(),
         portrait_url: artist_portrait(&artist),
         top_tracks,
         releases: page.releases,
-        release_counts: renderer_engine::protocol::ArtistReleaseCounts {
+        release_counts: spotifine_common::protocol::ArtistReleaseCounts {
             albums: groups[0].len(),
             singles: groups[1].len(),
             compilations: groups[2].len(),
@@ -3591,7 +3591,7 @@ pub async fn artist_browse(
 
 #[derive(Clone)]
 struct CatalogueReleaseSeed {
-    header: renderer_engine::protocol::AlbumBrowse,
+    header: spotifine_common::protocol::AlbumBrowse,
     track_uris: Vec<SpotifyUri>,
 }
 
@@ -3603,7 +3603,7 @@ fn parse_catalogue_release_payload(
     let uri = SpotifyUri::from_uri(entity_uri).ok()?;
     let album = Album::parse(&message, &uri).ok()?;
     Some(CatalogueReleaseSeed {
-        header: renderer_engine::protocol::AlbumBrowse {
+        header: spotifine_common::protocol::AlbumBrowse {
             id: id_of(&album.id),
             uri: uri_of(&album.id),
             name: album.name.clone(),
@@ -4059,7 +4059,7 @@ pub async fn artist_catalogue_browse(
     offset: usize,
     limit: usize,
     refs_only: bool,
-) -> Result<renderer_engine::protocol::ArtistCataloguePage, String> {
+) -> Result<spotifine_common::protocol::ArtistCataloguePage, String> {
     let selected = if release_types.is_empty() {
         vec![0, 1, 2]
     } else {
@@ -4087,7 +4087,7 @@ pub async fn artist_catalogue_browse(
     )
     .await?;
     if refs_only {
-        return Ok(renderer_engine::protocol::ArtistCataloguePage {
+        return Ok(spotifine_common::protocol::ArtistCataloguePage {
             releases: seeds.into_iter().map(|release| release.header).collect(),
             total,
             next_offset: (end < total).then_some(end),
@@ -4115,7 +4115,7 @@ pub async fn artist_catalogue_browse(
         }
         complete.push(release.header);
     }
-    Ok(renderer_engine::protocol::ArtistCataloguePage {
+    Ok(spotifine_common::protocol::ArtistCataloguePage {
         releases: complete,
         total,
         next_offset: (end < total).then_some(end),
@@ -4151,7 +4151,7 @@ fn context_page_next_cursor(
 pub async fn liked_songs_browse(
     session: &Session,
     cursor: Option<&str>,
-) -> Result<renderer_engine::protocol::LikedSongsPage, String> {
+) -> Result<spotifine_common::protocol::LikedSongsPage, String> {
     let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
         let payload = spclient_read(|| async { session.spclient().get_next_page(cursor).await }).await
             .map_err(|error| format!("liked songs page request failed: {error}"))?;
@@ -4178,7 +4178,7 @@ pub async fn liked_songs_browse(
         (uris, next_cursor)
     };
     let tracks = fetch_tracks(session, uris.iter()).await?;
-    Ok(renderer_engine::protocol::LikedSongsPage {
+    Ok(spotifine_common::protocol::LikedSongsPage {
         tracks,
         next_cursor,
     })
@@ -4193,7 +4193,7 @@ pub async fn liked_songs_browse(
 pub async fn liked_song_uris_browse(
     session: &Session,
     cursor: Option<&str>,
-) -> Result<renderer_engine::protocol::LikedUrisPage, String> {
+) -> Result<spotifine_common::protocol::LikedUrisPage, String> {
     let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
         let payload = spclient_read(|| async { session.spclient().get_next_page(cursor).await }).await
             .map_err(|error| format!("liked song uris page request failed: {error}"))?;
@@ -4219,7 +4219,7 @@ pub async fn liked_song_uris_browse(
         let next_cursor = context.pages.iter().find_map(context_page_next_cursor);
         (uris, next_cursor)
     };
-    Ok(renderer_engine::protocol::LikedUrisPage {
+    Ok(spotifine_common::protocol::LikedUrisPage {
         uris: uris.iter().map(uri_of).collect(),
         next_cursor,
     })
@@ -5173,8 +5173,8 @@ fn podcast_episode_hit(hit: &SearchPodcastHitJson) -> Option<EpisodeRef> {
 fn search_top_ref(
     query: &str,
     section: &SearchTopSectionJson,
-) -> Option<renderer_engine::protocol::SearchTopRef> {
-    use renderer_engine::protocol::SearchTopRef;
+) -> Option<spotifine_common::protocol::SearchTopRef> {
+    use spotifine_common::protocol::SearchTopRef;
     section
         .itemsV2
         .iter()
@@ -6350,7 +6350,7 @@ pub async fn search_browse(
     session: &Session,
     query: &str,
     limit: usize,
-) -> Result<renderer_engine::protocol::SearchBrowse, String> {
+) -> Result<spotifine_common::protocol::SearchBrowse, String> {
     if query.trim().is_empty() {
         return Err("search query must not be empty".to_owned());
     }
@@ -6408,7 +6408,7 @@ pub async fn search_browse(
                 }
             }
         }
-        return Ok(renderer_engine::protocol::SearchBrowse {
+        return Ok(spotifine_common::protocol::SearchBrowse {
             top: search_top_ref(query.trim(), &search.topResultsV2),
             tracks: parsed
                 .data
@@ -6575,7 +6575,7 @@ mod tests {
         assert!(episode.track.unavailable, "search alone cannot prove playable audio");
         assert!(podcast_episode_hit(search.podcasts.as_ref().unwrap().items[0].hit().unwrap()).is_none());
         let top = search_top_ref("An episode", &search.topResultsV2);
-        let Some(renderer_engine::protocol::SearchTopRef::Episode { uri }) = top else {
+        let Some(spotifine_common::protocol::SearchTopRef::Episode { uri }) = top else {
             panic!("expected the ranked episode");
         };
         assert_eq!(uri, episode.track.uri);
@@ -7379,7 +7379,7 @@ mod tests {
         let section: SearchTopSectionJson = serde_json::from_str(body).unwrap();
 
         match search_top_ref("taylor", &section).expect("a top result") {
-            renderer_engine::protocol::SearchTopRef::Artist(artist) => {
+            spotifine_common::protocol::SearchTopRef::Artist(artist) => {
                 assert_eq!(artist.name, "Taylor Swift");
             }
             other => panic!("expected the artist the query names, got {other:?}"),
@@ -7388,7 +7388,7 @@ mod tests {
         // The same response, asked a different question: now the track is what
         // was named, and Spotify's own leader is also the right answer.
         match search_top_ref("style", &section).expect("a top result") {
-            renderer_engine::protocol::SearchTopRef::Track(track) => {
+            spotifine_common::protocol::SearchTopRef::Track(track) => {
                 assert_eq!(track.name, "Style");
             }
             other => panic!("expected the track, got {other:?}"),
@@ -7396,7 +7396,7 @@ mod tests {
 
         // Nothing matches the words typed, so their ranking stands unaltered.
         match search_top_ref("zzzz", &section).expect("a top result") {
-            renderer_engine::protocol::SearchTopRef::Track(track) => {
+            spotifine_common::protocol::SearchTopRef::Track(track) => {
                 assert_eq!(track.name, "Style");
             }
             other => panic!("expected Spotify's own leader, got {other:?}"),
@@ -7449,7 +7449,7 @@ mod tests {
         let top = search_top_ref("top 50", &parsed.data.searchV2.topResultsV2)
             .expect("a top result");
         match top {
-            renderer_engine::protocol::SearchTopRef::Playlist(playlist) => {
+            spotifine_common::protocol::SearchTopRef::Playlist(playlist) => {
                 assert_eq!(playlist.name, "Top 50 - Deutschland");
                 assert_eq!(playlist.id, "1abcdefghijklmnopqrstu");
             }
@@ -7478,7 +7478,7 @@ mod tests {
         let top = search_top_ref("real answer", &parsed.data.searchV2.topResultsV2)
             .expect("a top result");
         match top {
-            renderer_engine::protocol::SearchTopRef::Artist(artist) => {
+            spotifine_common::protocol::SearchTopRef::Artist(artist) => {
                 assert_eq!(artist.name, "Real Answer");
             }
             other => panic!("expected the artist under the podcast, got {other:?}"),
@@ -7545,7 +7545,7 @@ mod tests {
             }
         }"#;
         let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        let converted = renderer_engine::protocol::SearchBrowse {
+        let converted = spotifine_common::protocol::SearchBrowse {
             top: search_top_ref("anything", &parsed.data.searchV2.topResultsV2),
             tracks: parsed
                 .data
@@ -7572,7 +7572,7 @@ mod tests {
                 .map(|wrapper| artist_ref_from_hit(&wrapper.data))
                 .collect(),
             playlists: Vec::new(),
-            ..renderer_engine::protocol::SearchBrowse::default()
+            ..spotifine_common::protocol::SearchBrowse::default()
         };
 
         assert_eq!(converted.tracks.len(), 1);
@@ -7818,7 +7818,7 @@ mod tests {
             .expect("the pre-V2 top-result section still ranks");
         assert!(matches!(
             top,
-            renderer_engine::protocol::SearchTopRef::Artist(_)
+            spotifine_common::protocol::SearchTopRef::Artist(_)
         ));
     }
 
@@ -8859,7 +8859,7 @@ mod tests {
     #[test]
     fn mixed_catalogue_is_sorted_before_pagination_with_stable_year_ties() {
         let seed = |name: &str, year| CatalogueReleaseSeed {
-            header: renderer_engine::protocol::AlbumBrowse {
+            header: spotifine_common::protocol::AlbumBrowse {
                 name: name.to_owned(),
                 year,
                 ..Default::default()
@@ -10103,7 +10103,7 @@ mod file_index_tests {
 #[cfg(test)]
 mod membership_tests {
     use super::{append_playlist_membership_page, parse_playlist_membership_page};
-    use renderer_engine::protocol::PlaylistMembership;
+    use spotifine_common::protocol::PlaylistMembership;
     use serde_json::json;
 
     fn page(items: Vec<serde_json::Value>, length: usize, revision: &str) -> super::PlaylistMembershipPage {

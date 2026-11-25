@@ -16,15 +16,14 @@ Performance matters because a music player runs continuously. Wasted CPU, memory
 Common checks:
 
 ```text
-cargo test -p renderer-engine --lib --bin PlaybackEngine -- --test-threads=1
-cargo test -p librespot-audio -- --test-threads=1
-cargo test -p spotifine -- --test-threads=1
 bun run build
+bun run build:engine
+cargo test --locked -p spotifine-common -p renderer-engine -p librespot-audio -p spotifine -- --test-threads=1
 bun test
 bun tauri build
 ```
 
-Native tests run serially: the audio and cache epochs are process-global.
+Native tests run serially: the audio and cache epochs are process-global. Build the frontend and release engine first. The shell's roundtrip test must launch an actual engine (the workspace release binary, or `SPOTIFY_ENGINE_PATH`).
 
 `dev/profile-app.ps1` measures the running app's own processes (CPU time and cycles, memory, I/O); its header explains the counters. Measure one controlled workload at a time; passive captures of normal use aren't comparable.
 

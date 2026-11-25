@@ -216,8 +216,8 @@ pub enum PlayerEvent {
         play_request_id: u64,
         track_id: SpotifyUri,
     },
-    // Spotify did not hand over the requested track's audio key, so nothing
-    // was decoded. The track itself is fine; asking again later works.
+    // The requested track's audio key was unavailable. The failure says
+    // whether Spotify refused it or the request went unanswered.
     AudioKeyUnavailable {
         play_request_id: u64,
         track_id: SpotifyUri,

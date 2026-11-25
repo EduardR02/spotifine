@@ -1,5 +1,5 @@
 <script>
-  import { tick, untrack } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import {
     initEvents,
     route,
@@ -16,6 +16,7 @@
     ui,
     api,
     maybeBackfillLazyQueue,
+    presentation,
     setPlayheadVisible,
   } from "./lib/state.svelte.js";
   import IconSprite from "./components/IconSprite.svelte";
@@ -36,6 +37,7 @@
   import { devicesEnabled } from "./lib/personal.svelte.js";
   import { setMeterActivity } from "./lib/vu-meter.js";
   import { os, frame, watchFrame } from "./lib/window-frame.svelte.js";
+  import { startUpdateChecks } from "./lib/updates.svelte.js";
   import LibraryView from "./views/LibraryView.svelte";
   import MadeForYouView from "./views/MadeForYouView.svelte";
   import LikedSongsView from "./views/LikedSongsView.svelte";
@@ -56,8 +58,16 @@
   import PodcastView from "./views/PodcastView.svelte";
   import ProfileView from "./views/ProfileView.svelte";
 
-  $effect(() => {
-    initEvents();
+  onMount(() => {
+    let disposed = false;
+    let stopUpdates;
+    void initEvents().then(() => {
+      if (!disposed && !presentation.name) stopUpdates = startUpdateChecks();
+    });
+    return () => {
+      disposed = true;
+      stopUpdates?.();
+    };
   });
 
   // The stylesheet's hook for the window frame (see window-frame.svelte.js).

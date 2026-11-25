@@ -36,6 +36,7 @@
   import { pins, loadPins, isPinned, openFolder, toggleFolder } from "../lib/pins.svelte.js";
   import { avatar, loadAvatar } from "../lib/avatar.svelte.js";
   import { frost, haze } from "../lib/ambient.svelte.js";
+  import { updates, installUpdate, restartUpdate } from "../lib/updates.svelte.js";
 
   /* The record's tone for the selected row's light (app.css, THE SELECTED
      PLATE), in two slots: a new record's tone goes into the slot not
@@ -616,6 +617,17 @@
   });
 
   const me = $derived(playback.username || session.username || "");
+  const updateLabel = $derived(
+    updates.phase === "available" ? `Install update ${updates.version} and restart`
+      : updates.phase === "installed" ? "Restart to finish updating"
+      : updates.status,
+  );
+
+  async function applyUpdate() {
+    if (updates.phase === "installed") await restartUpdate();
+    else await installUpdate();
+    if (updates.error) ui.error = updates.error;
+  }
   const LIKED = { id: "liked", name: "Liked Songs" };
 </script>
 
@@ -676,7 +688,7 @@
         <div class="lib-modes" role="tablist" aria-label="Library collection">
           {#each modes as [id, label] (id)}
             <button class="lib-mode" class:on={mode === id} role="tab" aria-selected={mode === id} onclick={() => showMode(id)}>
-              {label}
+              <span>{label}</span>
             </button>
           {/each}
         </div>
@@ -886,8 +898,7 @@
     </div>
   </div>
 
-  <!-- The account, where the Settings row was and at its height: you, opening
-       your profile, and the gear for Settings at the end of the same line. -->
+  <!-- The profile, update when available, and settings share one line. -->
   <div class="account">
     <button
       class="nav-item account-me"
@@ -902,6 +913,12 @@
     <button class="btn-round account-gear" class:on={route.name === "settings"} title="Settings" aria-label="Settings" onclick={() => navigate("settings")}>
       <Icon name="settings" size={17} />
     </button>
+    {#if updates.version}
+      <button class="btn-round on" title={updateLabel} aria-label={updateLabel}
+        disabled={updates.busy} onclick={applyUpdate}>
+        <Icon name="download" size={17} />
+      </button>
+    {/if}
   </div>
 </aside>
 
@@ -985,7 +1002,7 @@
      playlist. */
   @media (max-width: 1180px) {
     .lib-new { display: none; }
-    .lib-head :global(.lib-mode) { font-size: 11px; }
+    .lib-mode { font-size: 11px; }
   }
   .lib-filter { width: 100%; }
 
